@@ -13,6 +13,7 @@ pub(super) struct Database {
 }
 
 impl Database {
+    // toDo: make sure we don't overwrite objects.
     pub(super) fn store(&self, object: Object) -> [u8; 20] {
         let obj_type = object.obj_type().as_bytes();
         let content = object.serialize();
@@ -94,7 +95,7 @@ impl Database {
     }
 }
 
-// toDo: there is an edge case where 2 different processes could in theory generate the same tmp 
+// toDo: there is an edge case where 2 different processes could in theory generate the same tmp
 // file name and they will overwrite each others content, we have a case of competing writes, rare
 // but can happen. Use Lockfile.
 fn gen_tmp_name() -> String {
