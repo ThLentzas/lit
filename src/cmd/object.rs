@@ -44,9 +44,9 @@ impl Object {
                     // let s = format!("{:o} ", entry.mode);
                     // bytes.extend_from_slice(s.as_bytes());
                     write!(&mut bytes, "{:o} ", entry.mode).unwrap();
-                    bytes.extend(os::name_to_bytes(&entry.name));
+                    bytes.extend(&entry.name);
                     bytes.push(0);
-                    bytes.extend_from_slice(&entry.id);
+                    bytes.extend_from_slice(&entry.oid);
                 });
                 bytes
             }
@@ -106,8 +106,8 @@ pub(super) struct Signature {
 }
 
 pub(super) struct TreeEntry {
-    pub(super) id: [u8; 20],
+    pub(super) oid: [u8; 20],
     // read the notes "Filenames"
-    pub(super) name: OsString,
+    pub(super) name: Vec<u8>,
     pub(super) mode: u32,
 }

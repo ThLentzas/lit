@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+use crate::cmd::error::LockfileError;
 
 // https://git-scm.com/docs/api-lockfile
 // Lockfile guarantees mutual exclusion, atomic updates and cleanup of the tmp files in case of an
@@ -21,6 +22,8 @@ pub(super) struct Lockfile {
     // fields to remain valid, and we need to move the file out during commit to close it before the
     // rename. The `None` state is only ever observed internally by Drop after a successful commit
     pub(super) file: Option<File>,
+    // read drop() impl below
+    committed: bool
 }
 
 impl Lockfile {
@@ -42,7 +45,7 @@ impl Lockfile {
     // returns Ok(Some(()) when it successfully acquires the lock
     // returns Ok(None) if it fails to acquire the lock
     // returns Err for any Io
-    pub(super) fn acquire(path: &Path) -> io::Result<Option<Lockfile>> {
+    pub(super) fn acquire(path: &Path) -> Result<Lockfile, LockfileError> {
         let file_path = path.to_path_buf();
         let lock_path = PathBuf::from(format!("{}.lock", file_path.display()));
 
@@ -55,19 +58,31 @@ impl Lockfile {
             .create_new(true)
             .open(&lock_path)
         {
-            Ok(file) => Ok(Some(Lockfile {
+            Ok(file) => Ok(Lockfile {
                 file_path,
                 lock_path,
                 file: Some(file),
-            })),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-            Err(e) => Err(e),
+                committed: false,
+            }),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(LockfileError::LockDenied {
+                path: lock_path,
+            }),
+            Err(err) => {
+                Err(LockfileError::Io {
+                    path: lock_path,
+                    source: err,
+                })
+            }
         }
     }
 
-    pub(super) fn write(&mut self, content: &[u8]) {
+    pub(super) fn write(&mut self, content: &[u8]) -> Result<(), LockfileError> {
+        // safe to call unwrap because file is None only when commit() returns
         let file = self.file.as_mut().unwrap();
-        file.write_all(content).unwrap();
+        match file.write_all(content) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(LockfileError::Io { path: self.lock_path.clone(), source: err })
+        }
     }
 
     // write_all() returns when the data have been handed to the OS, but the OS typically buffers
@@ -79,7 +94,7 @@ impl Lockfile {
     //
     // we consume self because once we commit the changes Lockfile is no longer needed. It's a one
     // time use. We try to enforce it via the type system
-    pub(super) fn commit(mut self) {
+    pub(super) fn commit(mut self) -> Result<(), LockfileError> {
         let file = self.file.take().unwrap();
         // sync_all() does not closes the file, we can still call file.write_all()
         //
@@ -87,31 +102,35 @@ impl Lockfile {
         //      Files are automatically closed when they go out of scope. Errors detected on closing
         //      are ignored by the implementation of Drop. Use the method sync_all if these errors
         //      must be manually handled.
-        // if let Err(e) = file.sync_all() {
-        //         drop(file); // explicit close
-        //         let _ = fs::remove_file(&self.lock_path); // clean up the lock
-        //         return Err(e);
-        //     }
         // https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all
-        file.sync_all().unwrap();
         // Rust will close the file when it goes out of scope in this case, after the call to rename
         // Depending on the OS, some platforms might not allow renaming in open files, so we make
         // sure the file is closed before calling rename(). Note we don't call drop on self(Lockfile)
         // but in the <filename>.lock field of self. We can still access lock_path and file_path
+        file.sync_all().map_err(|err| LockfileError::Io {
+            path: self.lock_path.clone(),
+            source: err,
+        })?;
         drop(file);
-        //     if let Err(e) = fs::rename(&self.lock_path, &self.file_path) {
-        //         let _ = fs::remove_file(&self.lock_path);
-        //         return Err(e);
-        //     }
-        fs::rename(&self.lock_path, &self.file_path).unwrap();
+        fs::rename(&self.lock_path, &self.file_path).map_err(|err| LockfileError::Io {
+            path: self.file_path.clone(),
+            source: err,
+        })?;
+        self.committed = true;
+
+        Ok(())
     }
 }
 
 // Lockfile dropped without calling commit() (early return, panic, etc.).file is still Some, rename
-// was never called, the tmp file was never deleted, and we have to do the cleanup in Drop
+// was never called, the tmp file was never deleted, and we have to do the cleanup in Drop. An approach
+// with if self.file.is_some() won't work if commit was called but failed because file is no longer
+// Some is None but because it failed dropped will not clear it, this is the reason why we need this
+// flag. If committed is true, the tmp file was successfully deleted, in any other case we do the
+// manual cleanup
 impl Drop for Lockfile {
     fn drop(&mut self) {
-        if self.file.is_some() {
+        if !self.committed {
             let _ = fs::remove_file(&self.lock_path);
         }
     }

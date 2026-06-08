@@ -1,8 +1,9 @@
-use crate::cmd::error::{IndexError, IndexFormatError, IndexFormatErrorKind};
+use crate::cmd::error::{FormatError, FormatErrorKind, IndexError, PathError};
 use crate::cmd::lockfile::Lockfile;
 use crate::cmd::os;
 use sha1::{Digest, Sha1};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 // toDo:
 // Integrity validation:
@@ -20,16 +21,23 @@ use std::path::{Path, PathBuf};
 // git has multiple versions(2, 3, 4) for the index format
 const INDEX_VERSION: u32 = 2;
 const PATH_MAX_SIZE: u16 = 0xfff;
+const SIGNATURE: &'static str = "DIRC";
 
-#[derive(Default)]
+// toDo: caching tree
 pub(super) struct Index {
-    entries: Vec<IndexEntry>,
+    path: PathBuf,
+    pub(super) entries: Vec<IndexEntry>,
+    // a flag that is used to not unnecessary write if no changes detected
     modified: bool,
 }
 
 impl Index {
-    pub(super) fn new() -> Self {
-        Self::default()
+    pub(super) fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            entries: Vec::new(),
+            modified: false,
+        }
     }
 
     pub(super) fn add_entry(&mut self, entry: IndexEntry) {
@@ -38,7 +46,7 @@ impl Index {
         match self.entries.binary_search_by(|e| e.path.cmp(&entry.path)) {
             Ok(pos) => {
                 // don't compare the oid because two different files can have the same exact content
-                // or it is the same file and some metadata changed(mode, mtime)
+                // or even if it is the same file some metadata might have changed(mode, mtime)
                 if self.entries[pos] != entry {
                     self.entries[pos] = entry;
                     self.modified = true;
@@ -54,52 +62,31 @@ impl Index {
     // updating index is the same as updating head
     // we have to address competing writes and make sure that when someone tries to read .lit/index
     // they never read half-written data, both are guarantees by lockfile
-    //
-    pub(super) fn update(
-        &mut self,
-        path: &Path,
-        entries: Vec<IndexEntry>,
-    ) -> Result<(), IndexError> {
-        let mut lockfile = match Lockfile::acquire(path) {
-            Ok(lock) => match lock {
-                Some(lockfile) => lockfile,
-                None => {
-                    return Err(IndexError::LockDenied {
-                        path: path.to_path_buf(),
-                    });
-                }
-            },
-            Err(err) => {
-                return Err(IndexError::Io {
-                    path: path.to_path_buf(),
-                    source: err,
-                });
-            }
-        };
-        if path.exists() {
-            self.load(path)?;
-        }
+    pub(super) fn update(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
+        let mut lockfile = Lockfile::acquire(&self.path)?;
+
+        self.load()?;
 
         for entry in entries {
             self.add_entry(entry);
         }
-
         if !self.modified {
             // if the contents were never modified, we don't need to overwrite, but we must return
             // the lock. Lockfile implements Drop which removes the .lock file. In the book Coglan
-            // has a function rollback which does the same thing
+            // has a function rollback() which does the same thing
             return Ok(());
         }
+
         let content = self.serialize();
-        lockfile.write(&content);
-        lockfile.commit();
+        lockfile.write(&content)?;
+        lockfile.commit()?;
 
         Ok(())
     }
 
     pub(super) fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"DIRC");
+        bytes.extend_from_slice(SIGNATURE.as_bytes());
         bytes.extend_from_slice(&INDEX_VERSION.to_be_bytes());
         bytes.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
         // toDo: at this point according to the format we are supposed to add Extensions
@@ -113,22 +100,31 @@ impl Index {
     }
 
     // loads the context of .lit/index in memory
-    fn load(&mut self, path: &Path) -> Result<(), IndexError> {
-        let bytes = fs::read(path).map_err(|err| IndexError::Io {
-            path: path.to_path_buf(),
-            source: err,
-        })?;
+    pub(super) fn load(&mut self) -> Result<(), IndexError> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                self.entries = Vec::new();
+                return Ok(());
+            }
+            Err(err) => {
+                return Err(IndexError::Io {
+                    path: self.path.clone(),
+                    source: err,
+                });
+            }
+        };
 
         let (content, checksum): (&[u8], &[u8; 20]) =
-            bytes
-                .split_last_chunk::<20>()
-                .ok_or(IndexError::InvalidIndexFormat(IndexFormatError::at(
-                    bytes.len(),
-                    IndexFormatErrorKind::Eof {
+            bytes.split_last_chunk::<20>().ok_or_else(|| {
+                FormatError::at(
+                    0,
+                    FormatErrorKind::Eof {
                         needed: 20,
                         remaining: bytes.len(),
                     },
-                )))?;
+                )
+            })?;
         let hash: [u8; 20] = Sha1::digest(content).into();
         // The checksum tells us the bytes we read are the same bytes that were written. It does
         // not prove those bytes form a valid index file. We still need to do validation.
@@ -146,28 +142,29 @@ impl Index {
         // mode is one of the allowed Git modes
         // after reading entry_count entries, the parser ends exactly where expected
         if hash != *checksum {
-            return Err(IndexError::InvalidIndexFormat(IndexFormatError::at(
-                3,
-                IndexFormatErrorKind::InvalidChecksum,
-            )));
+            // it is not InvalidFormat, we don't know that yet, the contents have been tempered with
+            return Err(IndexError::InvalidChecksum);
         }
 
-        if &content[..4] != b"DIRC" {
-            return Err(IndexFormatError {});
+        let mut parser = Parser::new(&content);
+        if parser.take::<4>()? != SIGNATURE.as_bytes() {
+            return Err(FormatError::at(0, FormatErrorKind::InvalidSignature))?;
         }
 
-        let version = u32::from_be_bytes(content[4..8].try_into().unwrap());
+        let version = u32::from_be_bytes(*parser.take::<4>()?);
         if version != INDEX_VERSION {
-            return Err(IndexFormatError {});
+            return Err(IndexError::UnsupportedVersion(version));
         }
 
-        let count = u32::from_be_bytes(content[8..12].try_into().unwrap());
-        let mut parser = Parser::new(&content[12..]);
-
+        let count = u32::from_be_bytes(*parser.take::<4>()?);
         for _ in 0..count {
+            let entry_offset = parser.offset();
             let entry = parser.next()?;
-            if !self.entries.is_empty() {
-                let last = self.entries.last().unwrap();
+
+            // don't do the C++/Java way of
+            //  if !self.entries.is_empty() {
+            //  let last = self.entries.last().unwrap();
+            if let Some(last) = self.entries.last() {
                 // if the entries are not in ascending order the format is invalid
                 // in a sorted list duplicates must appear next to each other, and we check each entry
                 // with the previous one
@@ -177,17 +174,32 @@ impl Index {
                 // surface as a non-ascending pair somewhere in the sequence
                 // toDo: address sorting order when we add stage support
                 if last.path >= entry.path {
-                    return Err(IndexFormatError {});
+                    return Err(FormatError::at(
+                        entry_offset,
+                        FormatErrorKind::EntriesNotSorted,
+                    ))?;
                 }
             }
             self.entries.push(entry);
             if self.entries.len() > count as usize {
-                return Err(IndexFormatError {});
+                return Err(FormatError::at(
+                    parser.offset(),
+                    FormatErrorKind::EntriesCountMissMatch {
+                        actual: self.entries.len(),
+                        expected: count as usize,
+                    },
+                ))?;
             }
         }
 
         if self.entries.len() != count as usize {
-            return Err(IndexFormatError {});
+            return Err(FormatError::at(
+                parser.offset(),
+                FormatErrorKind::EntriesCountMissMatch {
+                    actual: self.entries.len(),
+                    expected: count as usize,
+                },
+            ))?;
         }
         Ok(())
     }
@@ -214,6 +226,13 @@ impl Index {
     }
 }
 
+// toDo: rethink this design 
+// we could do something like that returns some source of IoError wrapper because we need this with
+// lockfile
+fn io_error(path: PathBuf, err: io::Error) -> IndexError {
+    IndexError::Io { path, source: err }
+}
+
 // toDo: add GitLink support.
 #[derive(PartialEq, Eq)]
 pub(super) struct StatNode {
@@ -231,11 +250,11 @@ pub(super) struct StatNode {
 
 #[derive(PartialEq, Eq)]
 pub(super) struct IndexEntry {
-    stat: StatNode,
-    oid: [u8; 20],
+    pub(super) stat: StatNode,
+    pub(super) oid: [u8; 20],
     flags: u16,
     // always relative to root
-    path: Vec<u8>,
+    pub(super) path: Vec<u8>,
 }
 
 impl IndexEntry {
@@ -260,8 +279,6 @@ impl IndexEntry {
         // at least 1 NUL byte, at this point at least 63
         // path bytes
         // padding
-        //
-        // 64 because even if we had 0 path bytes(invalid case) we would still need 1 NUL byte for padding
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(&self.stat.ctime.to_be_bytes());
         bytes.extend_from_slice(&self.stat.ctime_nsec.to_be_bytes());
@@ -334,32 +351,38 @@ impl<'a> Parser<'a> {
     }
 
     // next always returns a valid IndexEntry
-    fn next(&mut self) -> Result<IndexEntry, IndexFormatError> {
-        let start = self.pos;
+    fn next(&mut self) -> Result<IndexEntry, FormatError> {
+        let entry_offset = self.offset();
 
         let stat = StatNode {
-            ctime: self.read_u32_be(),
-            ctime_nsec: self.read_u32_be(),
-            mtime: self.read_u32_be(),
-            mtime_nsec: self.read_u32_be(),
-            dev: self.read_u32_be(),
-            ino: self.read_u32_be(),
-            mode: self.read_u32_be(),
-            uid: self.read_u32_be(),
-            gid: self.read_u32_be(),
-            file_size: self.read_u32_be(),
+            ctime: u32::from_be_bytes(*self.take::<4>()?),
+            ctime_nsec: u32::from_be_bytes(*self.take::<4>()?),
+            mtime: u32::from_be_bytes(*self.take::<4>()?),
+            mtime_nsec: u32::from_be_bytes(*self.take::<4>()?),
+            dev: u32::from_be_bytes(*self.take::<4>()?),
+            ino: u32::from_be_bytes(*self.take::<4>()?),
+            mode: u32::from_be_bytes(*self.take::<4>()?),
+            uid: u32::from_be_bytes(*self.take::<4>()?),
+            gid: u32::from_be_bytes(*self.take::<4>()?),
+            file_size: u32::from_be_bytes(*self.take::<4>()?),
         };
         if !matches!(stat.mode, os::REGULAR | os::EXECUTABLE | os::SYMLINK) {
-            return Err(IndexFormatError {});
+            return Err(FormatError::at(
+                entry_offset,
+                FormatErrorKind::InvalidMode(stat.mode),
+            ));
         }
         // The nanoseconds field represents the fractional part of a second, so it lives in the range
         // [0, 10^9). Anything above that is a second.
-        if stat.ctime_nsec >= 1_000_000_00 || stat.mtime_nsec >= 1_000_000_000 {
-            return Err(IndexFormatError {});
+        if stat.ctime_nsec >= 1_000_000_000 || stat.mtime_nsec >= 1_000_000_000 {
+            return Err(FormatError::at(
+                entry_offset,
+                FormatErrorKind::InvalidNanoseconds,
+            ));
         }
 
-        let oid = self.take::<20>();
-        let flags = self.read_u16_be();
+        let oid = self.take::<20>()?;
+        let flags = u16::from_be_bytes(*self.take::<2>()?);
         let mut path_bytes = Vec::new();
         // we extract the lowest 12 bits which is where we stored the path len
         let path_len = flags & 0xfff;
@@ -369,24 +392,10 @@ impl<'a> Parser<'a> {
             path_bytes.extend(self.read_path(path_len as usize)?);
         }
 
-        let size = self.pos - start;
+        let size = self.pos - entry_offset;
         self.skip_padding(size)?;
 
-        Ok(IndexEntry::new(path_bytes, oid, stat))
-    }
-
-    fn read_u32_be(&mut self) -> u32 {
-        let val = u32::from_be_bytes(self.buffer[self.pos..self.pos + 4].try_into().unwrap());
-        self.advance(4);
-
-        val
-    }
-
-    fn read_u16_be(&mut self) -> u16 {
-        let val = u16::from_be_bytes(self.buffer[self.pos..self.pos + 2].try_into().unwrap());
-        self.advance(2);
-
-        val
+        Ok(IndexEntry::new(path_bytes, *oid, stat))
     }
 
     // one of the things that we have to validate is that the path length from flags matches the
@@ -395,22 +404,45 @@ impl<'a> Parser<'a> {
     // if the real path is longer than path_len, the next byte will not be NUL, and we reject it
     // If the real path is shorter than path_len, then the path slice will include the NUL byte
     // inside it, and validate_index_path() will reject it
-    fn read_path(&mut self, path_len: usize) -> Result<Vec<u8>, IndexFormatError> {
+    fn read_path(&mut self, path_len: usize) -> Result<Vec<u8>, FormatError> {
         // need path_len bytes for the path, plus 1 byte for the required NUL terminator.
         if self.pos + path_len >= self.buffer.len() {
-            return Err(IndexFormatError {});
+            return Err(FormatError::at(
+                self.pos,
+                FormatErrorKind::Eof {
+                    needed: path_len,
+                    remaining: self.buffer.len().saturating_sub(self.pos),
+                },
+            ));
         }
 
         let start = self.pos;
         let path_bytes = &self.buffer[start..start + path_len];
         // path name needs to follow the rules of the index format
-        validate_index_path(path_bytes)?;
+        validate_index_path(path_bytes)
+            .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
+        // move to the next byte after the path that according to the format should be NUL
+        self.pos = start + path_len;
 
         match self.buffer.get(self.pos) {
-            Some(0) => {}
-            _ => return Err(IndexFormatError {}),
+            // move past NUL
+            Some(0) => self.advance(1),
+            Some(_) => {
+                return Err(FormatError::at(
+                    self.pos,
+                    FormatErrorKind::MissingNulTerminator,
+                ));
+            }
+            None => {
+                return Err(FormatError::at(
+                    self.pos,
+                    FormatErrorKind::Eof {
+                        needed: 1,
+                        remaining: self.buffer.len().saturating_sub(self.pos),
+                    },
+                ));
+            }
         }
-        self.pos = start + path_len + 1;
 
         Ok(path_bytes.to_vec())
     }
@@ -426,21 +458,34 @@ impl<'a> Parser<'a> {
     // in read_path() we have to validate that the path length from flags matches the actual path
     // length. One caveat is that we can no longer verify that because we don't keep track of the
     // exact length but we use a sentinel value
-    fn read_path_until_nul(&mut self) -> Result<Vec<u8>, IndexFormatError> {
+    fn read_path_until_nul(&mut self) -> Result<Vec<u8>, FormatError> {
         let start = self.pos;
         let relative_pos = self.buffer[start..]
             .iter()
             .position(|b| *b == 0)
-            .ok_or(IndexFormatError {})?;
+            .ok_or_else(|| {
+                FormatError::at(
+                    self.buffer.len(),
+                    FormatErrorKind::Eof {
+                        needed: 1,
+                        remaining: 0,
+                    },
+                )
+            })?;
+
         // position() returns relative to the slice we searched not the entire buffer
         // the position of the NUL with respect to the whole buffer is start + relative
         let nul_pos = start + relative_pos;
         if nul_pos - start < PATH_MAX_SIZE as usize {
-            return Err(IndexFormatError {});
+            return Err(FormatError::at(
+                start,
+                FormatErrorKind::LongPathLenMissMatch,
+            ));
         }
 
         let path_bytes = &self.buffer[start..nul_pos];
-        validate_index_path(path_bytes)?;
+        validate_index_path(path_bytes)
+            .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // skip NUL
         self.pos = nul_pos + 1;
 
@@ -453,74 +498,86 @@ impl<'a> Parser<'a> {
     // 64 % 8 = 0, 8 - 0 = 8 which is incorrect we don't need 8 bytes of padding
     // to address that we mod the result with 8.
     // if we need any padding n % 8 = n when n < 8 and 0 when n = 8
-    fn skip_padding(&mut self, entry_size: usize) -> Result<(), IndexFormatError> {
+    fn skip_padding(&mut self, entry_size: usize) -> Result<(), FormatError> {
         let mut padding = (8 - (entry_size % 8)) % 8;
 
         while padding > 0 {
             // if it is not null or exhausted the buffer too early it's an invalid format
             match self.buffer.get(self.pos) {
-                Some(b) if *b == 0 => {
+                Some(0) => {
                     self.advance(1);
                     padding -= 1;
                 }
-                _ => return Err(IndexFormatError {}),
+                Some(_) => return Err(FormatError::at(self.pos, FormatErrorKind::InvalidPadding)),
+                None => {
+                    return Err(FormatError::at(
+                        self.pos - 1,
+                        FormatErrorKind::Eof {
+                            needed: 1,
+                            remaining: 0,
+                        },
+                    ));
+                }
             }
         }
         Ok(())
+    }
+
+    // how far we read in the buffer
+    fn offset(&self) -> usize {
+        self.pos
     }
 
     fn advance(&mut self, n: usize) {
         self.pos += n;
     }
 
-    fn take(&mut self, n: usize) -> Result<&[u8], IndexFormatError> {
+    fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], FormatError> {
         let remaining = self.buffer.len().saturating_sub(self.pos);
 
-        if remaining < n {
-            return Err(IndexFormatError::at(
-                self.pos,
-                IndexFormatErrorKind::Eof {
-                    needed: n,
+        let bytes: &[u8; N] = self.buffer[self.pos..self.pos + N]
+            .try_into()
+            .map_err(|_| FormatError {
+                offset: self.pos,
+                kind: FormatErrorKind::Eof {
+                    needed: N,
                     remaining,
                 },
-            ));
-        }
+            })?;
+        self.advance(N);
 
-        let start = self.pos;
-        self.advance(n);
-
-        Ok(&self.buffer[start..self.pos])
+        Ok(bytes)
     }
 }
 
-pub(super) fn validate_index_path(path: &[u8]) -> Result<(), IndexFormatError> {
+pub(super) fn validate_index_path(path: &[u8]) -> Result<(), PathError> {
     if path.is_empty() {
-        return Err(IndexFormatError {});
+        return Err(PathError::Empty);
     }
     // paths are relative to the repository root, so no leading slash.
     if path[0] == b'/' {
-        return Err(IndexFormatError {});
+        return Err(PathError::LeadingSlash);
     }
     // trailing slash is not allowed.
     if path[path.len() - 1] == b'/' {
-        return Err(IndexFormatError {});
+        return Err(PathError::TrailingSlash);
     }
 
     for component in path.split(|&b| b == b'/') {
         // empty components: "src//main.rs"
         if component.is_empty() {
-            return Err(IndexFormatError {});
+            return Err(PathError::EmptyComponent);
         }
         // ".", "..", and ".lit" as path components are not allowed
         // src/./main.rs: stays in the current directory, redundant and not a real subdirectory
         // src/../etc/passwd: escapes upward, would let a crafted index reference files outside the repo
         // .lit/config: points into Lit's own metadata, never legitimate as a tracked file.
         if component == b"." || component == b".." || component == b".lit" {
-            return Err(IndexFormatError {});
+            return Err(PathError::ReservedComponent);
         }
         // NUL cannot appear inside the path.
         if component.contains(&0) {
-            return Err(IndexFormatError {});
+            return Err(PathError::ContainsNul);
         }
     }
     Ok(())
@@ -531,6 +588,8 @@ pub(super) fn to_path_bytes(path: &Path) -> Vec<u8> {
     let mut components = path.iter().peekable();
 
     while let Some(component) = components.next() {
+        // Git compares entry names as raw byte sequences(memcmp), no encoding, no locale, no
+        // platform variation
         bytes.extend(os::name_to_bytes(component));
         // no trailing slash
         if components.peek().is_some() {

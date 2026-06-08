@@ -1,6 +1,7 @@
-use std::{fs, io};
-use std::path::Path;
+use crate::cmd::error::{DbError, LockfileError, RefError};
 use crate::cmd::lockfile::Lockfile;
+use std::path::Path;
+use std::{fs, io};
 
 // We can't use the same approach to update the head as we did to write objects. In the writing
 // object case, we don't care about competing writes. The object path is derived from its content. If
@@ -44,14 +45,14 @@ use crate::cmd::lockfile::Lockfile;
 //
 // We pass the path to .lit. The caller does not know the path to HEAD. The functions know the path
 // to HEAD. Similar logic to the db_path. The database knows where to store the objects
-pub(super) fn update_head<F>(path: &Path, f: F)
+pub(super) fn update_head<F>(path: &Path, f: F) -> Result<(), RefError>
 where
     // For commit there are 6 steps:
     //
     // Acquire the lock
     // Read HEAD (parent OID)
     // Build the commit object using that parent
-    // Store the commit → get new OID
+    // Store the commit -> get new OID
     // Write the new OID to HEAD
     // Release the lock
     //
@@ -67,30 +68,30 @@ where
     // just provide the behavior once we get access to parent. Could also be an approach where we
     // return the lock and continue our logic but this will need to change are refs api and lockfile
     // quite a lot.
-    F: FnOnce(Option<String>) -> [u8; 20]
+    F: FnOnce(Option<String>) -> Result<[u8; 20], DbError>
 {
-    let head_path = path.join("HEAD");
-    let mut lockfile = Lockfile::acquire(&head_path).unwrap().unwrap();
-
-    let parent = read_head(path).unwrap();
-    let new_id = f(parent);
+    let mut lockfile = Lockfile::acquire(&path)?;
+    let parent = read_head(path)?;
+    let new_id = f(parent)?;
     // convert the [u8; 20] hash into its hex representation
-    let new_id:String = new_id.iter().map(|c| format!("{:02x}", c)).collect();
+    let new_id: String = new_id.iter().map(|c| format!("{:02x}", c)).collect();
 
-    lockfile.write(new_id.as_bytes());
+    lockfile.write(new_id.as_bytes())?;
     // lockfile.write("\n".as_bytes());
-    lockfile.commit();
+    lockfile.commit()?;
+
+    Ok(())
 }
 
-pub(super) fn read_head(path: &Path) -> io::Result<Option<String>> {
+pub(super) fn read_head(path: &Path) -> Result<Option<String>, LockfileError>{
     let head_path = path.join("HEAD");
     // HEAD contains the id as a 40-character hex string already (plain text 903a71ad300d5aa1ba0c0495ce9341f42e3fcd7c)
     // we know it is valid utf8 so we can call read_to_string()
-    match fs::read_to_string(head_path) {
+    match fs::read_to_string(&head_path) {
         Ok(s) => Ok(Some(s)),
         // no HEAD yet (first commit)
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
         // something actually went wrong (permissions, corrupt data, etc.)
-        Err(e) => Err(e),
+        Err(err) => Err(LockfileError::Io { path: head_path.to_path_buf(), source: err }),
     }
 }

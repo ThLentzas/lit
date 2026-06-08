@@ -1,19 +1,19 @@
-use crate::cmd::db::Database;
-use crate::cmd::dir::Dir;
-use crate::cmd::error::{AddError, RepoError};
+use crate::cmd::error::{AddError, CommitError, RepoError};
 use crate::cmd::index::{Index, IndexEntry, StatNode};
+use crate::cmd::lockfile::Lockfile;
 use crate::cmd::object::Object;
 use crate::cmd::object::Signature;
+use crate::cmd::tree_builder::InMemTree;
 use std::env::Args;
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 pub mod db;
-pub mod dir;
 mod lockfile;
 mod object;
 pub mod refs;
+pub mod tree_builder;
 
 mod error;
 pub mod index;
@@ -32,12 +32,49 @@ pub(super) enum Command {
 impl Command {
     // toDo: make sure that a lit repo actually exists before executing any command apart from init
     // toDo: check git docs on what happens when calling init on a directory that already has .lit
+    // toDo: error handling
     pub(super) fn execute(&mut self) {
         match self {
             Command::Init(cmd) => cmd.execute(),
-            Command::Commit(cmd) => cmd.execute(),
+            Command::Commit(cmd) => cmd.execute().unwrap(),
             Command::Add(cmd) => cmd.execute().unwrap(),
         }
+    }
+}
+
+struct Repository {
+    root: PathBuf,
+    // lit is guaranteed to be a directory
+    lit: PathBuf,
+}
+
+impl Repository {
+    // cwd is either the root(the directory that owns .lit) or a subdirectory of the root
+    fn discover() -> Result<Self, RepoError> {
+        let mut dir = env::current_dir().map_err(|err| RepoError::CurrentDir(err))?;
+
+        loop {
+            let lit = dir.join(".lit");
+            if lit.is_dir() {
+                return Ok(Self { root: dir, lit });
+            }
+            // sets dir to parent, returns false if parent is None
+            if !dir.pop() {
+                return Err(RepoError::NotRepository);
+            }
+        }
+    }
+
+    fn objects_path(&self) -> PathBuf {
+        self.lit.join("objects")
+    }
+
+    fn index_path(&self) -> PathBuf {
+        self.lit.join("index")
+    }
+
+    fn head_path(&self) -> PathBuf {
+        self.lit.join("HEAD")
     }
 }
 
@@ -65,7 +102,7 @@ impl Init {
         if self.path.exists() && !self.path.is_dir() {
             // Error
         }
-        // if you are on Linux the files will be hidden by default since any file that starts with
+        // on Linux the files will be hidden by default since any file that starts with
         // . is hidden
         let git_dir = self.path.join(".lit");
         fs::create_dir_all(git_dir.join("objects")).unwrap();
@@ -76,51 +113,35 @@ impl Init {
 pub(super) struct Commit;
 
 impl Commit {
-    fn execute(&self) {
-        let cwd = env::current_dir().unwrap();
-        let lit = cwd.join(".lit");
+    fn execute(&self) -> Result<(), CommitError> {
+        let repo = Repository::discover()?;
+        let db_path = repo.objects_path();
 
-        // the user called commit from a path that does not have a lit repo
-        if !lit.is_dir() {
-            //return Err("fatal: not a lit repository".into());
-        }
+        // We must acquire the lock on .lit/index for the entire commit, not just read the file.
+        // Lockfile's atomic rename guarantees we never read half-written/corrupted data, but that
+        // is not enough here. We read the index, build tree objects from it, write a commit, and
+        // update HEAD.
+        //
+        // It is a time-of-check to time-of-use case. Without holding the lock across the whole
+        // operation, a concurrent add could happen in between our read and our write:
+        //   commit reads the index
+        //   add acquires the lock, modifies the index
+        //   commit builds its tree from the old index without the new changes
+        //
+        // The result is an old-but-valid index: no corruption, but we committed a staged state the
+        // user had already moved past, and the committed tree now disagrees with .lit/index.
+        // Concurrent commits are not a concern , they are read only
+        //
+        // A question to ask here is how many different people work in a repository locally? Most
+        // of the time 1 so we could just call index.load() without acquiring the lock but now with
+        // agents it is a different story
+        let index_path = repo.index_path();
+        let _index_lock = Lockfile::acquire(&index_path)?;
+        let mut index = Index::new(repo.index_path());
+        index.load()?;
 
-        // toDo: check that .lit/objects exists
-        let db_path = lit.join("objects");
-        let db = Database { path: db_path };
-        // We read from all the files from the root and its subdirectories, and we create a flast list
-        // of each entry. We create a nested structure, and then we build the tree bottom up. We don't
-        // try to translate the filesystem structure directly into tree objects. Coupling is the answer
-        // Read Chatper: 5.2.3
-        let mut paths = workspace::list_files(&cwd);
-        paths.sort_by(|a, b| {
-            // read below for strip_prefix()
-            let a = a.strip_prefix(&cwd).unwrap();
-            let b = b.strip_prefix(&cwd).unwrap();
-            // Git compares entry names as raw byte sequences(memcmp), no encoding, no locale, no
-            // platform variation
-            os::name_to_bytes(a.as_os_str()).cmp(&os::name_to_bytes(b.as_os_str()))
-        });
-        let mut root = Dir::new();
-        for path in paths {
-            let content = fs::read(&path).unwrap();
-            // hash the blobs/leaves of the Merkle tree
-            let blob_id = db.store(Object::Blob(content));
-            let mode = workspace::stat(&path);
-            // the path returned by list_files() includes machine specific location of the repo, but
-            // we only care about the path inside repo.
-            //
-            // C:\Users\Thanos\projects\lit\src\database\tree.rs
-            //
-            // we only care about src\database\tree.rs and the cwd is C:\Users\Thanos\projects\lit
-            //
-            // strip_prefix errors if base is not a prefix of self (i.e., starts_with returns false)
-            // cwd is always a parent component of every path, safe to unwrap
-            let path = path.strip_prefix(&cwd).unwrap();
-            root.add(path, blob_id, mode);
-        }
-        let tree_id = root.into_tree(&|entries| db.store(Object::Tree(entries)));
-        refs::update_head(&lit, |parent| {
+        let tree_id = InMemTree::from_index(index).write(&db_path)?;
+        refs::update_head(&repo.head_path(), |parent| {
             // toDo: move this logic on a new() method for Commit where we read the author/committer from the .gitconfig file
             let commit = object::Commit {
                 author: Signature {
@@ -136,16 +157,17 @@ impl Commit {
                 },
                 message: "".to_string(),
                 // convert the [u8, 20] to its hex value
-                tree_id: tree_id.into_iter().map(|b| format!("{:02x}", b)).collect(),
+                tree_id: tree_id.iter().map(|b| format!("{:02x}", b)).collect(),
             };
-            db.store(Object::Commit(commit))
-        });
+            db::store(&db_path, Object::Commit(commit))
+        })?;
+        Ok(())
     }
 }
 
-    pub(super) struct Add {
+pub(super) struct Add {
     // user provided path
-    path: PathBuf,
+    pub(super) path: PathBuf,
 }
 
 impl Add {
@@ -160,22 +182,14 @@ impl Add {
     // Git still knows the repository root is jolt and the index path should be src/parser/lexer.rs
     // not just lexer.rs(what the user provided, self.path in our case)
     fn execute(&self) -> Result<(), AddError> {
-        let root = find_root()?;
-        let lit = root.join(".lit");
-        let db_path = lit.join("objects");
-        // don't use exists(), because it can still exist but not be a directory
-        if !db_path.is_dir() {
-            return Err(RepoError::MissingRepoFile { path: db_path })?;
-        }
-
-        let db = Database { path: db_path };
-        let (absolute, relative) = self.resolve_path(&root)?;
-        let mut index = Index::new();
-        let index_path = lit.join("index");
+        let repo = Repository::discover()?;
+        let db_path = repo.objects_path();
+        let (absolute, relative) = self.resolve_path(&repo.root)?;
+        let mut index = Index::new(repo.index_path());
         let mut entries = Vec::new();
-        collect_entries(&absolute, &relative, &db, &mut entries)?;
-        index.update(&index_path, entries)?;
-        
+        collect_entries(&absolute, &relative, &db_path, &mut entries)?;
+        index.update(entries)?;
+
         Ok(())
     }
 
@@ -184,42 +198,38 @@ impl Add {
     // path for Index
     // 2 different views for the same entry path
     fn resolve_path(&self, root: &Path) -> Result<(PathBuf, PathBuf), AddError> {
-        // toDo: make a trait or some sort of a conversion method
         let abs_root = root.canonicalize().map_err(|err| AddError::Io {
             path: root.to_path_buf(),
             source: err,
         })?;
 
-        // the closure covers the case where the user input is just a bare filename/path component, like
+        // self.parent() returns Some("") for relative paths with one component
         // lit add foo.txt
         // the parent directory as the current working directory
         // canonicalize(".") -> treats '.' as current working directory
         // toDo: when we implement the path spec logic we want to support lit add . and '.' means
         // add the current directory, not add a file named dot.
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let parent = match self.path.parent() {
+            Some(p) if p.as_os_str().is_empty() => Path::new("."),
+            Some(p) => p,
+            None => unreachable!(),
+        };
+
         let name = self.path.file_name().unwrap();
         let abs_parent = parent.canonicalize().map_err(|err| AddError::Io {
             path: parent.to_path_buf(),
             source: err,
         })?;
-        // we can't use the code below to find the absolute path of the user's provided path because
-        // if it is a symlink canonicalize() resolves symlinks, and instead of returning the absolute
-        // path of the symlink, it returns the absolute path of the target
+
+        // we can't call self.path.canonicalize() because if it is a symlink, canonicalize() will
+        // resolve it and instead of returning the absolute path of the symlink, it returns the
+        // absolute path of the target
         //
         // https://stackoverflow.com/questions/33157267/get-actual-path-symlink-is-pointing-to
         //
-        //
-        // let abs_path = match self.path.canonicalize() {
-        //     Ok(p) => p,
-        //     // 2 error variants can occur, ErrorKind::NotFound, ErrorKind::NotDirectory
-        //     Err(err) => {
-        //         return Err(AddError::Io {
-        //             path: self.path.clone(),
-        //             source: err,
-        //         });
-        //     }
-        // };
-
+        // to address that we canonicalize the parent path and then join the name of the last component
+        // it does not change anything for file/dir but allows us to compute the absolute path for
+        // the symlink itself
         let abs_path = abs_parent.join(name);
         // provided path is not part of the repository
         if !abs_path.starts_with(&abs_root) {
@@ -234,26 +244,11 @@ impl Add {
     }
 }
 
-// cwd is either the root(the directory that owns .lit) or a subdirectory of the root
-fn find_root() -> Result<PathBuf, RepoError> {
-    let mut dir = env::current_dir().map_err(|err| RepoError::CurrentDir(err))?;
-
-    loop {
-        if dir.join(".lit").is_dir() {
-            return Ok(dir);
-        }
-        // sets dir to parent, returns false if parent is None
-        if !dir.pop() {
-            return Err(RepoError::NotRepository);
-        }
-    }
-}
-
 // absolute and relative do not need to be the exact same type.
 fn collect_entries(
     absolute: &Path,
     relative: &Path,
-    db: &Database,
+    db_path: &Path,
     out: &mut Vec<IndexEntry>,
 ) -> Result<(), AddError> {
     let stat = os::stat(absolute).map_err(|err| AddError::StatFile {
@@ -267,7 +262,7 @@ fn collect_entries(
                 path: absolute.to_path_buf(),
                 source: err,
             })?;
-            let oid = db.store(Object::Blob(content));
+            let oid = db::store(db_path, Object::Blob(content))?;
             let path_bytes = index::to_path_bytes(&relative);
             index::validate_index_path(&path_bytes)?;
             out.push(IndexEntry::new(path_bytes, oid, stat));
@@ -280,7 +275,7 @@ fn collect_entries(
             })?;
             let content = index::to_path_bytes(&target);
             let size = content.len().min(u32::MAX as usize) as u32;
-            let oid = db.store(Object::Blob(content));
+            let oid = db::store(db_path, Object::Blob(content))?;
             // the content of the blob is the target path as bytes
             // the file size is the length of the above sequence
             // it is more of sanity check
@@ -303,7 +298,7 @@ fn collect_entries(
                 source: err,
             })?;
 
-            // toDo: --ignore-errors
+            // toDo: look at --ignore-errors flag
             for entry in read_dir {
                 // opening the directory can succeed, but reading one of its entries can fail later.
                 // permission/access changes while iterating
@@ -326,11 +321,11 @@ fn collect_entries(
                 let child_absolute = entry.path();
                 let child_relative = relative.join(&name);
 
-                collect_entries(&child_absolute, &child_relative, db, out)?;
+                collect_entries(&child_absolute, &child_relative, db_path, out)?;
             }
         }
         // toDo: for now we silently ignore unsupported types
-        other => {},
+        other => {}
     }
     Ok(())
 }

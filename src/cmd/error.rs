@@ -11,41 +11,74 @@ pub(super) enum RepoError {
     CurrentDir(io::Error),
     // "not a lit repository (or any of the parent directories)"
     NotRepository,
-    MissingRepoFile { path: PathBuf }
+    MissingRepoFile { path: PathBuf },
 }
 
+#[derive(Debug)]
+pub(super) struct DbError {
+    pub(super) path: PathBuf,
+    pub(super) source: io::Error,
+}
+
+#[derive(Debug)]
+pub(super) enum PathError {
+    Empty,
+    LeadingSlash,
+    TrailingSlash,
+    EmptyComponent,
+    ReservedComponent,
+    ContainsNul,
+}
+
+#[derive(Debug)]
+pub(super) enum LockfileError {
+    Io { path: PathBuf, source: io::Error, },
+    LockDenied { path: PathBuf, },
+}
 // an error that can occur when creating IndexEntry or parsing .lit/index
 // Git when format is corrupted reports: Unknown Index Format
 // No more information is provided to the user because they can't do much if the format is invalid
-
 #[derive(Debug)]
-pub(super) enum  IndexError {
-    InvalidIndexFormat(IndexFormatError),
+pub(super) enum IndexError {
+    InvalidChecksum,
+    UnsupportedVersion(u32),
+    InvalidFormat(FormatError),
     Io { path: PathBuf, source: io::Error },
-    LockDenied { path: PathBuf }
+    Lockfile(LockfileError),
 }
-
 
 #[derive(Debug)]
-pub(super) struct IndexFormatError {
-    pub(super) offset: usize,
-    pub(super) kind: IndexFormatErrorKind
+pub(super) enum RefError {
+    Io { path: PathBuf, source: io::Error },
+    Lockfile(LockfileError),
+    DbError(DbError)
 }
 
-impl IndexFormatError {
-    pub(super) fn at(offset: usize, kind: IndexFormatErrorKind) -> Self {
-        Self {
-            offset,
-            kind
-        }
+#[derive(Debug)]
+pub(super) struct FormatError {
+    pub(super) offset: usize,
+    pub(super) kind: FormatErrorKind,
+}
+
+impl FormatError {
+    pub(super) fn at(offset: usize, kind: FormatErrorKind) -> Self {
+        Self { offset, kind }
     }
 }
 
 #[derive(Debug)]
-pub(super) enum IndexFormatErrorKind {
+pub(super) enum FormatErrorKind {
     Eof { needed: usize, remaining: usize },
-    InvalidChecksum
-
+    InvalidChecksum,
+    InvalidSignature,
+    EntriesNotSorted,
+    EntriesCountMissMatch { actual: usize, expected: usize },
+    InvalidMode(u32),
+    InvalidNanoseconds,
+    MissingNulTerminator,
+    InvalidPadding,
+    LongPathLenMissMatch,
+    InvalidPathSyntax(PathError),
 }
 
 #[derive(Debug)]
@@ -62,7 +95,19 @@ pub(super) enum AddError {
     // fatal: unable to stat 'path': <source>
     StatFile { path: PathBuf, source: io::Error },
     Io { path: PathBuf, source: io::Error },
-    InvalidIndexFormat,
+    Index(IndexError),
+    DbError(DbError),
+    InvalidPath(PathError),
+}
+
+#[derive(Debug)]
+pub(super) enum CommitError {
+    Repo(RepoError),
+    Io { path: PathBuf, source: io::Error },
+    Index(IndexError),
+    DbError(DbError),
+    Lockfile(LockfileError),
+    RefError(RefError)
 }
 
 impl From<RepoError> for AddError {
@@ -71,8 +116,80 @@ impl From<RepoError> for AddError {
     }
 }
 
-impl From<IndexFormatError> for AddError {
-    fn from(_err: IndexFormatError) -> Self {
-        AddError::InvalidIndexFormat
+impl From<RepoError> for CommitError {
+    fn from(err: RepoError) -> Self { CommitError::Repo(err) }
+}
+
+impl From<PathError> for AddError {
+    fn from(err: PathError) -> Self {
+        AddError::InvalidPath(err)
     }
 }
+
+impl From<IndexError> for AddError {
+    fn from(err: IndexError) -> Self {
+        AddError::Index(err)
+    }
+}
+
+impl From<DbError> for AddError {
+    fn from(err: DbError) -> Self {
+        AddError::DbError(err)
+    }
+}
+
+impl From<IndexError> for CommitError {
+    fn from(err: IndexError) -> Self {
+        CommitError::Index(err)
+    }
+}
+
+impl From<DbError> for CommitError {
+    fn from(err: DbError) -> Self {
+        CommitError::DbError(err)
+    }
+}
+
+impl From<FormatError> for IndexError {
+    fn from(err: FormatError) -> Self {
+        IndexError::InvalidFormat(err)
+    }
+}
+
+impl From<PathError> for FormatErrorKind {
+    fn from(err: PathError) -> Self {
+        FormatErrorKind::InvalidPathSyntax(err)
+    }
+}
+
+impl From<LockfileError> for RefError {
+    fn from(err: LockfileError) -> Self {
+        RefError::Lockfile(err)
+    }
+}
+
+impl From<DbError> for RefError {
+    fn from(err: DbError) -> Self {
+        RefError::DbError(err)
+    }
+}
+
+impl From<LockfileError> for CommitError {
+    fn from(err: LockfileError) -> Self {
+        CommitError::Lockfile(err)
+    }
+}
+
+impl From<RefError> for CommitError {
+    fn from(err: RefError) -> Self {
+        CommitError::RefError(err)
+    }
+}
+
+impl From<LockfileError> for IndexError {
+    fn from(err: LockfileError) -> Self {
+        IndexError::Lockfile(err)
+    }
+}
+
+
