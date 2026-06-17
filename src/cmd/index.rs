@@ -25,8 +25,8 @@ const SIGNATURE: &'static str = "DIRC";
 
 // toDo: caching tree
 pub(super) struct Index {
-    path: PathBuf,
     pub(super) entries: Vec<IndexEntry>,
+    path: PathBuf,
     // a flag that is used to not unnecessary write if no changes detected
     modified: bool,
 }
@@ -40,13 +40,22 @@ impl Index {
         }
     }
 
+    // Git requires index entries to be sorted by filename. It is a requirement for deterministic
+    // hashing. When we try to hash a tree with 2 entries a and b, we need a and b to have fixed
+    // order otherwise we will compute a different hash for the same tree which breaks Git's invariance
+    // same content -> same hash
+    //
+    // We encofre sorted, unique index entries to achieve the same behavior. Maintaing the sorted
+    // order prevents the above issue where we could produce different hash for the same tree. By
+    // sorting based on the path we maintain the order accross all componenets of the path.
+    // foo/src/a, foo/src/b and foo/README . In the final order README appears before src as the entries
+    // of foo and a appears before b as the entries of src. Inserting in ascending order allows us
+    // to do BS for retrieveing entries instead of appending + sorting. Read more Tree::write()
     pub(super) fn add_entry(&mut self, entry: IndexEntry) {
         self.resolve_conflicts(&entry.path);
 
         match self.entries.binary_search_by(|e| e.path.cmp(&entry.path)) {
             Ok(pos) => {
-                // don't compare the oid because two different files can have the same exact content
-                // or even if it is the same file some metadata might have changed(mode, mtime)
                 if self.entries[pos] != entry {
                     self.entries[pos] = entry;
                     self.modified = true;
@@ -146,7 +155,7 @@ impl Index {
             return Err(IndexError::InvalidChecksum);
         }
 
-        let mut parser = Parser::new(&content);
+        let mut parser = Parser::new(content);
         if parser.take::<4>()? != SIGNATURE.as_bytes() {
             return Err(FormatError::at(0, FormatErrorKind::InvalidSignature))?;
         }
@@ -224,13 +233,6 @@ impl Index {
             !(is_parent_path(&entry.path, path) || is_parent_path(path, &entry.path))
         })
     }
-}
-
-// toDo: rethink this design 
-// we could do something like that returns some source of IoError wrapper because we need this with
-// lockfile
-fn io_error(path: PathBuf, err: io::Error) -> IndexError {
-    IndexError::Io { path, source: err }
 }
 
 // toDo: add GitLink support.
@@ -419,7 +421,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let path_bytes = &self.buffer[start..start + path_len];
         // path name needs to follow the rules of the index format
-        validate_index_path(path_bytes)
+        validate_path(path_bytes)
             .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // move to the next byte after the path that according to the format should be NUL
         self.pos = start + path_len;
@@ -484,7 +486,7 @@ impl<'a> Parser<'a> {
         }
 
         let path_bytes = &self.buffer[start..nul_pos];
-        validate_index_path(path_bytes)
+        validate_path(path_bytes)
             .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // skip NUL
         self.pos = nul_pos + 1;
@@ -550,7 +552,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-pub(super) fn validate_index_path(path: &[u8]) -> Result<(), PathError> {
+fn validate_path(path: &[u8]) -> Result<(), PathError> {
     if path.is_empty() {
         return Err(PathError::Empty);
     }
@@ -583,7 +585,7 @@ pub(super) fn validate_index_path(path: &[u8]) -> Result<(), PathError> {
     Ok(())
 }
 
-pub(super) fn to_path_bytes(path: &Path) -> Vec<u8> {
+pub(super) fn normalize_path(path: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut components = path.iter().peekable();
 

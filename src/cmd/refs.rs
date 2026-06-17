@@ -70,10 +70,9 @@ where
     // quite a lot.
     F: FnOnce(Option<String>) -> Result<[u8; 20], DbError>
 {
-    let mut lockfile = Lockfile::acquire(&path)?;
+    let mut lockfile = Lockfile::acquire(path)?;
     let parent = read_head(path)?;
     let new_id = f(parent)?;
-    // convert the [u8; 20] hash into its hex representation
     let new_id: String = new_id.iter().map(|c| format!("{:02x}", c)).collect();
 
     lockfile.write(new_id.as_bytes())?;

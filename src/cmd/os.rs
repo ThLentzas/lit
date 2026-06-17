@@ -32,6 +32,10 @@ fn to_unix_time_nsec(filetime: u64) -> u64 {
 
 #[cfg(unix)]
 pub(super) fn stat(path: &Path) -> Result<StatNode, io::Error> {
+    // Git tracks symlinks as symlinks, not as the files they point to. 
+    //  fs::metadata(path) follows symlinks. If path is a symlink to target, we get metadata about 
+    //  target. 
+    //  fs::symlink_metadata(path) does not follow. We get metadata about the symlink itself.
     let meta = fs::symlink_metadata(path)?;
 
     Ok(StatNode {

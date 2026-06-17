@@ -1,10 +1,9 @@
-use std::path::Path;
-use crate::cmd::object::{Object, TreeEntry};
-use indexmap::IndexMap;
-use indexmap::map::Entry as MapEntry;
-use crate::cmd::db;
+use crate::cmd::db::Database;
 use crate::cmd::error::DbError;
 use crate::cmd::index::Index;
+use crate::cmd::object::{Object, Entry};
+use indexmap::IndexMap;
+use indexmap::map::Entry as MapEntry;
 
 const MODE: u32 = 0o40000;
 
@@ -13,17 +12,13 @@ enum TreeNode {
     Tree(IndexMap<Vec<u8>, TreeNode>),
 }
 
-#[derive(Default)]
 // in memory representation of the Tree
-pub(super) struct InMemTree {
+#[derive(Default)]
+pub(super) struct Tree {
     entries: IndexMap<Vec<u8>, TreeNode>,
 }
 
-impl InMemTree {
-    fn new() -> Self {
-        Self::default()
-    }
-
+impl Tree {
     pub(super) fn from_index(index: Index) -> Self {
         let mut builder = Self::new();
 
@@ -43,9 +38,6 @@ impl InMemTree {
     // a blob in the database directory.
     //
     // By the time we are done, we have the in memory representation of the tree.
-    //
-    // Builds the in-memory representation of a tree
-    //
     // Instead of sorting + IndexMap we could use a BTreeMap. BTreeMap does not allow us to provide
     // a custom comparator. It sorts by the key’s Ord implementation. So we would need a custom key
     // type and impl Ord for it.
@@ -72,16 +64,18 @@ impl InMemTree {
                         TreeNode::Tree(dir) => dir,
                     },
                     // directory does not exist, create it and return a mutable reference
-                    MapEntry::Vacant(entry) => match entry.insert(TreeNode::Tree(IndexMap::new())) {
-                        TreeNode::Blob { .. } => unreachable!(),
-                        TreeNode::Tree(dir) => dir,
-                    },
+                    MapEntry::Vacant(entry) => {
+                        match entry.insert(TreeNode::Tree(IndexMap::new())) {
+                            TreeNode::Blob { .. } => unreachable!(),
+                            TreeNode::Tree(dir) => dir,
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Builds the Merkle Tree.
+    // Builds the Merkle Tree also mentioned as Merkle DAG.
     //
     // First we hash the leaves. For each file, read its contents, compute the blob's hash, store
     // the blob keyed by that hash. Every file has an oid now. These are the leaf hashes of the
@@ -109,7 +103,7 @@ impl InMemTree {
     //  src/foo/hello.rs     -> blob E, mode 100644
     //  src/foo/test.rs      -> blob F, mode 100644
     //
-    // After building the InMemTree it looks like this:
+    // After building the Tree it looks like this:
     //  root
     //  ├── foo-bar.txt         blob A
     //  ├── foo
@@ -198,19 +192,23 @@ impl InMemTree {
     //
     // That is why rollback is not required. The visible state of the repository is controlled by
     // refs like HEAD, not by the presence of loose objects in .lit/objects.
-    pub(super) fn write(self, db_path: &Path) -> Result<[u8; 20], DbError> {
+    pub(super) fn write(self, db: &Database) -> Result<[u8; 20], DbError> {
         let mut entries = Vec::new();
 
         for (name, node) in self.entries {
             let (oid, mode) = match node {
                 TreeNode::Blob { oid, mode } => (oid, mode),
                 TreeNode::Tree(dir) => {
-                    let child_oid = InMemTree { entries: dir }.write(db_path)?;
+                    let child_oid = Tree { entries: dir }.write(db)?;
                     (child_oid, MODE)
                 }
             };
-            entries.push(TreeEntry { oid, name, mode });
+            entries.push(Entry { oid, name, mode });
         }
-        db::store(db_path, Object::Tree(entries))
+        db.store(Object::Tree(entries))
+    }
+
+    fn new() -> Self {
+        Self::default()
     }
 }

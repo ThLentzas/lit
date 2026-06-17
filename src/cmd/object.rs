@@ -1,11 +1,9 @@
 use std::io::Write;
-use std::ffi::OsString;
 use chrono::Local;
-use crate::cmd::{os, workspace};
 
 pub(super) enum Object {
     Blob(Vec<u8>),
-    Tree(Vec<TreeEntry>),
+    Tree(Vec<Entry>),
     Commit(Commit)
 }
 
@@ -30,8 +28,7 @@ impl Object {
                 // the hash has a fixed length of 20 bytes. There's no delimiter between that and
                 // the next entry's mode because we don't need one, we just count 20 bytes and stop.
                 // Whatever comes next is the start of the next entry.
-                // toDo: make this a for loop
-                entries.into_iter().for_each(|entry| {
+                for entry in entries {
                     // we have to store the ASCII bytes of the mode so for 100644: [49, 48, 48, 54, 52, 52]
                     // convert the numeric value into textual octal digits and append those ASCII
                     // bytes to the Vec<u8>
@@ -47,7 +44,7 @@ impl Object {
                     bytes.extend(&entry.name);
                     bytes.push(0);
                     bytes.extend_from_slice(&entry.oid);
-                });
+                }
                 bytes
             }
             // tree <tree-oid-in-hex>
@@ -105,7 +102,7 @@ pub(super) struct Signature {
     pub(super) timestamp: String
 }
 
-pub(super) struct TreeEntry {
+pub(super) struct Entry {
     pub(super) oid: [u8; 20],
     // read the notes "Filenames"
     pub(super) name: Vec<u8>,

@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 
@@ -14,10 +15,23 @@ pub(super) enum RepoError {
     MissingRepoFile { path: PathBuf },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PathspecError {
+    OutsideRepository { path: PathBuf },
+    ReservedComponent { path: PathBuf, component: OsString }
+}
+
 #[derive(Debug)]
 pub(super) struct DbError {
     pub(super) path: PathBuf,
     pub(super) source: io::Error,
+}
+
+#[derive(Debug)]
+pub(super) enum  WsError {
+    CurrentDir{ source: io::Error },
+    Io { path: PathBuf, source: io::Error },
+    OutsideRepository { path: PathBuf }
 }
 
 #[derive(Debug)]
@@ -84,20 +98,10 @@ pub(super) enum FormatErrorKind {
 #[derive(Debug)]
 pub(super) enum AddError {
     Repo(RepoError),
-    OutsideRepository { path: PathBuf, root: PathBuf },
-    // The path resolved successfully, but when add tried to inspect its metadata, the OS failed
-    // This can happen because the filesystem can change between operations:
-    //      let (absolute, relative) = self.resolve_path(&root)?;
-    //      let stat = os::stat(&absolute)?;
-    //
-    // Even if resolve_path() succeeded, another process might delete the file before stat() runs.
-    // Or permissions might change. Or the path might become inaccessible.
-    // fatal: unable to stat 'path': <source>
-    StatFile { path: PathBuf, source: io::Error },
-    Io { path: PathBuf, source: io::Error },
     Index(IndexError),
     DbError(DbError),
-    InvalidPath(PathError),
+    WsError(WsError),
+    Pathspec(PathspecError),
 }
 
 #[derive(Debug)]
@@ -120,9 +124,9 @@ impl From<RepoError> for CommitError {
     fn from(err: RepoError) -> Self { CommitError::Repo(err) }
 }
 
-impl From<PathError> for AddError {
-    fn from(err: PathError) -> Self {
-        AddError::InvalidPath(err)
+impl From<PathspecError> for AddError {
+    fn from(err: PathspecError) -> Self {
+        AddError::Pathspec(err)
     }
 }
 
@@ -135,6 +139,12 @@ impl From<IndexError> for AddError {
 impl From<DbError> for AddError {
     fn from(err: DbError) -> Self {
         AddError::DbError(err)
+    }
+}
+
+impl From<WsError> for AddError {
+    fn from(err: WsError) -> Self {
+        AddError::WsError(err)
     }
 }
 
