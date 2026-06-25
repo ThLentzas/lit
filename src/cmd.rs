@@ -22,6 +22,7 @@ pub mod index;
 mod os;
 mod pathspec;
 pub mod workspace;
+mod config;
 
 // init creates repository structure
 // add creates/updates the index
@@ -144,6 +145,10 @@ impl Add {
         let mut index = Index::new(repo.index_path());
 
         for path in self.paths.iter() {
+            // if the user called add . from root then the prefix is "" and the pathspec.pattern is
+            // also  "". This is fine because in collect_entries() for the dir case we call ws.list_dir()
+            // which does self.root.join(relative) so absolute root + "" give us the absolute to root
+            // path which is what we want.
             let pathspec = if path.is_absolute() {
                 Pathspec::new(path.as_os_str(), Path::new(""), &repo.root)?
             } else {
@@ -189,6 +194,7 @@ impl Commit {
         index.load()?;
 
         let tree_id = Tree::from_index(index).write(&db)?;
+        // toDo: first try to read the user info from env variables
         refs::update_head(&repo.head_path(), |parent| {
             // toDo: move this logic on a new() method for Commit where we read the author/committer from the .gitconfig file
             let commit = object::Commit {

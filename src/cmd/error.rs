@@ -1,12 +1,14 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-
 // toDo: maybe instead of PathBuf we could &'static Path to avoid cloning on the call site?
 
 // toDo: A function does not need to be able to return every variant of the enum. That is not
 // automatically bad design. What matters is whether the enum represents the error domain of the layer/function.
 // that is the case for find_root() where it can return 2/3 variants
+
+use crate::cmd::config::parse::ParseError;
+
 #[derive(Debug)]
 pub(super) enum RepoError {
     CurrentDir(io::Error),
@@ -28,10 +30,19 @@ pub(super) struct DbError {
 }
 
 #[derive(Debug)]
-pub(super) enum  WsError {
+pub(super) enum WsError {
     CurrentDir{ source: io::Error },
     Io { path: PathBuf, source: io::Error },
     OutsideRepository { path: PathBuf }
+}
+
+#[derive(Debug)]
+pub(super) enum ConfigError {
+    Io { path: PathBuf, source: io::Error },
+    Lockfile(LockfileError),
+    // toDo: display the unexpected byte value as hex, git shows bad config line 1. We can provide
+    // toDo: a message with more information such as the actual reason and the offset within the line
+    InvalidFormat { line: usize, source: ParseError}
 }
 
 #[derive(Debug)]

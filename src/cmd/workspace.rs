@@ -87,7 +87,8 @@ impl Workspace {
 
             let name = entry.file_name();
             // toDo: should this be an error?
-            if name == ".lit" {
+            // remove .git and add .litignore
+            if name == ".lit" || name == ".git" || name == "target" {
                 continue;
             }
 

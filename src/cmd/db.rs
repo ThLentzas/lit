@@ -31,6 +31,7 @@ impl Database {
         // don't confused it with utf-8
         // map [144, 58, 113, 173, 48, 13, 90, 161, 186, 12, ...] to [90, 3a, 71, ad, 30, 0d, 5a...].
         // Any u8 can be represented with at most 2 hex digits so the output is a String of length 40.
+        // u8 spans from 0 to 255 which is equivalent to 0x00 - 0xFF
         // both the 20 raw bytes and the 40-character hex string are the same hash. They are two
         // representations of the same 160-bit value
         let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
