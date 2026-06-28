@@ -14,12 +14,13 @@ enum TreeNode {
 
 // in memory representation of the Tree
 #[derive(Default)]
-pub(super) struct Tree {
+pub(crate) struct Tree {
+    // IndexMap maintains the sorting order of Index
     entries: IndexMap<Vec<u8>, TreeNode>,
 }
 
 impl Tree {
-    pub(super) fn from_index(index: Index) -> Self {
+    pub(crate) fn from_index(index: Index) -> Self {
         let mut builder = Self::new();
 
         for entry in index.entries {
@@ -192,7 +193,7 @@ impl Tree {
     //
     // That is why rollback is not required. The visible state of the repository is controlled by
     // refs like HEAD, not by the presence of loose objects in .lit/objects.
-    pub(super) fn write(self, db: &Database) -> Result<[u8; 20], DbError> {
+    pub(crate) fn write(self, db: &Database) -> Result<[u8; 20], DbError> {
         let mut entries = Vec::new();
 
         for (name, node) in self.entries {

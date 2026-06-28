@@ -2,6 +2,7 @@ use crate::cmd::error::PathspecError;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
+// toDo: add magic support
 // the set of paths certain commands should operate on
 #[derive(Debug)]
 pub(super) struct Pathspec {
@@ -122,7 +123,7 @@ mod tests {
     use std::ffi::OsString;
     use super::*;
 
-    // instead of caring (OsString, PathBuf, Pathspec)
+    // instead of carrying (OsString, PathBuf, Pathspec)
     #[derive(Debug)]
     struct GoodPath {
         arg: OsString,

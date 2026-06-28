@@ -1,17 +1,18 @@
-use super::{Line, LineKind, Span};
+use super::Span;
 
 // all the parse methods that we use to parse a LineKind like parse_section or parse_variable
 // do not return LineKind but the information of the kind they are parsing. We have seen this with
 // jolt and parse_array(). We didnt not return Value but Vec<Value> it is correct semmanticly. By
 // returning a LineKind someone could assume that we could return any kind of Line.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParseError {
     pub kind: ParseErrorKind,
     pub pos: usize, // line-relative offset
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ParseErrorKind {
+    // toDo: make it expected, got
     UnexpectedByte(u8),
     UnterminatedQuote,
     UnexpectedEof,
@@ -20,15 +21,41 @@ pub(crate) enum ParseErrorKind {
 pub(super) struct LineParser<'a> {
     buf: &'a [u8],
     pos: usize,
-    span: Span,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum LineKind {
+    Blank,
+    Comment,
+    Section { name: Span, subsection: Option<Span>, },
+    Variable { name: Span, value: Option<Span>, },
+}
+
+impl LineKind {
+    // LineParser parses a single logical line using spans that are relative to that line's slice.
+    // The Config buffer, however, stores the whole file, and all CST spans should point into that
+    // shared buffer. Shift every parsed child span by the line's starting offset so `name`,
+    // `subsection`, and `value` become absolute spans into the full input buffer.
+    pub(super) fn offset(self, base: usize) -> LineKind {
+        let shift = |s: Span| Span { start: s.start + base, end: s.end + base };
+
+        match self {
+            LineKind::Section { name, subsection } => {
+                LineKind::Section { name: shift(name), subsection: subsection.map(shift) }
+            },
+            LineKind::Variable { name, value } => {
+                LineKind::Variable { name: shift(name), value: value.map(shift) }
+            },
+            other => other,
+        }
+    }
 }
 
 impl<'a> LineParser<'a> {
-    pub(super) fn new(buf: &'a [u8], span: Span) -> Self {
+    pub(super) fn new(buf: &'a [u8]) -> Self {
         Self {
-            buf: &buf[span.start..span.end],
+            buf,
             pos: 0,
-            span,
         }
     }
 
@@ -38,28 +65,22 @@ impl<'a> LineParser<'a> {
     // we skip ws at the start of the line and then only between different tokens within the line.
     // For a variable, we skip ws to parse the name(1st token) then we skip to parse the optional
     // '='(2nd token) and the remaining is the value. We never skip ws after parsing the value.
-    pub(super) fn parse(mut self) -> Result<Line, ParseError> {
+    pub(super) fn parse(mut self) -> Result<LineKind, ParseError> {
         self.skip_ws();
 
         match self.peek() {
             Some(b'[') => {
                 let kind = self.parse_section()?;
                 self.check_trailing_comment()?;
-                Ok(Line {
-                    raw: self.span,
-                    kind: LineKind::Section { name: kind.0, subsection: kind.1 },
-                })
+                Ok(LineKind::Section { name: kind.0, subsection: kind.1 },)
             }
-            // we never scan the comment if we detect it, it spans until the end of the line
-            // comments can't be multiline
-            Some(b'#' | b';') => Ok(Line { raw: self.span, kind: LineKind::Comment, }),
             Some(byte) if byte.is_ascii_alphabetic() => {
                 let variable = self.parse_variable()?;
-                Ok(Line { raw: self.span, kind: LineKind::Variable { 
-                    name: variable.0, 
-                    value: variable.1 
-                }})
+                Ok(LineKind::Variable { name: variable.0, value: variable.1 })
             },
+            // we never scan the comment if we detect it, it spans until the end of the line
+            // comments can't be multiline
+            Some(b'#' | b';') => Ok(LineKind::Comment),
             // if after skipping ws we are at the end of line we have a blank line,
             // if the last line is blank then there is no '\n' at the end of the line so peek() returns
             // none, for any other line it returns Some(b'\n') or Some(b'/r') depending on the OS
@@ -69,10 +90,10 @@ impl<'a> LineParser<'a> {
             // https://stackoverflow.com/questions/1552749/difference-between-cr-lf-lf-and-cr-line-break-types
             // When we read the file, we are more permissive. A user may edit .lit/config manually
             // with an editor that writes CRLF. When we write we always emit LF
-            Some(b'\r' | b'\n') | None => Ok(Line { raw: self.span, kind: LineKind::Blank, }),
-            Some(byte) => Err(ParseError {
+            Some(b'\r' | b'\n') | None => Ok(LineKind::Blank),
+            Some(&byte) => Err(ParseError {
                 pos: self.pos,
-                kind: ParseErrorKind::UnexpectedByte(*byte),
+                kind: ParseErrorKind::UnexpectedByte(byte),
             }),
         }
     }
@@ -81,69 +102,50 @@ impl<'a> LineParser<'a> {
         self.advance(1); // skip opening '['
         let start = self.pos;
 
-        while let Some(b) = self.peek() {
-            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.') {
+        while let Some(&b) = self.peek() {
+            // Git supports also '.' as a value for the section name, we don't. Read config.rs
+            if b.is_ascii_alphanumeric() || b == b'-'  {
                 self.advance(1);
             } else {
                 break;
             }
         }
-        let section = Span { start, end: self.pos, };
 
+        let section = Span { start, end: self.pos, };
+        // [] empty section name not allowed
+        if let Some(b']') = self.peek() {
+            return if start == self.pos {
+                Err(ParseError { pos: self.pos, kind: ParseErrorKind::UnexpectedByte(b']') })
+            } else {
+                self.advance(1); // skip closing ']'
+                Ok((section, None))
+            }
+        }
         // Header has a strict syntax: [section "subsection"]. No leading/trailing whitespaces are
         // allowed, section is separated from subsection by a single space
-        match self.peek() {
-            Some(b' ') => self.advance(1),
-            Some(b']') => {
-                self.advance(1); // skip closing ']'
-                return Ok((section, None));
-            }
-            Some(&byte) => {
-                return Err(ParseError {
-                    pos: self.pos,
-                    kind: ParseErrorKind::UnexpectedByte(byte),
-                });
-            }
-            None => return Err(ParseError {
-                pos: self.pos,
-                kind: ParseErrorKind::UnexpectedEof,
-            }),
-        }
-
-        let subsection = match self.peek() {
-            Some(b']') => {
-                self.advance(1);
-                None
-            },
-            Some(b'"') => Some(self.parse_subsection()?),
-            Some(&byte) => return Err(ParseError {
-                pos: self.pos,
-                kind: ParseErrorKind::UnexpectedByte(byte),
-            }),
-            None => return Err(ParseError {
-                pos: self.pos,
-                kind: ParseErrorKind::UnexpectedEof,
-            }),
+        self.expect(b' ')?;
+        // [core ] is allowed
+        if let Some(b']') = self.peek() {
+            self.advance(1);
+            return Ok((section, None));
         };
-        Ok((section, subsection))
+        self.expect(b'\"')?;
+        let subsection = self.parse_subsection()?;
+        self.expect(b']')?;
+
+        Ok((section, Some(subsection)))
     }
 
     fn parse_subsection(&mut self) -> Result<Span, ParseError> {
-        self.advance(1); // skip opening "
         let start = self.pos;
 
-        while let Some(byte) = self.peek() {
+        // ws are allowed within ""
+        while let Some(&byte) = self.peek() {
             match byte {
                 b'\"' => {
                     let span = Span { start, end: self.pos, };
                     self.advance(1);
                     return Ok(span);
-                }
-                b' ' | b'\t' => {
-                    return Err(ParseError {
-                        pos: self.pos,
-                        kind: ParseErrorKind::UnexpectedByte(*byte),
-                    });
                 }
                 // unpaired
                 b'\\' if self.buf.get(self.pos + 1).is_none() => {
@@ -162,26 +164,12 @@ impl<'a> LineParser<'a> {
         Err(ParseError { pos: self.pos, kind: ParseErrorKind::UnexpectedEof, })
     }
 
-    fn check_trailing_comment(&mut self) -> Result<(), ParseError> {
-        self.skip_ws();
-        match self.peek() {
-            // once we see the delimiter for comment it is enough to stop, we never scan the contents
-            // everything after the delimiter up to the end of the buffer is part of the comment.
-            // \ inside a comment is an ordinary byte. Comments do not fold in the next line
-            None | Some(b'#' | b';') => Ok(()),
-            Some(&byte) => Err(ParseError {
-                pos: self.pos,
-                kind: ParseErrorKind::UnexpectedByte(byte),
-            }), // junk post closing ']' is an error
-        }
-    }
-
     // only values can be multiline so the check for '\' happens in parse_value() everywhere else
     // is an unexpected character.
     fn parse_variable(&mut self) -> Result<(Span, Option<Span>), ParseError> {
+        let start = self.pos;
         // the 1st character is verified that is alphabetic by the caller
         self.advance(1);
-        let start = self.pos;
 
         // name can contain only alphanumeric characters and '-'
         while let Some(b) = self.peek() {
@@ -201,7 +189,7 @@ impl<'a> LineParser<'a> {
                 Some(self.parse_value()?)
             }
             // valueless boolean, implicitly true
-            Some(b'#') | Some(b';') | None => None,
+            Some(b'#'| b';' | b'\r' | b'\n') | None => None,
             Some(&byte) => return Err(ParseError {
                 pos: self.pos,
                 kind: ParseErrorKind::UnexpectedByte(byte),
@@ -246,6 +234,8 @@ impl<'a> LineParser<'a> {
     // parse_value() must hold the invariance that the span of the value does not include any
     // leading/trailing ws.
     fn parse_value(&mut self) -> Result<Span, ParseError> {
+        // quotes and /<newline> are include if present, will be dropped later when we interpret the
+        // value
         let start = self.pos;
         let mut in_quote = false;
         let mut last_quote_pos= start;
@@ -296,10 +286,26 @@ impl<'a> LineParser<'a> {
         // we can't do it as we parse the value because we don't know yet if they will be part of the
         // value until we hit a comment or a newline.(the cases where we break above)
         let mut end = self.pos;
-        while end >= start && matches!(self.buf[end - 1], b' ' | b'\t') {
+        while end > start && matches!(self.buf[end - 1], b' ' | b'\t') {
             end -= 1;
         }
         Ok(Span { start, end })
+    }
+
+    fn check_trailing_comment(&mut self) -> Result<(), ParseError> {
+        self.skip_ws();
+        // another implementation would be to call eol() after skip_ws() and then instead of calling
+        // peek() we index into the buffer since we know we are in bounds
+        match self.peek() {
+            // once we see the delimiter for comment or eol it is enough to stop, we never scan the
+            // contents everything after the delimiter up to the end of the buffer is part of the
+            // comment. '\' inside a comment is an ordinary byte. Comments do not fold in the next line
+            None | Some(b'\n' | b'\r' | b'#' | b';') => Ok(()),
+            Some(&byte) => Err(ParseError {
+                pos: self.pos,
+                kind: ParseErrorKind::UnexpectedByte(byte),
+            }), // junk post closing ']' is an error
+        }
     }
 
     fn advance(&mut self, n: usize) {
@@ -308,6 +314,23 @@ impl<'a> LineParser<'a> {
 
     fn peek(&self) -> Option<&u8> {
         self.buf.get(self.pos)
+    }
+
+    fn expect(&mut self, expected: u8) -> Result<(), ParseError> {
+        match self.peek() {
+            Some(&byte) if byte == expected => {
+                self.advance(1);
+                Ok(())
+            }
+            Some(&byte) => Err(ParseError {
+                pos: self.pos,
+                kind: ParseErrorKind::UnexpectedByte(byte),
+            }),
+            None => Err(ParseError {
+                pos: self.pos,
+                kind: ParseErrorKind::UnexpectedEof,
+            }),
+        }
     }
 
     // read parse()
@@ -319,5 +342,267 @@ impl<'a> LineParser<'a> {
 
     fn eol(&self) -> bool {
         matches!(self.peek(), None | Some(b'\n' | b'\r'))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_sections() -> Vec<(&'static [u8], LineKind)> {
+        vec![
+            // section, no subsection
+            (b"[core]\n", LineKind::Section {
+                name: Span { start: 1, end: 5 },
+                subsection: None
+            }),
+            (b"[123]", LineKind::Section {
+                name: Span { start: 1, end: 4 },
+                subsection: None
+            }),
+            (b"[core]  \t\n", LineKind::Section {
+                name: Span { start: 1, end: 5 },
+                subsection: None
+            }),
+            (b"[core];trailing comment\n", LineKind::Section {
+                name: Span { start: 1, end: 5 },
+                subsection: None
+            }),
+            (b"[core]#trailing comment\n", LineKind::Section {
+                name: Span { start: 1, end: 5 },
+                subsection: None
+            }),
+            (b"[foo-bar]", LineKind::Section {
+                name: Span { start: 1, end: 8 },
+                subsection: None
+            }),
+            (b"[core ]", LineKind::Section {
+                name: Span { start: 1, end: 5 },
+                subsection: None
+            }),
+            // section, subsection
+            (b"[remote \"origin\"]", LineKind::Section {
+                name: Span { start: 1, end: 7 },
+                subsection: Some(Span { start: 9, end: 15 })
+            }),
+            (b"[remote \"\"]", LineKind::Section {
+                name: Span { start: 1, end: 7 },
+                subsection: Some(Span { start: 9, end: 9 })
+            }),
+            (b"[remote \"a\\\"b\"]", LineKind::Section {
+                name: Span { start: 1, end: 7 },
+                subsection: Some(Span { start: 9, end: 13 })
+            }),
+            (b"[remote \"my origin\"]\n", LineKind::Section {
+                name: Span { start: 1, end: 7 },
+                subsection: Some(Span { start: 9, end: 18 })
+            }),
+            (b"[remote \"a b ; # c\"]\n", LineKind::Section {
+                name: Span { start: 1, end: 7 },
+                subsection: Some(Span { start: 9, end: 18 })
+            }),
+        ]
+    }
+
+    fn invalid_sections() -> Vec<(&'static [u8], ParseError)> {
+        vec![
+            (b"[core\n", ParseError { pos: 5, kind:ParseErrorKind::UnexpectedByte(b'\n') }),
+            (b"[core", ParseError { pos: 5, kind:ParseErrorKind::UnexpectedEof }),
+            // this is tricky, the section name is "re" then we have the mandatory space and when
+            // we try to parse the subsection we encounter an unexpected 'm' instead of '"'
+            (b"[re mote]\n", ParseError { pos: 4, kind:ParseErrorKind::UnexpectedByte(b'm') }),
+            // expected a space between section-subsection
+            (b"[core\"x\"]\n", ParseError { pos: 5, kind:ParseErrorKind::UnexpectedByte(b'\"') }),
+            // never found closing quote
+            (b"[remote \"origin\n", ParseError { pos: 16, kind:ParseErrorKind::UnexpectedEof }),
+            // empty section name not allowed
+            (b"[]", ParseError { pos: 1, kind:ParseErrorKind::UnexpectedByte(b']') }),
+        ]
+    }
+
+    fn valid_variables() -> Vec<(&'static [u8], LineKind)> {
+        vec![
+            (b"key = value\n", LineKind::Variable {
+                name: Span { start: 0, end: 3 },
+                value: Some(Span { start: 6, end: 11 })
+            }),
+            (b"key=value\n", LineKind::Variable {
+                name: Span { start: 0, end: 3 },
+                value: Some(Span { start: 4, end: 9 })
+            }),
+            // trailing ws
+            (b"key=value  \t\n", LineKind::Variable {
+                name: Span { start: 0, end: 3 },
+                value: Some(Span { start: 4, end: 9 })
+            }),
+            // internal spaces are retained
+            (b"name = John Doe\n", LineKind::Variable {
+                name: Span { start: 0, end: 4 },
+                value: Some(Span { start: 7, end: 15 })
+            }),
+            // leading/trailing ws are retained within quotes
+            (b"key = \"  value \"", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 16 })
+            }),
+            // partial quoting
+            (b"key = \" a \"b\" c \"", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 17 })
+            }),
+            (b"key = \" # not a comment\"", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 24 })
+            }),
+            // trailing comment stops the value span
+            (b"key = \"value\" ; trailing comment", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 13 })
+            }),
+            // trailing comment stops the value span
+            (b"key = \"value\" # trailing comment", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 13 })
+            }),
+            // \t escaped
+            (b"key = \\t", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 8 })
+            }),
+            // empty value
+            (b"key =", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 5, end: 5 })
+            }),
+            // empty value with leading ws
+            (b"key =    \n", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 9, end: 9 })
+            }),
+            // empty value followed by comment
+            (b"key =  ; comment \n", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 7, end: 7 })
+            }),
+            // continuation, folded value foo\<nl>bar, the internal ws are retained
+            (b"key = foo \\\n bar\n", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 16 })
+            }),
+            // value begins with continuation
+            (b"key = \\\n bar\n", LineKind::Variable {
+                name: Span { start: 0, end: 3},
+                value: Some(Span { start: 6, end: 12 })
+            }),
+            // valueless
+            (b"flag\n", LineKind::Variable {
+                name: Span { start: 0, end: 4 },
+                value: None
+            }),
+            (b"flag ; comment\n", LineKind::Variable {
+                name: Span { start: 0, end: 4 },
+                value: None
+            }),
+            // 1st has to be alphabetic
+            (b"a1-2-3 ; comment\n", LineKind::Variable {
+                name: Span { start: 0, end: 6 },
+                value: None
+            }),
+        ]
+    }
+
+    fn invalid_variables() -> Vec<(&'static [u8], ParseError)> {
+        vec![
+            (b"key! = value\n", ParseError { pos: 3, kind:ParseErrorKind::UnexpectedByte(b'!') }),
+            // must start with alphabetic
+            (b"123 = value\n", ParseError { pos: 0, kind:ParseErrorKind::UnexpectedByte(b'1') }),
+            (b"key = \"value", ParseError { pos: 6, kind:ParseErrorKind::UnterminatedQuote}),
+            // unknown escape
+            (b"key = \\q", ParseError { pos: 7, kind:ParseErrorKind::UnexpectedByte(b'q')}),
+        ]
+    }
+
+    fn comments() -> Vec<(&'static [u8], LineKind)> {
+        vec![
+            (b"#hello", LineKind::Comment),
+            (b"  #leading ws", LineKind::Comment),
+            // empty comment
+            (b"#", LineKind::Comment),
+            (b"# part of the comment ;", LineKind::Comment),
+        ]
+    }
+
+    fn blank_lines() -> Vec<(&'static [u8], LineKind)> {
+        vec![
+            // empty line
+            (b"", LineKind::Blank),
+            (b"  \t \n", LineKind::Blank),
+            // CRLF
+            (b"   \r\n", LineKind::Blank)
+        ]
+    }
+
+    #[test]
+    fn test_valid_sections() {
+        for (buf, kind) in valid_sections() {
+            let parser = LineParser::new(buf);
+            let res = parser.parse().unwrap();
+            assert_eq!(kind, res, "failed: {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn test_invalid_sections() {
+        for (buf, err) in invalid_sections() {
+            let parser = LineParser::new(buf);
+            let res = parser.parse();
+            assert_eq!(res, Err(err), "failed: {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn test_valid_variables() {
+        for (buf, kind) in valid_variables() {
+            let parser = LineParser::new(buf);
+            let res = parser.parse().unwrap();
+            assert_eq!(kind, res, "failed: {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn test_invalid_variables() {
+        for (buf, err) in invalid_variables() {
+            let parser = LineParser::new(buf);
+            let res = parser.parse();
+            assert_eq!(res, Err(err), "failed: {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn test_comments() {
+        for (buf, kind) in comments() {
+            let parser = LineParser::new(buf);
+            let res = parser.parse().unwrap();
+            assert_eq!(kind, res, "failed: {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn test_blank_lines() {
+        for (buf, kind) in blank_lines() {
+            let parser = LineParser::new(buf);
+            let res = parser.parse().unwrap();
+            assert_eq!(kind, res, "failed: {:?}", buf);
+        }
+    }
+
+    #[test]
+    fn test_unexpected_character() {
+        // @
+        let buf = [64];
+        let parser = LineParser::new(&buf);
+        let err = ParseError { pos: 0, kind: ParseErrorKind::UnexpectedByte(b'@') };
+        let res = parser.parse();
+        assert_eq!(res, Err(err), "failed: {:?}", buf);
     }
 }

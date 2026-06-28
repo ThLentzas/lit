@@ -1,5 +1,11 @@
+use std::env;
+use std::env::VarError;
+use std::ffi::OsString;
 use std::io::Write;
+use std::string::FromUtf8Error;
 use chrono::Local;
+use crate::cmd::config::Config;
+use crate::cmd::os;
 
 pub(super) enum Object {
     Blob(Vec<u8>),
@@ -93,6 +99,13 @@ pub(super) struct Commit {
     pub(super) tree_id: String,
 }
 
+pub(super) enum SignatureError {
+    NotFound(& 'static str),
+    NotUnicode(OsString),
+    InvalidTimeStamp(&'static str)
+}
+
+// https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
 pub(super) struct Signature {
     pub(super) email: String,
     pub(super) name: String,
@@ -100,6 +113,55 @@ pub(super) struct Signature {
     // let timestamp = now.timestamp();
     // let offset = now.offset();
     pub(super) timestamp: String
+}
+
+impl Signature {
+    pub(super) fn author(config: &Config) -> Result<Self, SignatureError> {
+        let name = match env::var("GIT_AUTHOR_NAME") {
+            Ok(s) => s,
+            Err(err) => match err {
+                VarError::NotPresent => {
+                    // toDo: enforce in config that variables are always utf8 valid seq
+                    let name = config.get("author.name".as_ref())
+                        .or_else(|| config.get("user.name".as_ref()))
+                        .ok_or(SignatureError::NotFound("author name"))?;
+                    unsafe { String::from_utf8_unchecked(name.to_vec()) }
+                },
+                // write!(f, "environment variable was not valid unicode: {:?}", s)
+                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+            }
+        };
+
+        let email = match env::var("GIT_AUTHOR_EMAIL") {
+            Ok(s) => s,
+            Err(err) => match err {
+                VarError::NotPresent => {
+                    // toDo: enforce in config that variables are always utf8 valid seq
+                    let email = config.get("author.email".as_ref())
+                        .or_else(|| config.get("user.email".as_ref()))
+                        .ok_or(SignatureError::NotFound("author email"))?;
+                    unsafe { String::from_utf8_unchecked(email.to_vec()) }
+                },
+                // write!(f, "environment variable was not valid unicode: {:?}", s)
+                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+            }
+        };
+
+        let timestamp = match env::var("GIT_AUTHOR_DATE") {
+            Ok(s) => s,
+            Err(err) => match err {
+                VarError::NotPresent => {
+                    let now = Local::now();
+                    let timestamp = now.timestamp();
+                    let offset = now.offset();
+                },
+                // write!(f, "environment variable was not valid unicode: {:?}", s)
+                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+            }
+        };
+
+        Ok(Self { name, email, timestamp})
+    }
 }
 
 pub(super) struct Entry {

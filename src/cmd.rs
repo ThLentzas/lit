@@ -4,7 +4,7 @@ use crate::cmd::index::{Index, IndexEntry, StatNode};
 use crate::cmd::lockfile::Lockfile;
 use crate::cmd::object::{Object, Signature};
 use crate::cmd::pathspec::Pathspec;
-use crate::cmd::tree::Tree;
+use crate::cmd::index::tree::Tree;
 use crate::cmd::workspace::Workspace;
 use std::env::Args;
 use std::iter::{Peekable, Skip};
@@ -15,7 +15,6 @@ pub mod db;
 mod lockfile;
 mod object;
 pub mod refs;
-pub mod tree;
 
 mod error;
 pub mod index;
@@ -23,6 +22,7 @@ mod os;
 mod pathspec;
 pub mod workspace;
 mod config;
+pub mod timestamp;
 
 // init creates repository structure
 // add creates/updates the index
@@ -83,6 +83,9 @@ impl Repository {
     fn index_path(&self) -> PathBuf {
         self.lit.join("index")
     }
+    fn config_path(&self) -> PathBuf {
+        self.lit.join("config")
+    }
 
     fn head_path(&self) -> PathBuf {
         self.lit.join("HEAD")
@@ -116,9 +119,10 @@ impl Init {
         }
         
         // on Linux the files will be hidden by default since any file that starts with . is hidden
-        let git_dir = self.path.join(".lit");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(git_dir.join("refs")).unwrap();
+        let lit_dir = self.path.join(".lit");
+        fs::create_dir_all(lit_dir.join("objects")).unwrap();
+        fs::create_dir_all(lit_dir.join("refs")).unwrap();
+        fs::create_dir_all(lit_dir.join("config")).unwrap();
     }
 }
 
@@ -190,7 +194,7 @@ impl Commit {
         // agents it is a different story
         let index_path = repo.index_path();
         let _index_lock = Lockfile::acquire(&index_path)?;
-        let mut index = Index::new(repo.index_path());
+        let mut index = Index::new(index_path);
         index.load()?;
 
         let tree_id = Tree::from_index(index).write(&db)?;
@@ -289,7 +293,7 @@ impl<'a> EntryCollector<'a> {
                 }
             }
             // toDo: for now we silently ignore unsupported type
-            other => {}
+            _ => {}
         }
         Ok(())
     }

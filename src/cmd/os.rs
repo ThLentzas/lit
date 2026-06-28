@@ -1,5 +1,5 @@
 use std::{fs, io};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use crate::cmd::index::StatNode;
 use std::fs::Metadata;
@@ -92,8 +92,8 @@ fn mode(meta: &Metadata) -> u32 {
 }
 
 #[cfg(unix)]
-pub(super) fn name_to_bytes(name: &OsStr) -> Vec<u8> {
-    name.as_bytes().to_vec()
+pub(super) fn name_as_bytes(name: &OsStr) -> &[u8] {
+    name.as_bytes()
 }
 
 #[cfg(windows)]
@@ -112,10 +112,10 @@ fn mode(meta: &Metadata) -> u32 {
 }
 
 #[cfg(windows)]
-pub(super) fn name_to_bytes(name: &OsStr) -> Vec<u8> {
+pub(super) fn name_as_bytes(name: &OsStr) -> &[u8] {
     // toDo: check if this unwrap is safe
     let s = name.to_str().unwrap();
-    s.as_bytes().to_vec()
+    s.as_bytes()
 }
 
 
