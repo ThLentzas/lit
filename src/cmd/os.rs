@@ -20,6 +20,7 @@ const EPOCH_DIFF: u64 = 11_644_473_000;
 #[cfg(windows)]
 const TICKS_PER_SECOND: u64 = 10_000_000;
 
+// Read notes
 #[cfg(windows)]
 fn to_unix_time(filetime: u64) -> u64 {
     (filetime / TICKS_PER_SECOND).saturating_sub(EPOCH_DIFF)

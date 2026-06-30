@@ -1,28 +1,30 @@
+use crate::cmd::config::Config;
 use crate::cmd::db::Database;
-use crate::cmd::error::{AddError, CommitError, RepoError};
+use crate::cmd::error::{AddError, CommitError, InitError, RepoError};
+use crate::cmd::index::tree::Tree;
 use crate::cmd::index::{Index, IndexEntry, StatNode};
 use crate::cmd::lockfile::Lockfile;
 use crate::cmd::object::{Object, Signature};
 use crate::cmd::pathspec::Pathspec;
-use crate::cmd::index::tree::Tree;
 use crate::cmd::workspace::Workspace;
 use std::env::Args;
+use std::io::ErrorKind;
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
-use std::{env, fs};
+use std::{env, fs, io};
 
 pub mod db;
 mod lockfile;
 mod object;
 pub mod refs;
 
+mod config;
 mod error;
 pub mod index;
 mod os;
 mod pathspec;
-pub mod workspace;
-mod config;
 pub mod timestamp;
+pub mod workspace;
 
 // init creates repository structure
 // add creates/updates the index
@@ -34,12 +36,10 @@ pub(super) enum Command {
 }
 
 impl Command {
-    // toDo: check git docs on what happens when calling init on a directory that already has .lit
-    // i think it reinitializes the repo
     // toDo: error handling
     pub(super) fn execute(&mut self) {
         match self {
-            Command::Init(cmd) => cmd.execute(),
+            Command::Init(cmd) => cmd.execute().unwrap(),
             Command::Add(cmd) => cmd.execute().unwrap(),
             Command::Commit(cmd) => cmd.execute().unwrap(),
         }
@@ -60,9 +60,11 @@ struct Repository {
 impl Repository {
     // cwd is either the root or a subdirectory of the root
     fn discover() -> Result<Self, RepoError> {
-        let mut dir = fs::canonicalize(env::current_dir().map_err(RepoError::CurrentDir)?)
-            // toDo: handle this unwrap
-            .unwrap();
+        let cwd = env::current_dir().map_err(RepoError::CurrentDir)?;
+        let mut dir = fs::canonicalize(&cwd).map_err(|err| RepoError::Io {
+            path: cwd,
+            source: err,
+        })?;
 
         loop {
             let lit = dir.join(".lit");
@@ -96,7 +98,6 @@ pub(super) struct Init {
     pub(super) path: PathBuf,
 }
 
-// toDo: reinitialization if it already exists
 impl Init {
     // toDo: maybe those two methods could be one like cmd::init() since we don't really need state?
     // we want to set the path to always be absolute, toDo: Read the Chapter for init on why
@@ -113,16 +114,40 @@ impl Init {
         Self { path }
     }
 
-    fn execute(&self) {
-        if self.path.exists() && !self.path.is_dir() {
-            // Error
-        }
-        
+    // when calling init in an existing repo Git does not overwrite any of the existing files, it 
+    // will try to create any that are missing.
+    fn execute(&self) -> Result<(), InitError> {
+        fs::create_dir_all(&self.path).map_err(|err| Self::io_error(&self.path, err))?;
         // on Linux the files will be hidden by default since any file that starts with . is hidden
         let lit_dir = self.path.join(".lit");
-        fs::create_dir_all(lit_dir.join("objects")).unwrap();
-        fs::create_dir_all(lit_dir.join("refs")).unwrap();
-        fs::create_dir_all(lit_dir.join("config")).unwrap();
+
+        let reinit = match fs::create_dir(&lit_dir) {
+            Ok(_) => false,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => true,
+            Err(err) => return Err(Self::io_error(&lit_dir, err)),
+        };
+
+        let objects = lit_dir.join("objects");
+        let refs = lit_dir.join("refs");
+        // safe to call create_dir_all() in existing dirs, it will return without touching them
+        fs::create_dir_all(&objects).map_err(|err| Self::io_error(&objects, err))?;
+        fs::create_dir_all(&refs).map_err(|err| Self::io_error(&objects, err))?;
+        // toDo: At this point we need to some setup for template files
+        // toDo: one such case is to create the config file with the core section [core]
+
+        if reinit {
+            println!("Reinitialized existing Lit repository in {}", lit_dir.display());
+        } else {
+            println!("Initialized empty Lit repository in {}", lit_dir.display());
+        }
+        Ok(())
+    }
+
+    fn io_error(path: &Path, err: io::Error) -> InitError {
+        InitError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        }
     }
 }
 
@@ -144,8 +169,12 @@ impl Add {
     // not just lexer.rs(what the user provided, self.path in our case)
     fn execute(&self) -> Result<(), AddError> {
         let repo = Repository::discover()?;
-        let db = Database { path: repo.objects_path() };
-        let ws = Workspace { root: repo.root.clone(), };
+        let db = Database {
+            path: repo.objects_path(),
+        };
+        let ws = Workspace {
+            root: repo.root.clone(),
+        };
         let mut index = Index::new(repo.index_path());
 
         for path in self.paths.iter() {
@@ -172,8 +201,9 @@ pub(super) struct Commit;
 impl Commit {
     fn execute(&self) -> Result<(), CommitError> {
         let repo = Repository::discover()?;
-        let db = Database { path: repo.objects_path(), };
-
+        let db = Database {
+            path: repo.objects_path(),
+        };
         // We must acquire the lock on .lit/index for the entire commit, not just read the file.
         // Lockfile's atomic rename guarantees we never read half-written/corrupted data, but that
         // is not enough here. We read the index, build tree objects from it, write a commit, and
@@ -196,26 +226,23 @@ impl Commit {
         let _index_lock = Lockfile::acquire(&index_path)?;
         let mut index = Index::new(index_path);
         index.load()?;
-
+        // toDo: revisit if the we actually need to acquire the lock for config the same we did for
+        // index. Also need to rethink how this load() is called because now load() is called without
+        // knowing if Signature will actually read the info from config or env
+        let mut config = Config::new(repo.config_path());
+        config.load()?;
+        let author = Signature::author(&config)?;
+        let committer = Signature::committer(&config)?;
         let tree_id = Tree::from_index(index).write(&db)?;
-        // toDo: first try to read the user info from env variables
+
         refs::update_head(&repo.head_path(), |parent| {
-            // toDo: move this logic on a new() method for Commit where we read the author/committer from the .gitconfig file
             let commit = object::Commit {
-                author: Signature {
-                    name: "".to_string(),
-                    email: "".to_string(),
-                    timestamp: "".to_string(),
-                },
+                author,
                 parent,
-                committer: Signature {
-                    name: "".to_string(),
-                    email: "".to_string(),
-                    timestamp: "".to_string(),
-                },
+                committer,
                 message: "".to_string(),
                 // convert the [u8, 20] to its hex value
-                tree_id: tree_id.iter().map(|b| format!("{:02x}", b)).collect(),
+                root_id: tree_id.iter().map(|b| format!("{:02x}", b)).collect(),
             };
             db.store(Object::Commit(commit))
         })?;

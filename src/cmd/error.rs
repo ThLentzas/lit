@@ -1,20 +1,20 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-// toDo: maybe instead of PathBuf we could &'static Path to avoid cloning on the call site?
 
 // toDo: A function does not need to be able to return every variant of the enum. That is not
 // automatically bad design. What matters is whether the enum represents the error domain of the layer/function.
 // that is the case for find_root() where it can return 2/3 variants
 
 use crate::cmd::config::parse::ParseError;
+use crate::cmd::object::SignatureError;
 
 #[derive(Debug)]
 pub(super) enum RepoError {
     CurrentDir(io::Error),
     // "not a lit repository (or any of the parent directories)"
     NotRepository,
-    MissingRepoFile { path: PathBuf },
+    Io{ path: PathBuf, source: io::Error},
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -107,6 +107,11 @@ pub(super) enum FormatErrorKind {
 }
 
 #[derive(Debug)]
+pub(super) enum InitError {
+    Io { path: PathBuf, source: io::Error },
+}
+
+#[derive(Debug)]
 pub(super) enum AddError {
     Repo(RepoError),
     Index(IndexError),
@@ -118,11 +123,12 @@ pub(super) enum AddError {
 #[derive(Debug)]
 pub(super) enum CommitError {
     Repo(RepoError),
-    Io { path: PathBuf, source: io::Error },
     Index(IndexError),
     DbError(DbError),
     Lockfile(LockfileError),
-    RefError(RefError)
+    RefError(RefError),
+    Signature(SignatureError),
+    Config(ConfigError)
 }
 
 impl From<RepoError> for AddError {
@@ -213,4 +219,15 @@ impl From<LockfileError> for IndexError {
     }
 }
 
+impl From<SignatureError> for CommitError {
+    fn from(err: SignatureError) -> Self {
+        CommitError::Signature(err)
+    }
+}
+
+impl From<ConfigError> for CommitError {
+    fn from(err: ConfigError) -> Self {
+        CommitError::Config(err)
+    }
+}
 

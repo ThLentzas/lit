@@ -75,7 +75,7 @@ impl Config {
     //
     // This is a zero-copy approach. The name of a variable is a sub-slice of its line, which is a
     // sub-slice of the file.
-    fn load(&mut self) -> Result<(), ConfigError> {
+    pub(super) fn load(&mut self) -> Result<(), ConfigError> {
         let file = File::open(&self.local).map_err(|err| ConfigError::Io {
             path: self.local.clone(),
             source: err,

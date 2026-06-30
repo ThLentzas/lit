@@ -35,6 +35,7 @@ pub(super) struct Index {
     modified: bool,
 }
 
+// .lit/index is created lazily on the first write
 impl Index {
     pub(super) fn new(path: PathBuf) -> Self {
         Self {

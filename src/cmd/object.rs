@@ -2,10 +2,8 @@ use std::env;
 use std::env::VarError;
 use std::ffi::OsString;
 use std::io::Write;
-use std::string::FromUtf8Error;
-use chrono::Local;
 use crate::cmd::config::Config;
-use crate::cmd::os;
+use crate::cmd::timestamp;
 
 pub(super) enum Object {
     Blob(Vec<u8>),
@@ -61,7 +59,7 @@ impl Object {
             Self::Commit(commit) => {
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(b"tree ");
-                bytes.extend_from_slice(commit.tree_id.as_bytes());
+                bytes.extend_from_slice(commit.root_id.as_bytes());
                 bytes.push(b'\n');
                 bytes.extend_from_slice(b"author ");
                 bytes.extend_from_slice(commit.author.name.as_bytes());
@@ -96,22 +94,19 @@ pub(super) struct Commit {
     // Trees contain many entries. Using 20 raw bytes instead of 40 hex chars saves 50% per id,
     // which adds up significantly. Saving 20 bytes per commit is negligible. Saving 20 bytes per
     // entry in a tree with thousands of entries matters.
-    pub(super) tree_id: String,
+    pub(super) root_id: String,
 }
 
+#[derive(Debug)]
 pub(super) enum SignatureError {
     NotFound(& 'static str),
     NotUnicode(OsString),
-    InvalidTimeStamp(&'static str)
 }
 
 // https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
 pub(super) struct Signature {
     pub(super) email: String,
     pub(super) name: String,
-    // let now = Local::now();
-    // let timestamp = now.timestamp();
-    // let offset = now.offset();
     pub(super) timestamp: String
 }
 
@@ -147,20 +142,41 @@ impl Signature {
             }
         };
 
-        let timestamp = match env::var("GIT_AUTHOR_DATE") {
+        Ok(Self { name, email, timestamp: timestamp::now() })
+    }
+
+    pub(super) fn committer(config: &Config) -> Result<Self, SignatureError> {
+        let name = match env::var("GIT_COMMITTER_NAME") {
             Ok(s) => s,
             Err(err) => match err {
                 VarError::NotPresent => {
-                    let now = Local::now();
-                    let timestamp = now.timestamp();
-                    let offset = now.offset();
+                    // toDo: enforce in config that variables are always utf8 valid seq
+                    let name = config.get("committer.name".as_ref())
+                        .or_else(|| config.get("user.name".as_ref()))
+                        .ok_or(SignatureError::NotFound("committer name"))?;
+                    unsafe { String::from_utf8_unchecked(name.to_vec()) }
                 },
                 // write!(f, "environment variable was not valid unicode: {:?}", s)
                 VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
             }
         };
 
-        Ok(Self { name, email, timestamp})
+        let email = match env::var("GIT_COMMITTER_EMAIL") {
+            Ok(s) => s,
+            Err(err) => match err {
+                VarError::NotPresent => {
+                    // toDo: enforce in config that variables are always utf8 valid seq
+                    let email = config.get("committer.email".as_ref())
+                        .or_else(|| config.get("user.email".as_ref()))
+                        .ok_or(SignatureError::NotFound("committer email"))?;
+                    unsafe { String::from_utf8_unchecked(email.to_vec()) }
+                },
+                // write!(f, "environment variable was not valid unicode: {:?}", s)
+                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+            }
+        };
+
+        Ok(Self { name, email, timestamp: timestamp::now() })
     }
 }
 

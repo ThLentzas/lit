@@ -11,6 +11,7 @@ pub(super) struct Database {
     pub(super) path: PathBuf
 }
 
+// toDo: info and packs files
 impl Database {
     pub(super) fn store(&self, object: Object) -> Result<[u8; 20], DbError> {
         let obj_type = object.obj_type().as_bytes();
