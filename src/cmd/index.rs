@@ -2,7 +2,6 @@ mod parse;
 pub(super) mod tree;
 
 use crate::cmd::error::{FormatError, FormatErrorKind, IndexError, PathError};
-use crate::cmd::lockfile::Lockfile;
 use crate::cmd::os;
 use sha1::{Digest, Sha1};
 use std::fs;
@@ -29,10 +28,11 @@ const SIGNATURE: &'static str = "DIRC";
 
 // toDo: caching tree
 pub(super) struct Index {
+    // TODO: on the rewrite test if a BTreeMap would work
     pub(super) entries: Vec<IndexEntry>,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     // a flag that is used to not unnecessary write if no changes detected
-    modified: bool,
+    pub(super) modified: bool,
 }
 
 // .lit/index is created lazily on the first write
@@ -43,6 +43,55 @@ impl Index {
             entries: Vec::new(),
             modified: false,
         }
+    }
+
+    // This method is used by status to see if the entry pointed by `path` is tracked by the index.
+    // If path points to a file, a single binary search call is enough, but directories have specific
+    // behavior. As we already mentioned Index does not keep track of directories. If the path passed
+    // to add is a directory Index and tracks its entries.
+    // An optimization that Git does is that when a directory  contains no tracked files anywhere
+    // inside it, status reports the directory itself, not every file below it. So if foo contains
+    // bar.txt, and baz.txt, instead of listing both as untracked it lists foo/.
+    //      workspace:
+    //          a/b/inner.txt      tracked
+    //          a/outer.txt        untracked
+    //          a/b/c/file.txt     untracked
+    //
+    //      index:
+    //          a/b/inner.txt
+    //
+    // The result of status for untracked files is: a/b/c, a/outer.txt. even though a/ is not literally
+    // in the index, it is a tracked directory for status purposes because it contains a/b/inner.txt,
+    // which is tracked. a/b is also tracked since it contains inner.txt.
+    //
+    // The rule is:
+    //      A path is tracked for status if:
+    //          1. the exact file path exists in the index, OR
+    //          2. the path is a directory prefix of at least one index entry.
+    //
+    // The exact file is easy as mentioned. For the dir case, we already have the is_parent_path()
+    // from resolve_conflicts() we need to find the child entry path. Read lower_bound()
+    // This logic handles untracked(non-empty) directories.
+    pub(super) fn is_tracked(&self, path: &Path) -> bool {
+        let path = path_as_bytes(path);
+
+        if self.entries.binary_search_by(|entry| entry.path.cmp(&path)).is_ok() {
+            return true;
+        }
+        // TODO: test it
+        // Hard to see edge case spotted by AI. If the path is not found it means either that it is
+        // a file and does not exist or that is a dir. In either case we append a trailing slash
+        // a/b.txt      <- '.' (0x2E) sorts before '/' (0x2F)
+        // a/b/c.txt
+        // is_tracked("a/b"): exact search misses, lower_bound("a/b") lands on a/b.txt (the first
+        // entry > "a/b"), is_parent_path("a/b", "a/b.txt") is false -> we return false, even though
+        // a/b/c.txt makes a/b tracked. The real descendants live past the sibling file. Searching
+        // for a/b/ instead skips over a/b.txt and lands exactly on the first descendant if one exists
+        let mut path = path.clone();
+        path.push(b'/');
+        let pos = self.lower_bound(path.as_slice());
+        self.entries.get(pos)
+            .is_some_and(|entry| is_parent_path(path.as_slice(), entry.path.as_slice()))
     }
 
     // Git requires index entries to be sorted by filename. It is a requirement for deterministic
@@ -56,46 +105,28 @@ impl Index {
     // foo/src/a, foo/src/b and foo/README . In the final order README appears before src as the entries
     // of foo and a appears before b as the entries of src. Inserting in ascending order allows us
     // to do BS for retrieveing entries instead of appending + sorting. Read more Tree::write()
-    pub(super) fn add_entry(&mut self, entry: IndexEntry) {
-        self.resolve_conflicts(&entry.path);
+    pub(super) fn add_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
+        for entry in entries {
+            self.resolve_conflicts(&entry.path);
 
-        match self.entries.binary_search_by(|e| e.path.cmp(&entry.path)) {
-            Ok(pos) => {
-                if self.entries[pos] != entry {
-                    self.entries[pos] = entry;
+            match self.entries.binary_search_by(|e| e.path.cmp(&entry.path)) {
+                Ok(pos) => {
+                    if self.entries[pos] != entry {
+                        self.entries[pos] = entry;
+                        self.modified = true;
+                    }
+                }
+                Err(pos) => {
+                    self.entries.insert(pos, entry);
                     self.modified = true;
                 }
             }
-            Err(pos) => {
-                self.entries.insert(pos, entry);
-                self.modified = true;
-            }
         }
+        Ok(())
     }
 
-    // updating index is the same as updating head
-    // we have to address competing writes and make sure that when someone tries to read .lit/index
-    // they never read half-written data, both are guarantees by lockfile
-    pub(super) fn update(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
-        let mut lockfile = Lockfile::acquire(&self.path)?;
-
-        self.load()?;
-
-        for entry in entries {
-            self.add_entry(entry);
-        }
-        if !self.modified {
-            // if the contents were never modified, we don't need to overwrite, but we must return
-            // the lock. Lockfile implements Drop which removes the .lock file. In the book Coglan
-            // has a function rollback() which does the same thing
-            return Ok(());
-        }
-
-        let content = self.serialize();
-        lockfile.write(&content)?;
-        lockfile.commit()?;
-
-        Ok(())
+    pub(super) fn refresh_entry_stat(&mut self, index: usize, stat: StatNode) {
+        self.entries[index].stat = stat;
     }
 
     pub(super) fn serialize(&self) -> Vec<u8> {
@@ -238,13 +269,27 @@ impl Index {
             !(is_parent_path(&entry.path, path) || is_parent_path(path, &entry.path))
         })
     }
+
+    // This method we have seen before on Leetcode is the next_greater() adaptation of binary search,
+    // or it is treated as such. To determine if `path` is parent path of any of the entries, we need
+    // to find the entry that is lexicographically greater than `path`. The entries that we are actually
+    // going to return true are entries that their path length is always greater than length of the
+    // provided path because child_path.len() > parent_path.len(). Sure foo/bar.txt is one potential
+    // candidate as is lexicographically greater than a/b/ but so is a/b/foo.txt.
+    fn lower_bound(&self, path: &[u8]) -> usize {
+        self.entries.binary_search_by(|entry| entry.path.as_slice().cmp(path))
+            .unwrap_or_else(|pos| pos)
+    }
 }
 
 // toDo: add GitLink support.
-#[derive(PartialEq, Eq)]
+// cheap copy only 40 bytes
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(super) struct StatNode {
+    // change time, most recent time a file's attributes changed(owner group, perm, etc)
     pub(super) ctime: u32,
     pub(super) ctime_nsec: u32,
+    // modify time, most recent time a file's contents changed
     pub(super) mtime: u32,
     pub(super) mtime_nsec: u32,
     pub(super) dev: u32,
@@ -252,6 +297,7 @@ pub(super) struct StatNode {
     pub(super) mode: u32,
     pub(super) uid: u32,
     pub(super) gid: u32,
+    // on disk size, truncated to 32-bit
     pub(super) file_size: u32,
 }
 
@@ -380,7 +426,7 @@ fn validate_path(path: &[u8]) -> Result<(), PathError> {
     Ok(())
 }
 
-pub(super) fn normalize_path(path: &Path) -> Vec<u8> {
+pub(super) fn path_as_bytes(path: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut components = path.iter().peekable();
 

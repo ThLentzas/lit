@@ -1,6 +1,6 @@
 use std::{fs, io};
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use crate::cmd::index::StatNode;
 use std::fs::Metadata;
 #[cfg(unix)]
@@ -12,7 +12,7 @@ use std::os::windows::fs::MetadataExt;
 
 pub(super) const REGULAR: u32 = 0o100644;
 pub(super) const EXECUTABLE: u32 = 0o100755;
-const DIR: u32 = 0o040000;
+pub(super) const DIR: u32 = 0o040000;
 pub(super) const SYMLINK: u32 = 0o120000;
 const UNSUPPORTED: u32 = 0;
 #[cfg(windows)]
@@ -95,6 +95,20 @@ fn mode(meta: &Metadata) -> u32 {
 #[cfg(unix)]
 pub(super) fn name_as_bytes(name: &OsStr) -> &[u8] {
     name.as_bytes()
+}
+
+#[cfg(unix)]
+pub(super) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+// TODO: check if true Windows accepts / in paths. The Win32 file APIs (and therefore Rust's Path on
+// TODO: Windows) treat / and \ as equivalent separators, so you never need to convert separators
+// TODO: OsString is WTF-16 internally, so bytes must go through UTF-8 — which is safe because Git for 
+// TODO: Windows stores index paths as UTF-8 by convention
+#[cfg(windows)]
+pub(super) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes))
 }
 
 #[cfg(windows)]

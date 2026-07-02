@@ -30,7 +30,7 @@ pub(super) struct DbError {
 }
 
 #[derive(Debug)]
-pub(super) enum WsError {
+pub(super) enum WorkspaceError {
     CurrentDir{ source: io::Error },
     Io { path: PathBuf, source: io::Error },
     OutsideRepository { path: PathBuf }
@@ -60,6 +60,7 @@ pub(super) enum LockfileError {
     Io { path: PathBuf, source: io::Error, },
     LockDenied { path: PathBuf, },
 }
+
 // an error that can occur when creating IndexEntry or parsing .lit/index
 // Git when format is corrupted reports: Unknown Index Format
 // No more information is provided to the user because they can't do much if the format is invalid
@@ -69,7 +70,6 @@ pub(super) enum IndexError {
     UnsupportedVersion(u32),
     InvalidFormat(FormatError),
     Io { path: PathBuf, source: io::Error },
-    Lockfile(LockfileError),
 }
 
 #[derive(Debug)]
@@ -116,8 +116,9 @@ pub(super) enum AddError {
     Repo(RepoError),
     Index(IndexError),
     DbError(DbError),
-    WsError(WsError),
+    WsError(WorkspaceError),
     Pathspec(PathspecError),
+    Lockfile(LockfileError),
 }
 
 #[derive(Debug)]
@@ -159,8 +160,8 @@ impl From<DbError> for AddError {
     }
 }
 
-impl From<WsError> for AddError {
-    fn from(err: WsError) -> Self {
+impl From<WorkspaceError> for AddError {
+    fn from(err: WorkspaceError) -> Self {
         AddError::WsError(err)
     }
 }
@@ -213,9 +214,9 @@ impl From<RefError> for CommitError {
     }
 }
 
-impl From<LockfileError> for IndexError {
+impl From<LockfileError> for AddError {
     fn from(err: LockfileError) -> Self {
-        IndexError::Lockfile(err)
+        AddError::Lockfile(err)
     }
 }
 

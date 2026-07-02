@@ -12,11 +12,11 @@ pub(super) enum Object {
 }
 
 impl Object {
-    pub(super) fn obj_type(&self) -> &'static str {
+    pub(super) fn obj_type(&self) -> &[u8] {
         match self {
-            Self::Blob(_) => "blob",
-            Self::Tree(_) => "tree",
-            Self::Commit(_) => "commit",
+            Self::Blob(_) => b"blob",
+            Self::Tree(_) => b"tree",
+            Self::Commit(_) => b"commit",
         }
     }
 

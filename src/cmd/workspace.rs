@@ -1,4 +1,4 @@
-use crate::cmd::error::WsError;
+use crate::cmd::error::WorkspaceError;
 use crate::cmd::index::StatNode;
 use crate::cmd::os;
 use std::path::{Path, PathBuf};
@@ -15,7 +15,6 @@ pub(super) struct Workspace {
 }
 
 impl Workspace {
-
     // resolves cwd path to root relative path
     //
     // prefix refers to the path from the repository to the cwd
@@ -27,46 +26,49 @@ impl Workspace {
     // 
     // we need the prefix to later compute repo relative paths
     // if cwd = root then prefix is ""
-    pub(super) fn prefix(&self) -> Result<PathBuf, WsError> {
-        let cwd = env::current_dir().map_err(|err| WsError::CurrentDir { source: err })?;
+    pub(super) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
+        let cwd = env::current_dir().map_err(|err| WorkspaceError::CurrentDir { source: err })?;
 
         cwd.strip_prefix(&self.root)
             .map(Path::to_path_buf)
-            .map_err(|_| WsError::OutsideRepository { path: cwd })
+            .map_err(|_| WorkspaceError::OutsideRepository { path: cwd })
     }
 
     // returns the target's path
-    pub(super) fn read_link(&self, path: &Path) -> Result<PathBuf, WsError> {
+    pub(super) fn read_link(&self, path: &Path) -> Result<PathBuf, WorkspaceError> {
         let absolute = self.root.join(path);
 
-        fs::read_link(&absolute).map_err(|err| WsError::Io {
+        fs::read_link(&absolute).map_err(|err| WorkspaceError::Io {
             path: absolute,
             source: err,
         })
     }
 
-    pub(super) fn read_file(&self, path: &Path) -> Result<Vec<u8>, WsError> {
+    pub(super) fn read_file(&self, path: &Path) -> Result<Vec<u8>, WorkspaceError> {
         let absolute = self.root.join(path);
 
-        fs::read(&absolute).map_err(|err| WsError::Io {
+        fs::read(&absolute).map_err(|err| WorkspaceError::Io {
             path: absolute,
             source: err,
         })
     }
 
-    pub(super) fn stat(&self, path: &Path) -> Result<StatNode, WsError> {
+    pub(super) fn stat(&self, path: &Path) -> Result<StatNode, WorkspaceError> {
         let absolute = self.root.join(path);
 
-        os::stat(&absolute).map_err(|err| WsError::Io {
+        os::stat(&absolute).map_err(|err| WorkspaceError::Io {
             path: absolute,
             source: err,
         })
     }
 
     // returns all entries of a directory pointed by the path
-    pub fn list_dir(&self, relative: &Path) -> Result<Vec<(PathBuf, StatNode)>, WsError> {
+    // the returned path is repo relative
+    // This approach returns a flat list, and it is up to the caller if they want to recurse for
+    // directories
+    pub fn dir_entries(&self, relative: &Path) -> Result<Vec<(PathBuf, StatNode)>, WorkspaceError> {
         let absolute = self.root.join(relative);
-        let read_dir = fs::read_dir(&absolute).map_err(|err| WsError::Io {
+        let read_dir = fs::read_dir(&absolute).map_err(|err| WorkspaceError::Io {
             path: absolute,
             source: err,
         })?;
@@ -80,7 +82,7 @@ impl Workspace {
         for entry in read_dir {
             // If the iterator itself errs, there is no DirEntry, hence no name, the parent is
             // genuinely the most precise path available.
-            let entry = entry.map_err(|err| WsError::Io {
+            let entry = entry.map_err(|err| WorkspaceError::Io {
                 path: relative.to_path_buf(),
                 source: err,
             })?;
@@ -93,7 +95,7 @@ impl Workspace {
             }
 
             let child = relative.join(&name);
-            let stat = os::stat(&entry.path()).map_err(|err| WsError::Io {
+            let stat = os::stat(&entry.path()).map_err(|err| WorkspaceError::Io {
                 path: child.clone(),
                 source: err,
             })?;
@@ -105,5 +107,21 @@ impl Workspace {
         // so there is no tree object that needs to exist. Git trees are Merkle trees, if there is
         // no blob to hash, we can't create such tree.
         Ok(entries)
+    }
+
+    pub(super) fn contains_trackable_file(&self, path: &Path, mode: u32) -> Result<bool, WorkspaceError> {
+        if matches!(mode, os::REGULAR | os::EXECUTABLE | os::SYMLINK) {
+            return Ok(true);
+        }
+        if mode != os::DIR {
+            return Ok(false);
+        }
+
+        for (path, stat) in self.dir_entries(path)? {
+            if self.contains_trackable_file(&path, stat.mode)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 }

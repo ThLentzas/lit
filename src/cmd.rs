@@ -12,6 +12,7 @@ use std::io::ErrorKind;
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
+use crate::cmd::status::Status;
 
 pub mod db;
 mod lockfile;
@@ -25,6 +26,7 @@ mod os;
 mod pathspec;
 pub mod timestamp;
 pub mod workspace;
+pub mod status;
 
 // init creates repository structure
 // add creates/updates the index
@@ -33,6 +35,7 @@ pub(super) enum Command {
     Init(Init),
     Add(Add),
     Commit(Commit),
+    Status(Status),
 }
 
 impl Command {
@@ -42,6 +45,7 @@ impl Command {
             Command::Init(cmd) => cmd.execute().unwrap(),
             Command::Add(cmd) => cmd.execute().unwrap(),
             Command::Commit(cmd) => cmd.execute().unwrap(),
+            Command::Status(cmd) => cmd.execute().unwrap(),
         }
     }
 }
@@ -114,7 +118,7 @@ impl Init {
         Self { path }
     }
 
-    // when calling init in an existing repo Git does not overwrite any of the existing files, it 
+    // when calling init in an existing repo Git does not overwrite any of the existing files, it
     // will try to create any that are missing.
     fn execute(&self) -> Result<(), InitError> {
         fs::create_dir_all(&self.path).map_err(|err| Self::io_error(&self.path, err))?;
@@ -169,13 +173,11 @@ impl Add {
     // not just lexer.rs(what the user provided, self.path in our case)
     fn execute(&self) -> Result<(), AddError> {
         let repo = Repository::discover()?;
-        let db = Database {
-            path: repo.objects_path(),
-        };
-        let ws = Workspace {
-            root: repo.root.clone(),
-        };
+        let db = Database { path: repo.objects_path(), };
+        let workspace = Workspace { root: repo.root.clone(), };
         let mut index = Index::new(repo.index_path());
+        let mut lockfile = Lockfile::acquire(&index.path)?;
+        index.load()?;
 
         for path in self.paths.iter() {
             // if the user called add . from root then the prefix is "" and the pathspec.pattern is
@@ -185,13 +187,17 @@ impl Add {
             let pathspec = if path.is_absolute() {
                 Pathspec::new(path.as_os_str(), Path::new(""), &repo.root)?
             } else {
-                let prefix = ws.prefix()?;
+                let prefix = workspace.prefix()?;
                 Pathspec::new(path.as_os_str(), &prefix, &repo.root)?
             };
-            let mut collector = EntryCollector::new(&ws, &db, &pathspec.pattern);
+            let mut collector = EntryCollector::new(&workspace, &db, &pathspec.pattern);
             collector.collect()?;
-            index.update(collector.finish())?;
+            index.add_entries(collector.finish())?;
         }
+        if index.modified {
+            lockfile.write(&index.serialize())?;
+        }
+        lockfile.commit()?;
         Ok(())
     }
 }
@@ -204,6 +210,8 @@ impl Commit {
         let db = Database {
             path: repo.objects_path(),
         };
+        // TODO: modify index by refreshing the metadata and then it becomes a read-modify-write 
+        // for index itself
         // We must acquire the lock on .lit/index for the entire commit, not just read the file.
         // Lockfile's atomic rename guarantees we never read half-written/corrupted data, but that
         // is not enough here. We read the index, build tree objects from it, write a commit, and
@@ -222,9 +230,8 @@ impl Commit {
         // A question to ask here is how many different people work in a repository locally? Most
         // of the time 1 so we could just call index.load() without acquiring the lock but now with
         // agents it is a different story
-        let index_path = repo.index_path();
-        let _index_lock = Lockfile::acquire(&index_path)?;
-        let mut index = Index::new(index_path);
+        let mut index = Index::new(repo.index_path());
+        let _index_lock = Lockfile::acquire(&index.path)?;
         index.load()?;
         // toDo: revisit if the we actually need to acquire the lock for config the same we did for
         // index. Also need to rethink how this load() is called because now load() is called without
@@ -254,16 +261,16 @@ impl Commit {
 // all the work, but we had to pass 5 arguments:
 //  collect_entries(ws: &Workspace, rel: &Path, stat: StatNode, db: &Database, out: &mut Vec<IndexEntry>)
 struct EntryCollector<'a> {
-    ws: &'a Workspace,
+    workspace: &'a Workspace,
     db: &'a Database,
     path: &'a Path,
     entries: Vec<IndexEntry>,
 }
 
 impl<'a> EntryCollector<'a> {
-    fn new(ws: &'a Workspace, db: &'a Database, path: &'a Path) -> Self {
+    fn new(workspace: &'a Workspace, db: &'a Database, path: &'a Path) -> Self {
         Self {
-            ws,
+            workspace,
             db,
             path,
             entries: Vec::new(),
@@ -273,7 +280,7 @@ impl<'a> EntryCollector<'a> {
     // standard recursive approach, collect is the function that triggers the recursion with some initial
     // state
     fn collect(&mut self) -> Result<(), AddError> {
-        let stat = self.ws.stat(self.path)?;
+        let stat = self.workspace.stat(self.path)?;
         self.collect_entries(self.path, stat)?;
 
         Ok(())
@@ -284,9 +291,9 @@ impl<'a> EntryCollector<'a> {
     fn collect_entries(&mut self, relative: &Path, stat: StatNode) -> Result<(), AddError> {
         match stat.mode {
             0o100644 | 0o100755 => {
-                let content = self.ws.read_file(relative)?;
+                let content = self.workspace.read_file(relative)?;
                 let oid = self.db.store(Object::Blob(content))?;
-                let path_bytes = index::normalize_path(relative);
+                let path_bytes = index::path_as_bytes(relative);
                 self.entries.push(IndexEntry::new(path_bytes, oid, stat));
             }
             // https://stackoverflow.com/questions/954560/how-does-git-handle-symbolic-links
@@ -296,8 +303,8 @@ impl<'a> EntryCollector<'a> {
             // if the user deletes target, then we have a dangling reference which is allowed. It's up
             // to the user to remove the symlink
             0o120000 => {
-                let target = self.ws.read_link(relative)?;
-                let content = index::normalize_path(&target);
+                let target = self.workspace.read_link(relative)?;
+                let content = index::path_as_bytes(&target);
                 let size = content.len().min(u32::MAX as usize) as u32;
                 let oid = self.db.store(Object::Blob(content))?;
                 // it is more of sanity check
@@ -307,7 +314,7 @@ impl<'a> EntryCollector<'a> {
                     file_size: size,
                     ..stat
                 };
-                let path_bytes = index::normalize_path(relative);
+                let path_bytes = index::path_as_bytes(relative);
                 self.entries.push(IndexEntry::new(path_bytes, oid, stat));
             }
 
@@ -315,7 +322,7 @@ impl<'a> EntryCollector<'a> {
             0o040000 => {
                 // toDo: look at --ignore-errors flag
                 //
-                for (path, stat) in self.ws.list_dir(relative)? {
+                for (path, stat) in self.workspace.dir_entries(relative)? {
                     self.collect_entries(&path, stat)?;
                 }
             }

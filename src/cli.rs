@@ -1,6 +1,7 @@
 use crate::cmd::{Add, Command, Commit, Init};
 use std::env;
 use std::path::PathBuf;
+use crate::cmd::status::Status;
 
 // toDo: write a proper parser, dont pass the command args as fn args
 // write it as an external library and include it as a dependency
@@ -19,6 +20,7 @@ pub(super) fn parse() -> Command {
         // if any path is empty -> Error
         "add" => Command::Add(Add { paths: vec![PathBuf::from(args.next().unwrap())]} ),
         "commit" => Command::Commit(Commit{}),
+        "status" => Command::Status(Status::new()),
         _ => todo!(),
     }
 }
