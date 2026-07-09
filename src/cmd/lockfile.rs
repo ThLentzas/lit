@@ -46,7 +46,6 @@ impl Lockfile {
     // returns Ok(None) if it fails to acquire the lock
     // returns Err for any Io
 
-    // toDo: reconsider this design maybe Option<Lockfile> is better?
     pub(super) fn acquire(path: &Path) -> Result<Lockfile, LockfileError> {
         let file_path = path.to_path_buf();
         let lock_path = PathBuf::from(format!("{}.lock", file_path.display()));

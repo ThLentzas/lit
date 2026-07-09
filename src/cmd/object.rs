@@ -1,9 +1,18 @@
+mod parse;
+
 use std::env;
 use std::env::VarError;
 use std::ffi::OsString;
 use std::io::Write;
 use crate::cmd::config::Config;
-use crate::cmd::timestamp;
+use crate::cmd::timestamp::Timestamp;
+
+pub(super) struct Entry {
+    pub(super) mode: u32,
+    // read the notes "Filenames"
+    pub(super) name: Vec<u8>,
+    pub(super) oid: [u8; 20],
+}
 
 pub(super) enum Object {
     Blob(Vec<u8>),
@@ -20,9 +29,11 @@ impl Object {
         }
     }
 
-    // For blobs, we return the content, the bytes representing the file
-    // For trees, we concatenate the bytes of each entry. Each entry is represented as:
-    // mode, a space, the filename, a null byte, and then twenty bytes for the object id
+    // pub(super) fn deserialize(bytes: &[u8]) -> Self {
+    // }
+
+    // a mistake I made at the start was to think that I could just impl Display and then call as_bytes()
+    // but it won't work. display() needs valid utf8, oid is [u8;20], path names are platform specific
     pub(super) fn serialize(&self) -> Vec<u8> {
         match self {
             Self::Blob(content) => content.to_vec(),
@@ -51,30 +62,40 @@ impl Object {
                 }
                 bytes
             }
-            // tree <tree-oid-in-hex>
-            // author <name> <email> <timestamp> <timezone>
-            // committer <name> <email> <timestamp> <timezone>
+            // tree tree_oid_hex LF
+            // parent parent_oid_hex\n // repeated once per parent, omitted for root commit
+            // author name <email> timestamp timezone\n
+            // committer name <email> timestamp timezone\n
+            // \n
+            // message
             //
-            // <message>
+            // The commit body is a line-oriented text format, timestamp is written as ASCII decimal
+            // The same logic applies to tree as well where mode is written as ASCII not as be_bytes()
+            // mode is written as be_bytes() in the Index where the format is binary, now it is text
             Self::Commit(commit) => {
+                // TODO: can we clean this up using write!()?
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(b"tree ");
                 bytes.extend_from_slice(commit.root_id.as_bytes());
-                bytes.push(b'\n');
+                bytes.extend_from_slice(b"\n");
+                if let Some(parent) = &commit.parent {
+                    bytes.extend_from_slice(b"parent ");
+                    bytes.extend_from_slice(parent.as_bytes());
+                    bytes.extend_from_slice(b"\n");
+                }
                 bytes.extend_from_slice(b"author ");
                 bytes.extend_from_slice(commit.author.name.as_bytes());
-                bytes.push(b' ');
+                bytes.extend_from_slice(b" <");
                 bytes.extend_from_slice(commit.author.email.as_bytes());
-                bytes.push(b' ');
-                bytes.extend_from_slice(commit.author.timestamp.as_bytes());
-                bytes.push(b'\n');
-                bytes.extend_from_slice(b"committer ");
+                bytes.extend_from_slice(b"> ");
+                bytes.extend_from_slice(commit.author.timestamp.to_string().as_bytes());
+                bytes.extend_from_slice(b"\ncommitter ");
                 bytes.extend_from_slice(commit.committer.name.as_bytes());
-                bytes.push(b' ');
+                bytes.extend_from_slice(b" <");
                 bytes.extend_from_slice(commit.committer.email.as_bytes());
-                bytes.push(b' ');
-                bytes.extend_from_slice(commit.committer.timestamp.as_bytes());
-                bytes.extend_from_slice(b"\n\n");
+                bytes.extend_from_slice(b"> ");
+                bytes.extend_from_slice(commit.committer.timestamp.to_string().as_bytes());
+                bytes.extend_from_slice(b"\n\n<");
                 bytes.extend_from_slice(commit.message.as_bytes());
                 bytes
             }
@@ -107,7 +128,7 @@ pub(super) enum SignatureError {
 pub(super) struct Signature {
     pub(super) email: String,
     pub(super) name: String,
-    pub(super) timestamp: String
+    pub(super) timestamp: Timestamp
 }
 
 impl Signature {
@@ -142,7 +163,7 @@ impl Signature {
             }
         };
 
-        Ok(Self { name, email, timestamp: timestamp::now() })
+        Ok(Self { name, email, timestamp: Timestamp::now() })
     }
 
     pub(super) fn committer(config: &Config) -> Result<Self, SignatureError> {
@@ -176,13 +197,6 @@ impl Signature {
             }
         };
 
-        Ok(Self { name, email, timestamp: timestamp::now() })
+        Ok(Self { name, email, timestamp: Timestamp::now() })
     }
-}
-
-pub(super) struct Entry {
-    pub(super) oid: [u8; 20],
-    // read the notes "Filenames"
-    pub(super) name: Vec<u8>,
-    pub(super) mode: u32,
 }

@@ -73,7 +73,7 @@ impl Index {
     // from resolve_conflicts() we need to find the child entry path. Read lower_bound()
     // This logic handles untracked(non-empty) directories.
     pub(super) fn is_tracked(&self, path: &Path) -> bool {
-        let path = path_as_bytes(path);
+        let path = path_to_bytes(path);
 
         if self.entries.binary_search_by(|entry| entry.path.cmp(&path)).is_ok() {
             return true;
@@ -426,7 +426,7 @@ fn validate_path(path: &[u8]) -> Result<(), PathError> {
     Ok(())
 }
 
-pub(super) fn path_as_bytes(path: &Path) -> Vec<u8> {
+pub(super) fn path_to_bytes(path: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut components = path.iter().peekable();
 

@@ -26,7 +26,14 @@ pub(super) enum PathspecError {
 #[derive(Debug)]
 pub(super) struct DbError {
     pub(super) path: PathBuf,
-    pub(super) source: io::Error,
+    pub(super) kind: DbErrorKind,
+}
+
+#[derive(Debug)]
+pub(super) enum DbErrorKind {
+    Io { source: io::Error },
+    // hash mismatch
+    Corrupt
 }
 
 #[derive(Debug)]

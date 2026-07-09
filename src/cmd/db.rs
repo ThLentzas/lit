@@ -1,4 +1,4 @@
-use crate::cmd::error::DbError;
+use crate::cmd::error::{DbError, DbErrorKind};
 use crate::cmd::object::Object;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::{fs, io};
 
 pub(super) struct Database {
-    pub(super) path: PathBuf
+    pub(super) path: PathBuf,
 }
 
 // toDo: info and packs files
@@ -16,7 +16,7 @@ impl Database {
     pub(super) fn store(&self, object: Object) -> Result<[u8; 20], DbError> {
         let obj_type = object.obj_type();
         let content = object.serialize();
-        // The header for each object is: object type, a space, the length of the object(result of
+        // The header for each object is: object type, a space, the size of the object(result of
         // serialization) and a nul byte. These are the bytes that will be used for compression
         let mut bytes = Vec::new();
         bytes.extend_from_slice(obj_type);
@@ -46,19 +46,20 @@ impl Database {
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                 if !parent.is_dir() {
+                    let err = io::Error::new(
+                        ErrorKind::AlreadyExists,
+                        "object directory path exists but is not a directory",
+                    );
                     return Err(DbError {
                         path: parent,
-                        source: io::Error::new(
-                            ErrorKind::AlreadyExists,
-                            "object directory path exists but is not a directory",
-                        ),
+                        kind: DbErrorKind::Io { source: err },
                     });
                 }
             }
             Err(err) => {
                 return Err(DbError {
                     path: parent,
-                    source: err,
+                    kind: DbErrorKind::Io { source: err },
                 });
             }
         }
@@ -72,10 +73,11 @@ impl Database {
         let tmp_path = parent.join(gen_tmp_name());
         // this will create only the temp file and not any of the parent dir if missing
         // .lit/objects/90/tmp_obj_gNLJvt
+        // TODO: maybe we use zlib?
         let compressed = deflate::deflate_bytes(&bytes);
         fs::write(&tmp_path, compressed).map_err(|err| DbError {
             path: parent.to_path_buf(),
-            source: err,
+            kind: DbErrorKind::Io { source: err },
         })?;
 
         // we return the rename error even if remove_file() fails because that was the main reason
@@ -84,10 +86,37 @@ impl Database {
             let _ = fs::remove_file(&tmp_path);
             return Err(DbError {
                 path: tmp_path,
-                source: err,
+                kind: DbErrorKind::Io { source: err },
             });
         }
         Ok(hash)
+    }
+
+    pub(super) fn load(&self, oid: &str) -> Result<Option<Object>, DbError> {
+        if oid.len() != 40 {
+            return Ok(None);
+        }
+        let path = self.path.join(&oid[..2]);
+        let path = path.join(&oid[2..]);
+        let content = fs::read(&path).map_err(|err| DbError {
+            // TODO: this clone happens only because the closure can't know about ? and the compiler
+            // sees that the value is used and moved again after. It happens a lot try to find a fix
+            // TODO: the not exists variant must be Ok(None) or Error
+            // TODO: we must also handle the exists case but it is a DIR
+            path: path.clone(),
+            kind: DbErrorKind::Io { source: err },
+        })?;
+        
+        let bytes = inflate::inflate_bytes(&content).unwrap();
+        let hash: [u8; 20] = Sha1::digest(&bytes).into();
+        let hex: String = hash.iter().map(|&b| format!("{:02x}", b)).collect();
+
+        if hex != oid {
+            // tampered object: someone opened the file, changed its contents, compressed the new
+            // content and wrote back to the file, the hashes do not match
+            return Err(DbError { path, kind: DbErrorKind::Corrupt });
+        }
+        Ok(Some(Object::deserialize(&bytes)))
     }
 }
 

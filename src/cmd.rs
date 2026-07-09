@@ -293,7 +293,7 @@ impl<'a> EntryCollector<'a> {
             0o100644 | 0o100755 => {
                 let content = self.workspace.read_file(relative)?;
                 let oid = self.db.store(Object::Blob(content))?;
-                let path_bytes = index::path_as_bytes(relative);
+                let path_bytes = index::path_to_bytes(relative);
                 self.entries.push(IndexEntry::new(path_bytes, oid, stat));
             }
             // https://stackoverflow.com/questions/954560/how-does-git-handle-symbolic-links
@@ -304,7 +304,7 @@ impl<'a> EntryCollector<'a> {
             // to the user to remove the symlink
             0o120000 => {
                 let target = self.workspace.read_link(relative)?;
-                let content = index::path_as_bytes(&target);
+                let content = index::path_to_bytes(&target);
                 let size = content.len().min(u32::MAX as usize) as u32;
                 let oid = self.db.store(Object::Blob(content))?;
                 // it is more of sanity check
@@ -314,7 +314,7 @@ impl<'a> EntryCollector<'a> {
                     file_size: size,
                     ..stat
                 };
-                let path_bytes = index::path_as_bytes(relative);
+                let path_bytes = index::path_to_bytes(relative);
                 self.entries.push(IndexEntry::new(path_bytes, oid, stat));
             }
 

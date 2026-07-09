@@ -43,16 +43,24 @@ impl Status {
     pub(crate) fn new() -> Self {
         Self::default()
     }
-    
+
     pub(super) fn execute(&mut self) -> Result<(), StatusError> {
         let repo = Repository::discover()?;
         let mut index = Index::new(repo.index_path());
         let workspace = Workspace { root: repo.root };
 
+        // When status is called Git tries to acquire the lock for index because it does something
+        // called Background Refresh: https://git-scm.com/docs/git-status#_background_refresh
+        //
+        // If it fails to acquire the lock though, it does not error, it still reports changes but
+        // never updates the index.
         let lock = match Lockfile::acquire(&index.path) {
             Ok(lock) => Some(lock),
+            // don't try to do Err(e) if e == LockfileError::LockDenied .. won't work because io::Error
+            // does not impl PartialEq. LockfileError is an Enum not a struct like io::Error where
+            // we had to check against err.kind
             Err(LockfileError::LockDenied { .. }) => None,
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(StatusError::from(err)),
         };
 
         index.load()?;
@@ -85,7 +93,7 @@ impl Status {
                     self.scan_workspace(workspace, index, &path)?;
                 } else {
                     // tracked file, pending to see if it is actually different from the Index Entry
-                    self.stats.insert(index::path_as_bytes(&path), stat);
+                    self.stats.insert(index::path_to_bytes(&path), stat);
                 }
             // for an untracked path to be shown in the report it must be either a file or a
             // non-empty directory. We will show untracked directories that actually contain
@@ -116,7 +124,7 @@ impl Status {
                     );
                 }
                 // At this point the entry is found in both workspace and index, we need to check
-                // if it has changed and if it did to refresh the index
+                // if it has changed and refresh the index.
                 Some(&ws_stat) => {
                     // different size/mode -> modified
                     if entry.stat.file_size != ws_stat.file_size || entry.stat.mode != ws_stat.mode
@@ -153,7 +161,12 @@ impl Status {
                                 }
                             );
                         } else {
-                            // content is the same -> update index to refresh entry stat
+                            // this is the only moment where we want to record the change to update
+                            // the index entry based on if we acquired the lock.
+                            // in the previous 2 cases, size and oid mismatch initially I did
+                            // entry.oid = oid where oid was the result of hash(). It was wrong because
+                            // hash() computed an oid for an object that was never stored and the index
+                            // now references a non-existing object.
                             self.refreshes.insert(index, ws_stat);
                         }
                     } // else: metadata match -> no changes, no I/O

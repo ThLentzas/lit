@@ -1,5 +1,8 @@
+extern crate core;
+
 pub mod cli;
 mod cmd;
+pub mod hex;
 
 // this should return Result<(), Error>
 // it is the equivalent of exit status codes in a C program, 0 -> success, anything else -> failure
@@ -9,3 +12,6 @@ fn main() {
     let mut command = cli::parse();
     command.execute();
 }
+
+// TODO: write a doc where we explain each command and how it works and why we made those choices
+// TODO: write the new parser methods that are common in the next rewrite

@@ -49,9 +49,9 @@ impl<'a> Parser<'a> {
         // we extract the lowest 12 bits which is where we stored the path len
         let path_len = flags & 0xfff;
         if path_len == PATH_MAX_SIZE {
-            path_bytes.extend(self.read_path_until_nul()?);
+            path_bytes.extend_from_slice(self.read_path_until_nul()?);
         } else {
-            path_bytes.extend(self.read_path(path_len as usize)?);
+            path_bytes.extend_from_slice(self.read_path(path_len as usize)?);
         }
 
         let size = self.pos - entry_offset;
@@ -66,7 +66,7 @@ impl<'a> Parser<'a> {
     // if the real path is longer than path_len, the next byte will not be NUL, and we reject it
     // If the real path is shorter than path_len, then the path slice will include the NUL byte
     // inside it, and validate_index_path() will reject it
-    fn read_path(&mut self, path_len: usize) -> Result<Vec<u8>, FormatError> {
+    fn read_path(&mut self, path_len: usize) -> Result<&'a [u8], FormatError> {
         // need path_len bytes for the path, plus 1 byte for the required NUL terminator.
         if self.pos + path_len >= self.buffer.len() {
             return Err(FormatError::at(
@@ -106,7 +106,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        Ok(path_bytes.to_vec())
+        Ok(path_bytes)
     }
 
     // we use this method read the path when it's length exceeds PATH_MAX_SIZE
@@ -120,11 +120,13 @@ impl<'a> Parser<'a> {
     // in read_path() we have to validate that the path length from flags matches the actual path
     // length. One caveat is that we can no longer verify that because we don't keep track of the
     // exact length but we use a sentinel value
-    fn read_path_until_nul(&mut self) -> Result<Vec<u8>, FormatError> {
+    fn read_path_until_nul(&mut self) -> Result<&'a[u8], FormatError> {
         let start = self.pos;
+        // TODO: use memchr the same way the Rust team does on read_until()
+        // check object::parser
         let relative_pos = self.buffer[start..]
             .iter()
-            .position(|b| *b == 0)
+            .position(|&b| b == 0)
             .ok_or_else(|| {
                 FormatError::at(
                     self.buffer.len(),
@@ -139,10 +141,7 @@ impl<'a> Parser<'a> {
         // the position of the NUL with respect to the whole buffer is start + relative
         let nul_pos = start + relative_pos;
         if nul_pos - start < PATH_MAX_SIZE as usize {
-            return Err(FormatError::at(
-                start,
-                FormatErrorKind::LongPathLenMissMatch,
-            ));
+            return Err(FormatError::at(start, FormatErrorKind::LongPathLenMissMatch,));
         }
 
         let path_bytes = &self.buffer[start..nul_pos];
@@ -151,7 +150,7 @@ impl<'a> Parser<'a> {
         // skip NUL
         self.pos = nul_pos + 1;
 
-        Ok(path_bytes.to_vec())
+        Ok(path_bytes)
     }
 
     // padding formula: size % 8 tells us how far past the last multiple of 8 we are. 67 % 8 = 3
