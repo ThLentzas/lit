@@ -12,11 +12,13 @@ use std::io::ErrorKind;
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
+use crate::cmd::refs::Refs;
 use crate::cmd::status::Status;
+use crate::hex;
 
 pub mod db;
 mod lockfile;
-mod object;
+pub mod object;
 pub mod refs;
 
 mod config;
@@ -82,19 +84,20 @@ impl Repository {
         }
     }
 
-    fn objects_path(&self) -> PathBuf {
+    fn db_path(&self) -> PathBuf {
         self.lit.join("objects")
     }
 
     fn index_path(&self) -> PathBuf {
         self.lit.join("index")
     }
+
     fn config_path(&self) -> PathBuf {
         self.lit.join("config")
     }
 
-    fn head_path(&self) -> PathBuf {
-        self.lit.join("HEAD")
+    fn refs_path(&self) -> PathBuf {
+        self.lit.join("refs")
     }
 }
 
@@ -135,7 +138,7 @@ impl Init {
         let refs = lit_dir.join("refs");
         // safe to call create_dir_all() in existing dirs, it will return without touching them
         fs::create_dir_all(&objects).map_err(|err| Self::io_error(&objects, err))?;
-        fs::create_dir_all(&refs).map_err(|err| Self::io_error(&objects, err))?;
+        fs::create_dir_all(&refs).map_err(|err| Self::io_error(&refs, err))?;
         // toDo: At this point we need to some setup for template files
         // toDo: one such case is to create the config file with the core section [core]
 
@@ -173,7 +176,7 @@ impl Add {
     // not just lexer.rs(what the user provided, self.path in our case)
     fn execute(&self) -> Result<(), AddError> {
         let repo = Repository::discover()?;
-        let db = Database { path: repo.objects_path(), };
+        let db = Database { path: repo.db_path(), };
         let workspace = Workspace { root: repo.root.clone(), };
         let mut index = Index::new(repo.index_path());
         let mut lockfile = Lockfile::acquire(&index.path)?;
@@ -208,9 +211,10 @@ impl Commit {
     fn execute(&self) -> Result<(), CommitError> {
         let repo = Repository::discover()?;
         let db = Database {
-            path: repo.objects_path(),
+            path: repo.db_path(),
         };
-        // TODO: modify index by refreshing the metadata and then it becomes a read-modify-write 
+        let refs = Refs { path: repo.refs_path() };
+        // TODO: modify index by refreshing the metadata and then it becomes a read-modify-write, and remove this comment it no longer stands
         // for index itself
         // We must acquire the lock on .lit/index for the entire commit, not just read the file.
         // Lockfile's atomic rename guarantees we never read half-written/corrupted data, but that
@@ -233,8 +237,7 @@ impl Commit {
         let mut index = Index::new(repo.index_path());
         let _index_lock = Lockfile::acquire(&index.path)?;
         index.load()?;
-        // toDo: revisit if the we actually need to acquire the lock for config the same we did for
-        // index. Also need to rethink how this load() is called because now load() is called without
+        // need to rethink how this load() is called because now load() is called without
         // knowing if Signature will actually read the info from config or env
         let mut config = Config::new(repo.config_path());
         config.load()?;
@@ -242,14 +245,14 @@ impl Commit {
         let committer = Signature::committer(&config)?;
         let tree_id = Tree::from_index(index).write(&db)?;
 
-        refs::update_head(&repo.head_path(), |parent| {
+        refs.update_head(|parent| {
             let commit = object::Commit {
                 author,
                 parent,
                 committer,
                 message: "".to_string(),
                 // convert the [u8, 20] to its hex value
-                root_id: tree_id.iter().map(|b| format!("{:02x}", b)).collect(),
+                root_id: hex::bytes_as_hex(&tree_id),
             };
             db.store(Object::Commit(commit))
         })?;

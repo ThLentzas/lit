@@ -1,11 +1,14 @@
 use crate::cmd::error::{DbError, DbErrorKind};
 use crate::cmd::object::Object;
+use crate::cmd::os;
+use crate::hex;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
 use sha1::{Digest, Sha1};
-use std::io::ErrorKind;
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::PathBuf;
-use std::{fs, io};
 
 pub(super) struct Database {
     pub(super) path: PathBuf,
@@ -14,7 +17,7 @@ pub(super) struct Database {
 // toDo: info and packs files
 impl Database {
     pub(super) fn store(&self, object: Object) -> Result<[u8; 20], DbError> {
-        let obj_type = object.obj_type();
+        let obj_type = object.obj_type().as_bytes();
         let content = object.serialize();
         // The header for each object is: object type, a space, the size of the object(result of
         // serialization) and a nul byte. These are the bytes that will be used for compression
@@ -34,7 +37,7 @@ impl Database {
         // u8 spans from 0 to 255 which is equivalent to 0x00 - 0xFF
         // both the 20 raw bytes and the 40-character hex string are the same hash. They are two
         // representations of the same 160-bit value
-        let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+        let hex = hex::bytes_as_hex(&hash);
         // the first 2 characters are the name of the folder in /objects, the rest are the name
         // of the file .lit/objects/90/3a71ad300d...
         // the two character split is just to avoid having of thousands of files in one directory,
@@ -96,27 +99,94 @@ impl Database {
         if oid.len() != 40 {
             return Ok(None);
         }
-        let path = self.path.join(&oid[..2]);
-        let path = path.join(&oid[2..]);
-        let content = fs::read(&path).map_err(|err| DbError {
-            // TODO: this clone happens only because the closure can't know about ? and the compiler
-            // sees that the value is used and moved again after. It happens a lot try to find a fix
-            // TODO: the not exists variant must be Ok(None) or Error
-            // TODO: we must also handle the exists case but it is a DIR
-            path: path.clone(),
-            kind: DbErrorKind::Io { source: err },
-        })?;
-        
-        let bytes = inflate::inflate_bytes(&content).unwrap();
-        let hash: [u8; 20] = Sha1::digest(&bytes).into();
-        let hex: String = hash.iter().map(|&b| format!("{:02x}", b)).collect();
+        let path = self.path.join(&oid[..2]).join(&oid[2..]);
+        let content = match fs::read(&path) {
+            Ok(content) => content,
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::IsADirectory) => {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(DbError {
+                    path,
+                    kind: DbErrorKind::Io { source: err },
+                });
+            }
+        };
 
+        let bytes = match inflate::inflate_bytes(&content) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Err(DbError {
+                    path,
+                    kind: DbErrorKind::Decompress { reason: err },
+                });
+            }
+        };
+
+        let hash: [u8; 20] = Sha1::digest(&bytes).into();
+        let hex = hex::bytes_as_hex(&hash);
         if hex != oid {
             // tampered object: someone opened the file, changed its contents, compressed the new
             // content and wrote back to the file, the hashes do not match
-            return Err(DbError { path, kind: DbErrorKind::Corrupt });
+            return Err(DbError {
+                path,
+                kind: DbErrorKind::HashMismatch {
+                    oid: oid.to_owned(),
+                },
+            });
         }
-        Ok(Some(Object::deserialize(&bytes)))
+        // the information from any parsing error that occurs during loading an object is never returned
+        // to the user. It means something is wrong with our on-disk format. Bad object with {oid}
+        // is all they are going to see. The information is only needed for debugging.
+        Ok(Some(Object::deserialize(&bytes).map_err(|_| DbError {
+            path,
+            kind: DbErrorKind::BadObject {
+                oid: oid.to_owned(),
+            },
+        })?))
+    }
+
+    pub(super) fn load_tree_files(&self, tree_oid: &str) -> Result<HashMap<Vec<u8>, ([u8; 20], u32)>, DbError> {
+        let mut files = HashMap::new();
+        self.collect_tree_files(&mut files, b"", tree_oid)?;
+
+        Ok(files)
+    }
+
+    fn collect_tree_files(
+        &self,
+        files: &mut HashMap<Vec<u8>, ([u8; 20], u32)>,
+        prefix: &[u8],
+        tree_oid: &str,
+    ) -> Result<(), DbError> {
+        let entries = match self.load(tree_oid)? {
+            Some(Object::Tree(entries)) => entries,
+            Some(object) => return Err(DbError {
+                path: os::bytes_to_path(prefix),
+                kind: DbErrorKind::ObjectTypeMisMatch {
+                    // to_string() calls String::from() and String::from() calls to_owned(). There is
+                    // no performance cost in any of them
+                    expected: "tree".to_owned(),
+                    found: object.obj_type().to_owned(),
+                    oid: tree_oid.to_owned(),
+                }
+            }),
+            None => return Err(DbError {
+                path: os::bytes_to_path(prefix),
+                kind: DbErrorKind::NotFound { oid: tree_oid.to_owned() }
+            }),
+        };
+
+        for entry in entries {
+            if entry.mode == os::DIR {
+                let path = extend_path(prefix, &entry.name);
+                // dfs
+                self.collect_tree_files(files, &path, &hex::bytes_as_hex(&entry.oid))?;
+            } else {
+                files.insert(prefix.to_vec(), (entry.oid, entry.mode));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -142,3 +212,25 @@ fn gen_tmp_name() -> String {
         .collect();
     format!("tmp_obj_{suffix}")
 }
+
+// this method is used to builds the path when walking a tree starting from the root. if we walk
+// src and has 1 file: main.rs then the path stored on the map is src/main.rs it is the location of
+// the file build incrementally one level at a time. The path then is compared against index paths
+// to determine any changes. Read load_tree_files() and  status::Status::head_entries().
+fn extend_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    // root has no prefix
+    if prefix.is_empty() {
+        return name.to_vec();
+    }
+
+    let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+    path.extend_from_slice(prefix);
+    // TODO: currently the path will be tested against index path which are of fixed format using
+    // TODO: using '/'. We could use the os separator and do the conversion to an index path in the
+    // TODO: caller. path.push(MAIN_SEPARATOR as u8);
+    path.push(b'/');
+    path.extend_from_slice(name);
+
+    path
+}
+

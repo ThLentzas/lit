@@ -2,12 +2,12 @@ mod parse;
 pub(super) mod tree;
 
 use crate::cmd::error::{FormatError, FormatErrorKind, IndexError, PathError};
+use crate::cmd::index::parse::Parser;
 use crate::cmd::os;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use crate::cmd::index::parse::Parser;
 // toDo:
 // Integrity validation:
 //   Did the bytes survive unchanged?
@@ -75,7 +75,7 @@ impl Index {
     pub(super) fn is_tracked(&self, path: &Path) -> bool {
         let path = path_to_bytes(path);
 
-        if self.entries.binary_search_by(|entry| entry.path.cmp(&path)).is_ok() {
+        if self.contains(&path) {
             return true;
         }
         // TODO: test it
@@ -280,6 +280,12 @@ impl Index {
         self.entries.binary_search_by(|entry| entry.path.as_slice().cmp(path))
             .unwrap_or_else(|pos| pos)
     }
+    
+    pub(super) fn contains(&self, path: &[u8]) -> bool {
+        self.entries
+            .binary_search_by(|entry| entry.path.as_slice().cmp(path))
+            .is_ok()
+    }
 }
 
 // toDo: add GitLink support.
@@ -415,7 +421,7 @@ fn validate_path(path: &[u8]) -> Result<(), PathError> {
         // src/./main.rs: stays in the current directory, redundant and not a real subdirectory
         // src/../etc/passwd: escapes upward, would let a crafted index reference files outside the repo
         // .lit/config: points into Lit's own metadata, never legitimate as a tracked file.
-        if component == b"." || component == b".." || component == b".lit" {
+        if matches!(component, b"." | b".." | b".lit") {
             return Err(PathError::ReservedComponent);
         }
         // NUL cannot appear inside the path.

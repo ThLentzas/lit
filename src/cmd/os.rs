@@ -102,7 +102,7 @@ pub(super) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
-// TODO: check if true Windows accepts / in paths. The Win32 file APIs (and therefore Rust's Path on
+// TODO: check if true: Windows accepts / in paths. The Win32 file APIs (and therefore Rust's Path on
 // TODO: Windows) treat / and \ as equivalent separators, so you never need to convert separators
 // TODO: OsString is WTF-16 internally, so bytes must go through UTF-8 — which is safe because Git for 
 // TODO: Windows stores index paths as UTF-8 by convention

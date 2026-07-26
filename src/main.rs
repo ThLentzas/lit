@@ -1,5 +1,3 @@
-extern crate core;
-
 pub mod cli;
 mod cmd;
 pub mod hex;
@@ -15,3 +13,4 @@ fn main() {
 
 // TODO: write a doc where we explain each command and how it works and why we made those choices
 // TODO: write the new parser methods that are common in the next rewrite
+// TODO: review every single import and why we declare them that way in terms of access level

@@ -1,7 +1,21 @@
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct HexError {
     pub(super) digit: u8,
     pub(super) pos: usize,
+}
+
+pub(super) fn bytes_as_hex(bytes: &[u8; 20]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+pub(super) fn parse_hex(bytes: &[u8; 40]) -> Result<String, HexError> {
+    for (index, &byte) in bytes.iter().enumerate() {
+        if !is_hex_digit(byte) {
+            return Err(HexError { digit: byte, pos: index });
+        }
+    }
+    // SAFETY: the previous loop guarantees that all bytes are ASCII
+    Ok(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
 }
 
 pub(super) fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {

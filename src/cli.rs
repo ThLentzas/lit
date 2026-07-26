@@ -20,7 +20,7 @@ pub(super) fn parse() -> Command {
         // if any path is empty -> Error
         "add" => Command::Add(Add { paths: vec![PathBuf::from(args.next().unwrap())]} ),
         "commit" => Command::Commit(Commit{}),
-        "status" => Command::Status(Status::new()),
+        "status" => Command::Status(Status{}),
         _ => todo!(),
     }
 }

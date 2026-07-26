@@ -1,7 +1,7 @@
 use chrono::{Local, Offset};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum TimestampError {
+pub(crate) enum TimestampError {
     BadUnixTimeStamp,
     BadTimezone,
 }

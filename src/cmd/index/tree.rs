@@ -21,13 +21,13 @@ pub(crate) struct Tree {
 
 impl Tree {
     pub(crate) fn from_index(index: Index) -> Self {
-        let mut builder = Self::new();
+        let mut tree = Self::new();
 
         for entry in index.entries {
-            builder.insert(entry.path, entry.oid, entry.stat.mode);
+            tree.insert(entry.path, entry.oid, entry.stat.mode);
         }
 
-        builder
+        tree
     }
 
     // We have 2 paths: src/main.rs and src/database/tree.rs
@@ -193,6 +193,11 @@ impl Tree {
     //
     // That is why rollback is not required. The visible state of the repository is controlled by
     // refs like HEAD, not by the presence of loose objects in .lit/objects.
+    //
+    // When we want to retrieve all the entries for a tree, since it only contains a flat list of
+    // its entries, we walk the list and check the mode if a directory is found we recurse. It is
+    // very important to see that the entry's name is a directory level, there is no nesting. The name
+    // never contains '/'
     pub(crate) fn write(self, db: &Database) -> Result<[u8; 20], DbError> {
         let mut entries = Vec::new();
 

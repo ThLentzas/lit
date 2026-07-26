@@ -1,9 +1,13 @@
 use crate::cmd::object::{Commit, Entry, Object, Signature};
 use crate::cmd::os;
 use crate::cmd::timestamp::{Timestamp, TimestampError};
-use crate::hex;
-use std::str::Utf8Error;
+use crate::hex::{self, HexError};
 
+// Every parser that I wrote so far is a struct and all the parse_* methods are implemented in its
+// impl block. Now we pass Cursor a struct that has some generic methods that are used to walk the
+// buffer. It is helps a lot approaching the parsing like this because of commit's structure.
+// Read parse_commit(). Every method that does not take &mut Cursor as arg, returns error indices
+// relative to the slice passed, but they get adjusted by the caller(parse_signature(), parse_oid()).
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -22,23 +26,30 @@ impl<'a> Cursor<'a> {
         &self.buf[self.pos..]
     }
 
-    fn advance(&mut self, n: usize) {
-        self.pos += n;
-    }
-
     fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], CursorError> {
-        let available = self.buf.len().saturating_sub(self.pos);
+        let start = self.pos;
+        let available = self.buf.len().saturating_sub(start);
 
-        let bytes: &[u8; N] = self.buf[self.pos..self.pos + N].try_into().map_err(|_| {
-            CursorError::new(
-                self.pos,
-                CursorErrorKind::Truncated {
-                    needed: N,
-                    available,
-                },
-            )
-        })?;
-        self.advance(N);
+        let end = start.checked_add(N).ok_or(CursorError::new(
+            start,
+            CursorErrorKind::Truncated {
+                needed: N,
+                available,
+            },
+        ))?;
+
+        // we can't just call self.buf[self.pos..self.pos + N], it can panic
+        let bytes = self.buf.get(start..end).ok_or(CursorError::new(
+            start,
+            CursorErrorKind::Truncated {
+                needed: N,
+                available,
+            },
+        ))?;
+
+        // safe to unwrap since end - start is N
+        let bytes: &[u8; N] = bytes.try_into().unwrap();
+        self.pos = end;
 
         Ok(bytes)
     }
@@ -66,45 +77,9 @@ impl<'a> Cursor<'a> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum OidError {
-    WrongLen { offset: usize, len: usize },
-    BadDigit { offset: usize, digit: u8 },
-}
-
-impl OidError {
-    fn offset(&self) -> usize {
-        match self {
-            OidError::WrongLen { offset, .. } => *offset,
-            OidError::BadDigit { offset, .. } => *offset,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum SignatureError {
-    MissingSpace { offset: usize },
-    MissingAngleBracket { offset: usize },
-    MissingName { offset: usize },
-    MissingEmail { offset: usize },
-    MissingTime { offset: usize },
-    InvalidUtf8(Utf8Error),
-    BadTimestamp { offset: usize, err: TimestampError },
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum TreeEntryError {
-    MissingSpace,
-    MissingNul,
-    TruncatedOid,
-    UnknownMode { mode: Vec<u8> },
-}
-
-#[derive(Debug, PartialEq, Eq)]
 enum CursorErrorKind {
     /// read_until: delimiter absent between `offset` and end of input
     MissingDelimiter { delimiter: u8 },
-    /// expect: next byte wasn't the required one (None = at end of input)
-    Expected { byte: u8, found: Option<u8> },
     /// take::<N>: fewer than `needed` bytes remained
     Truncated { needed: usize, available: usize },
 }
@@ -121,31 +96,101 @@ impl CursorError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OidError {
+    WrongLen { offset: usize, len: usize },
+    BadDigit(HexError),
+}
+
+impl OidError {
+    fn offset(&self) -> usize {
+        match self {
+            OidError::WrongLen { offset, .. } => *offset,
+            OidError::BadDigit(err) => err.pos,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SignatureError {
+    pub(super) offset: usize,
+    pub(super) kind: SignatureErrorKind,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SignatureErrorKind {
+    MissingSpace,
+    MissingAngleBracket,
+    MissingName,
+    MissingEmail,
+    MissingTime,
+    InvalidUtf8,
+    BadTimestamp(TimestampError),
+}
+
+impl SignatureError {
+    fn new(offset: usize, kind: SignatureErrorKind) -> Self {
+        Self { offset, kind }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TreeEntryErrorKind {
+    MissingSpace,
+    MissingNul,
+    TruncatedOid,
+    BadPathName { name: Vec<u8> },
+    UnknownMode { mode: Vec<u8> },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntryError {
+    offset: usize,
+    kind: TreeEntryErrorKind,
+}
+
+impl TreeEntryError {
+    fn new(offset: usize, kind: TreeEntryErrorKind) -> Self {
+        Self { offset, kind }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum ParseErrorKind {
     DuplicateHeader { name: &'static str },
     MissingHeaderSpace,
     MissingHeaderNul,
-    InvalidTreeEntry(TreeEntryError),
+    InvalidTreeEntry(TreeEntryErrorKind),
     InvalidSizeHeader,
     SizeMisMatch { expected: usize, actual: usize },
     MissingDelimiter { delimiter: u8 },
     MissingNewLine,
     UnknownType { got: Vec<u8> },
-    // bad hex digit
+    BadSignature(SignatureErrorKind),
     BadOid(OidError),
     BadTimestamp(TimestampError),
-    UnexpectedHeader { header: Vec<u8> }
+    MissingBlankLine,
+    UnexpectedHeader { expected: Vec<u8>, got: Vec<u8> },
+    InvalidUtf8,
 }
 
-pub(super) struct ParseError {
-    pub(super) offset: usize,
-    pub(super) kind: ParseErrorKind,
+pub(crate) struct ParseError {
+    offset: usize,
+    kind: ParseErrorKind,
 }
 
 impl ParseError {
     fn new(offset: usize, kind: ParseErrorKind) -> Self {
         Self { offset, kind }
     }
+}
+
+struct Line<'a> {
+    // where the line starts with respect to the entire buffer
+    start: usize,
+    key: &'a [u8],
+    value: &'a [u8],
+    // absolute index of value within the entire buffer
+    vbase: usize,
 }
 
 // object type, a space, the size of the object and a nul byte
@@ -177,74 +222,79 @@ pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
             // to verify the structure so far and not adjust the offsets because it is already absolute
             let mut entries = Vec::new();
             while !cursor.is_empty() {
-                entries.push(parse_tree_entry(&mut cursor)?);
+                entries.push(parse_tree_entry(&mut cursor).map_err(|err| {
+                    ParseError::new(err.offset, ParseErrorKind::InvalidTreeEntry(err.kind))
+                })?);
             }
             Ok(Object::Tree(entries))
         }
-        b"commit" => {}
+        b"commit" => Ok(Object::Commit(parse_commit(&mut cursor)?)),
         _ => Err(ParseError::new(
-            cursor.pos,
+            0,
             ParseErrorKind::UnknownType { got: kind.to_vec() },
         )),
     }
 }
 
-fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, ParseError> {
+fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
     let start = cursor.pos;
-    let buf = cursor.read_until(b' ').map_err(|err| {
-        ParseError::new(
-            err.offset,
-            ParseErrorKind::InvalidTreeEntry(TreeEntryError::MissingSpace),
-        )
-    })?;
+    let buf = cursor
+        .read_until(b' ')
+        .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::MissingSpace))?;
     let mut mode = 0u32;
 
+    // this part is tricky, we have the mode as ASCII, something like '100644', we can't just convert
+    // it to 100644 in base 10, we need base 8
+    // "100644" octal -> 0o100644(33188 decimal)
     for &b in buf {
-        if !b.is_ascii_digit() {
-            return Err(ParseError::new(
+        if !(b'0'..=b'7').contains(&b) {
+            return Err(TreeEntryError::new(
                 start,
-                ParseErrorKind::InvalidTreeEntry(TreeEntryError::UnknownMode {
-                    mode: buf.to_vec(),
-                }),
+                TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
             ));
         }
         mode = mode
-            .checked_mul(10)
+            .checked_mul(8)
             .and_then(|n| n.checked_add((b - b'0') as u32))
-            .ok_or(ParseError::new(
+            .ok_or(TreeEntryError::new(
                 start,
-                ParseErrorKind::InvalidTreeEntry(TreeEntryError::UnknownMode {
-                    mode: buf.to_vec(),
-                }),
+                TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
             ))?;
     }
 
     if !matches!(mode, os::EXECUTABLE | os::REGULAR | os::SYMLINK | os::DIR) {
-        return Err(ParseError::new(
+        return Err(TreeEntryError::new(
             start,
-            ParseErrorKind::InvalidTreeEntry(TreeEntryError::UnknownMode { mode: buf.to_vec() }),
+            TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
         ));
     }
 
+    let start = cursor.pos;
     let name = cursor
         .read_until(0)
-        .map_err(|err| {
-            ParseError::new(
-                err.offset,
-                ParseErrorKind::InvalidTreeEntry(TreeEntryError::MissingNul),
-            )
-        })?
-        .to_vec();
-    let oid = cursor.take::<20>().map_err(|err| {
-        ParseError::new(
-            err.offset,
-            ParseErrorKind::InvalidTreeEntry(TreeEntryError::TruncatedOid),
-        )
-    })?;
+        .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::MissingNul))?;
+    // the name of the tree entry is the name as it was set by index::Tree::write()
+    // it is flat and represents one object level at the current tree
+    if matches!(name, b"." | b".." | b".lit")
+        || name.contains(&0)
+        || name.contains(&b'/')
+        || name.is_empty()
+    {
+        return Err(TreeEntryError::new(
+            start,
+            TreeEntryErrorKind::BadPathName {
+                name: name.to_vec(),
+            },
+        ));
+    }
+
+    let oid = cursor
+        .take::<20>()
+        .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::TruncatedOid))?;
 
     Ok(Entry {
         mode,
-        name,
+        name: name.to_vec(),
         oid: *oid,
     })
 }
@@ -258,7 +308,6 @@ fn parse_size(cursor: &mut Cursor) -> Result<usize, ParseError> {
     if size_buf.is_empty() {
         return Err(ParseError::new(start, ParseErrorKind::InvalidSizeHeader));
     }
-    cursor.advance(1);
 
     let mut size = 0usize;
     // we could also try to parse as usize from std
@@ -279,135 +328,171 @@ fn parse_size(cursor: &mut Cursor) -> Result<usize, ParseError> {
     Ok(size)
 }
 
+// tree tree_oid_hex\n
+// parent parent_oid_hex\n // repeated once per parent, omitted for root commit
+// author name <email> timestamp timezone\n
+// committer name <email> timestamp timezone\n
+// \n
+// message
+//
+// To parse the commit instead of reading up to 1st space and then to \n etc, we can try to parse it
+// line by line. Read until \n and that slice is now a Line, where everything up to the 1st space is
+// the header name/key and everything after is the value. This way we can create helper functions to
+// parse value without bloating commit. tree and parent headers are followed by the same value a
+// 40-character hex string. After tree, parent header is optional so in the mismatch case we don't
+// error but pass line to the next check.
 fn parse_commit(cursor: &mut Cursor) -> Result<Commit, ParseError> {
-    let mut tree: Option<[u8; 20]> = None;
-    // TODO: when we support merge, this needs to change to a Vec<[u8; 20]>, an empty vec means initial commit
-    let mut parent: Option<[u8; 20]> = None;
-    let mut author: Option<Signature> = None;
-    let mut committer: Option<Signature> = None;
-
-    loop {
-        let start = cursor.pos;
-        let line = cursor
-            .read_until(b'\n')
-            .map_err(|err| ParseError::new(err.offset, ParseErrorKind::MissingNewLine))?;
-        // new line was found but the line is empty, we found the divider between headers and message
-        if line.is_empty() {
-            break;
-        }
-        let index = memchr::memchr(b' ', line)
-            .ok_or(ParseError::new(start, ParseErrorKind::MissingHeaderSpace))?;
-        let header_name = &line[..index];
-        let header_value = &line[index + 1..];
-
-        match header_name {
-            b"tree" => {
-                if tree.is_some() {
-                    return Err(ParseError::new(
-                        start,
-                        ParseErrorKind::DuplicateHeader { name: "tree" },
-                    ));
-                }
-                tree = Some(parse_oid(header_value).map_err(|err| {
-                    // OidError returns the offset relative to the input, and we adjust for the
-                    // absolute pos
-                    ParseError::new(start + err.offset(), ParseErrorKind::BadOid(err))
-                })?);
-            }
-            // TODO: read parent's declaration
-            b"parent" => {
-                if parent.is_some() {
-                    return Err(ParseError::new(
-                        start,
-                        ParseErrorKind::DuplicateHeader { name: "parent" },
-                    ));
-                }
-                parent = Some(parse_oid(header_value).map_err(|err| {
-                    // OidError returns the offset relative to the input, and we adjust for the
-                    // absolute pos
-                    ParseError::new(start + err.offset(), ParseErrorKind::BadOid(err))
-                })?);
-            }
-            b"author" => {
-                if author.is_some() {
-                    return Err(ParseError::new(
-                        start,
-                        ParseErrorKind::DuplicateHeader { name: "author" },
-                    ));
-                }
-                author = Some(parse_signature(header_value).unwrap())
-            }
-            b"committer" => {
-                if committer.is_some() {
-                    return Err(ParseError::new(
-                        start,
-                        ParseErrorKind::DuplicateHeader { name: "committer" },
-                    ));
-                }
-                committer = Some(parse_signature(header_value).unwrap())
-            }
-            other => return Err(ParseError::new(start, ParseErrorKind::UnexpectedHeader { header: other.to_vec() })),
-        }
+    let line = parse_header(cursor)?;
+    if line.key != b"tree" {
+        return Err(ParseError::new(
+            line.start,
+            ParseErrorKind::UnexpectedHeader {
+                expected: b"tree".to_vec(),
+                got: line.key.to_vec(),
+            },
+        ));
     }
+    let tree = parse_oid(line.value)
+        .map_err(|err| ParseError::new(line.vbase + err.offset(), ParseErrorKind::BadOid(err)))?;
+    let mut parents = Vec::new();
+    let line = loop {
+        let line = parse_header(cursor)?;
+        if line.key != b"parent" {
+            break line;
+        }
+        parents.push(parse_oid(line.value).map_err(|err| {
+            ParseError::new(line.vbase + err.offset(), ParseErrorKind::BadOid(err))
+        })?);
+    };
+    if line.key != b"author" {
+        return Err(ParseError::new(
+            line.start,
+            ParseErrorKind::UnexpectedHeader {
+                expected: b"author".to_vec(),
+                got: line.key.to_vec(),
+            },
+        ));
+    }
+    let author = parse_signature(line.value).map_err(|err| {
+        ParseError::new(
+            line.vbase + err.offset,
+            ParseErrorKind::BadSignature(err.kind),
+        )
+    })?;
 
-    todo!()
+    let line = parse_header(cursor)?;
+    if line.key != b"committer" {
+        return Err(ParseError::new(
+            line.start,
+            ParseErrorKind::UnexpectedHeader {
+                expected: b"committer".to_vec(),
+                got: line.key.to_vec(),
+            },
+        ));
+    }
+    let committer = parse_signature(line.value).map_err(|err| {
+        ParseError::new(
+            line.vbase + err.offset,
+            ParseErrorKind::BadSignature(err.kind),
+        )
+    })?;
+    let start = cursor.pos;
+    let line = cursor
+        .read_until(b'\n')
+        .map_err(|err| ParseError::new(err.offset, ParseErrorKind::MissingNewLine))?;
+    if !line.is_empty() {
+        return Err(ParseError::new(start, ParseErrorKind::MissingBlankLine));
+    }
+    let start = cursor.pos;
+    // after the blank line, everything that is left is the message
+    let message = String::from_utf8(cursor.rest().to_vec()).map_err(|err| {
+        ParseError::new(
+            start + err.utf8_error().valid_up_to(),
+            ParseErrorKind::InvalidUtf8,
+        )
+    })?;
+
+    Ok(Commit {
+        root_id: tree,
+        parent: parents,
+        author,
+        committer,
+        message,
+    })
 }
 
-fn parse_oid(buf: &[u8]) -> Result<[u8; 20], OidError> {
-    let hex: &[u8; 40] = buf.try_into().map_err(|_| OidError::WrongLen {
+// line.key and line.value live in cursor.buf so they share the same lifetime
+fn parse_header<'a>(cursor: &mut Cursor<'a>) -> Result<Line<'a>, ParseError> {
+    let start = cursor.pos;
+    let line = cursor
+        .read_until(b'\n')
+        .map_err(|err| ParseError::new(err.offset, ParseErrorKind::MissingNewLine))?;
+    let index = memchr::memchr(b' ', line)
+        .ok_or(ParseError::new(start, ParseErrorKind::MissingHeaderSpace))?;
+    // everything up to space is the key and everything after is the value
+    Ok(Line {
+        start,
+        key: &line[..index],
+        value: &line[index + 1..],
+        vbase: start + index + 1,
+    })
+}
+
+fn parse_oid(buf: &[u8]) -> Result<String, OidError> {
+    let bytes: &[u8; 40] = buf.try_into().map_err(|_| OidError::WrongLen {
         offset: 0,
         len: buf.len(),
     })?;
 
-    let mut oid = [0u8; 20];
-    // same logic as:
-    //  let j = i * 2;
-    //  let pair: &[u8; 2] = hex[j..j + 2].try_into().unwrap();
-    for (i, pair) in hex.chunks_exact(2).enumerate() {
-        oid[i] = hex::pair_to_u8(pair.try_into().unwrap())
-            // i * 2 is the index we create
-            .map_err(|e| OidError::BadDigit {
-                offset: i * 2 + e.pos,
-                digit: e.digit,
-            })?;
-    }
-    Ok(oid)
+    Ok(hex::parse_hex(bytes).map_err(OidError::BadDigit)?)
 }
 
 fn parse_signature(buf: &[u8]) -> Result<Signature, SignatureError> {
     let mut pos = 0;
-    let index =
-        memchr::memchr(b'<', buf).ok_or(SignatureError::MissingAngleBracket { offset: pos })?;
+    let index = memchr::memchr(b'<', buf).ok_or(SignatureError::new(
+        pos,
+        SignatureErrorKind::MissingAngleBracket,
+    ))?;
     let name = buf[..index]
         .strip_suffix(b" ")
-        .ok_or(SignatureError::MissingSpace { offset: 0 })?
+        .ok_or(SignatureError::new(pos, SignatureErrorKind::MissingSpace))?
         .to_vec();
     if name.is_empty() {
-        return Err(SignatureError::MissingName { offset: 0 });
+        return Err(SignatureError::new(pos, SignatureErrorKind::MissingName));
     }
-    let name =
-        String::from_utf8(name).map_err(|err| SignatureError::InvalidUtf8(err.utf8_error()))?;
+    let name = String::from_utf8(name).map_err(|err| {
+        SignatureError::new(
+            pos + err.utf8_error().valid_up_to(),
+            SignatureErrorKind::InvalidUtf8,
+        )
+    })?;
 
-    pos = index + 1;
-    let index = memchr::memchr(b'>', &buf[pos..])
-        .ok_or(SignatureError::MissingAngleBracket { offset: pos })?;
+    pos += index + 1;
+    let index = memchr::memchr(b'>', &buf[pos..]).ok_or(SignatureError::new(
+        pos,
+        SignatureErrorKind::MissingAngleBracket,
+    ))?;
     let email = buf[pos..index].to_vec();
     if email.is_empty() {
-        return Err(SignatureError::MissingEmail { offset: pos });
+        return Err(SignatureError::new(pos, SignatureErrorKind::MissingEmail));
     }
-    let email =
-        String::from_utf8(email).map_err(|err| SignatureError::InvalidUtf8(err.utf8_error()))?;
-    pos = index + 1;
+    let email = String::from_utf8(email).map_err(|err| {
+        SignatureError::new(
+            pos + err.utf8_error().valid_up_to(),
+            SignatureErrorKind::InvalidUtf8,
+        )
+    })?;
+    pos += index + 1;
     if buf.get(pos) != Some(&b' ') {
-        return Err(SignatureError::MissingSpace { offset: index + 1 });
+        return Err(SignatureError::new(pos, SignatureErrorKind::MissingSpace));
     }
     pos += 1;
-    let index =
-        memchr::memchr(b' ', &buf[pos..]).ok_or(SignatureError::MissingSpace { offset: pos })?;
-    let unix = &buf[pos..index];
-    let timezone = &buf[index + 1..];
+    let index = memchr::memchr(b' ', &buf[pos..])
+        .ok_or(SignatureError::new(pos, SignatureErrorKind::MissingSpace))?;
+    let unix = &buf[pos..pos + index];
+    let timezone = &buf[pos + index + 1..];
     let timestamp = Timestamp::from_bytes(unix, timezone)
-        .map_err(|err| SignatureError::BadTimestamp { offset: pos, err })?;
+        .map_err(|err| SignatureError::new(pos, SignatureErrorKind::BadTimestamp(err)))?;
 
     Ok(Signature {
         name,

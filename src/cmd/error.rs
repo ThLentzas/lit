@@ -9,12 +9,13 @@ use std::path::PathBuf;
 use crate::cmd::config::parse::ParseError;
 use crate::cmd::object::SignatureError;
 
+// TODO: move errors to their respective modules and delete error.rs
 #[derive(Debug)]
 pub(super) enum RepoError {
     CurrentDir(io::Error),
     // "not a lit repository (or any of the parent directories)"
     NotRepository,
-    Io{ path: PathBuf, source: io::Error},
+    Io { path: PathBuf, source: io::Error},
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -32,8 +33,14 @@ pub(super) struct DbError {
 #[derive(Debug)]
 pub(super) enum DbErrorKind {
     Io { source: io::Error },
-    // hash mismatch
-    Corrupt
+    Decompress { reason: String },
+    // hash mismatch on trying to load
+    HashMismatch { oid: String },
+    BadObject { oid: String },
+    NotATree { oid: String },
+    NotFound { oid: String },
+    ObjectTypeMisMatch { expected: String, found: String, oid: String }
+
 }
 
 #[derive(Debug)]

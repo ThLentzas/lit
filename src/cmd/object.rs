@@ -1,10 +1,12 @@
-mod parse;
+pub mod parse;
 
 use std::env;
 use std::env::VarError;
 use std::ffi::OsString;
 use std::io::Write;
 use crate::cmd::config::Config;
+use crate::cmd::index::IndexEntry;
+use crate::cmd::object::parse::ParseError;
 use crate::cmd::timestamp::Timestamp;
 
 pub(super) struct Entry {
@@ -21,16 +23,17 @@ pub(super) enum Object {
 }
 
 impl Object {
-    pub(super) fn obj_type(&self) -> &[u8] {
+    pub(super) fn obj_type(&self) -> &str {
         match self {
-            Self::Blob(_) => b"blob",
-            Self::Tree(_) => b"tree",
-            Self::Commit(_) => b"commit",
+            Self::Blob(_) => "blob",
+            Self::Tree(_) => "tree",
+            Self::Commit(_) => "commit",
         }
     }
 
-    // pub(super) fn deserialize(bytes: &[u8]) -> Self {
-    // }
+    pub(super) fn deserialize(buf: &[u8]) -> Result<Self, ParseError> {
+        parse::parse(buf)
+    }
 
     // a mistake I made at the start was to think that I could just impl Display and then call as_bytes()
     // but it won't work. display() needs valid utf8, oid is [u8;20], path names are platform specific
@@ -62,7 +65,7 @@ impl Object {
                 }
                 bytes
             }
-            // tree tree_oid_hex LF
+            // tree tree_oid_hex\n
             // parent parent_oid_hex\n // repeated once per parent, omitted for root commit
             // author name <email> timestamp timezone\n
             // committer name <email> timestamp timezone\n
@@ -78,7 +81,7 @@ impl Object {
                 bytes.extend_from_slice(b"tree ");
                 bytes.extend_from_slice(commit.root_id.as_bytes());
                 bytes.extend_from_slice(b"\n");
-                if let Some(parent) = &commit.parent {
+                for parent in &commit.parent {
                     bytes.extend_from_slice(b"parent ");
                     bytes.extend_from_slice(parent.as_bytes());
                     bytes.extend_from_slice(b"\n");
@@ -106,7 +109,7 @@ impl Object {
 pub(super) struct Commit {
     pub(super) author: Signature,
     pub(super) committer: Signature,
-    pub(super) parent: Option<String>,
+    pub(super) parent: Vec<String>,
     pub(super) message: String,
     // Everything in a commit is already plain text, the author/committer names and emails, the
     // timestamp, the blank line separator, the message. Using a hex id for the tree reference keeps

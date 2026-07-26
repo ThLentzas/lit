@@ -3,13 +3,13 @@ use crate::cmd::index::{validate_path, IndexEntry, StatNode, PATH_MAX_SIZE};
 use crate::cmd::os;
 
 pub(super) struct Parser<'a> {
-    buffer: &'a [u8],
+    buf: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Parser<'a> {
-    pub(super) fn new(buffer: &'a [u8]) -> Self {
-        Self { buffer, pos: 0 }
+    pub(super) fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
     }
 
     // next always returns a valid IndexEntry
@@ -68,25 +68,25 @@ impl<'a> Parser<'a> {
     // inside it, and validate_index_path() will reject it
     fn read_path(&mut self, path_len: usize) -> Result<&'a [u8], FormatError> {
         // need path_len bytes for the path, plus 1 byte for the required NUL terminator.
-        if self.pos + path_len >= self.buffer.len() {
+        if self.pos + path_len >= self.buf.len() {
             return Err(FormatError::at(
                 self.pos,
                 FormatErrorKind::Eof {
                     needed: path_len,
-                    remaining: self.buffer.len().saturating_sub(self.pos),
+                    remaining: self.buf.len().saturating_sub(self.pos),
                 },
             ));
         }
 
         let start = self.pos;
-        let path_bytes = &self.buffer[start..start + path_len];
+        let path_bytes = &self.buf[start..start + path_len];
         // path name needs to follow the rules of the index format
         validate_path(path_bytes)
             .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // move to the next byte after the path that according to the format should be NUL
         self.pos = start + path_len;
 
-        match self.buffer.get(self.pos) {
+        match self.buf.get(self.pos) {
             // move past NUL
             Some(0) => self.advance(1),
             Some(_) => {
@@ -100,7 +100,7 @@ impl<'a> Parser<'a> {
                     self.pos,
                     FormatErrorKind::Eof {
                         needed: 1,
-                        remaining: self.buffer.len().saturating_sub(self.pos),
+                        remaining: self.buf.len().saturating_sub(self.pos),
                     },
                 ));
             }
@@ -124,12 +124,12 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         // TODO: use memchr the same way the Rust team does on read_until()
         // check object::parser
-        let relative_pos = self.buffer[start..]
+        let relative_pos = self.buf[start..]
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(|| {
                 FormatError::at(
-                    self.buffer.len(),
+                    self.buf.len(),
                     FormatErrorKind::Eof {
                         needed: 1,
                         remaining: 0,
@@ -144,7 +144,7 @@ impl<'a> Parser<'a> {
             return Err(FormatError::at(start, FormatErrorKind::LongPathLenMissMatch,));
         }
 
-        let path_bytes = &self.buffer[start..nul_pos];
+        let path_bytes = &self.buf[start..nul_pos];
         validate_path(path_bytes)
             .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // skip NUL
@@ -164,7 +164,7 @@ impl<'a> Parser<'a> {
 
         while padding > 0 {
             // if it is not null or exhausted the buffer too early it's an invalid format
-            match self.buffer.get(self.pos) {
+            match self.buf.get(self.pos) {
                 Some(0) => {
                     self.advance(1);
                     padding -= 1;
@@ -194,9 +194,9 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], FormatError> {
-        let remaining = self.buffer.len().saturating_sub(self.pos);
+        let remaining = self.buf.len().saturating_sub(self.pos);
 
-        let bytes: &[u8; N] = self.buffer[self.pos..self.pos + N]
+        let bytes: &[u8; N] = self.buf[self.pos..self.pos + N]
             .try_into()
             .map_err(|_| FormatError {
                 offset: self.pos,
