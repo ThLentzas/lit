@@ -1,11 +1,12 @@
 mod report;
 mod print;
 
+use crate::cmd::Repository;
 use crate::cmd::error::{LockfileError, RepoError};
 use crate::cmd::index::Index;
 use crate::cmd::lockfile::Lockfile;
 use crate::cmd::status::report::{Report, ReportError};
-use crate::cmd::Repository;
+use std::io;
 
 // TODO:
 // merge conflicts / unmerged index stages
@@ -58,7 +59,7 @@ impl Status {
                 lockfile.commit()?;
             }
         }
-        print::print(&report, Format::default());
+        print::print(&report, Format::default()).map_err(StatusError::Io)?;
         Ok(())
     }
 }
@@ -68,6 +69,9 @@ pub(super) enum StatusError {
     BadReport(ReportError),
     Repository(RepoError),
     Lockfile(LockfileError),
+    // occurs when trying to print to the terminal, so compared to the other Io variants we had there
+    // is no path
+    Io(io::Error),
 }
 
 

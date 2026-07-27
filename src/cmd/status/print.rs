@@ -8,20 +8,51 @@ const LABEL_WIDTH: usize = 12;
 enum Color {
     Red,
     Green,
+    // diff adds Bold, Cyan
 }
 
-struct Style {
-    colorize: bool,
+impl Color {
+    fn sgr(&self) -> &'static [u8] {
+        match self {
+            Color::Red => b"\x1b[31m",
+            Color::Green => b"\x1b[32m",
+        }
+    }
+}
+
+enum Style {
+    Plain,
+    Colored(Color),
 }
 
 impl Style {
-    fn auto() -> Self {
-        Self { colorize: io::stdout().is_terminal() }
+    // the user might have redirected the stdout to another process or a file. we don't want to
+    // add the sgr sequence as is, because only the terminal will recognize it and not display it
+    fn for_stdout(color: Color) -> Self {
+        if io::stdout().is_terminal() {
+            Self::Colored(color)
+        } else {
+            Self::Plain
+        }
     }
 
     // For porcelain output and tests no coloring
-    pub(crate) fn plain() -> Self {
-        Self { colorize: false }
+    fn plain() -> Self {
+        Self::Plain
+    }
+
+    fn begin(&self, out: &mut impl Write) -> io::Result<()> {
+        match self {
+            Style::Plain => Ok(()),
+            Style::Colored(color) => out.write_all(color.sgr()),
+        }
+    }
+
+    fn end(&self, out: &mut impl Write) -> io::Result<()> {
+        match self {
+            Style::Plain => Ok(()),
+            Style::Colored(_) => out.write_all(b"\x1b[m"),
+        }
     }
 }
 
@@ -29,6 +60,7 @@ pub(super) fn print(report: &Report, format: Format) -> io::Result<()> {
     match format {
         Format::Short => print_short(report),
         Format::Long => print_long(report),
+
     }
 }
 
@@ -38,72 +70,81 @@ fn print_short(report: &Report) -> io::Result<()> {
 
 fn print_long(report: &Report) -> io::Result<()> {
     let mut writer = io::stdout().lock();
-
-    print_changes(
-        "Changes to be committed",
-        report.changes.iter().filter_map(|(path, change)| {
+    let staged = report.changes
+        .iter()
+        .filter_map(|(path, change)| {
             change.head_index.as_ref().map(|ch| {
-                (
-                    path,
-                    match ch {
-                        HeadIndexChange::ADDED => "new file:",
-                        HeadIndexChange::MODIFIED => "modified:",
-                        HeadIndexChange::DELETED => "deleted:",
-                    },
-                )
+                let label = match ch {
+                    HeadIndexChange::ADDED => "new file:",
+                    HeadIndexChange::MODIFIED => "modified:",
+                    HeadIndexChange::DELETED => "deleted:",
+                };
+                (path, label)
             })
-        }),
-        Color::Green,
-        &mut writer,
-    )?;
-    print_changes(
-        "Changes not staged for commit",
-        report.changes.iter().filter_map(|(path, change)| {
+        });
+    let unstaged = report.changes
+        .iter()
+        .filter_map(|(path, change)| {
             change.workspace_index.as_ref().map(|ch| {
-                (
-                    path,
-                    match ch {
-                        WorkspaceIndexChange::MODIFIED => "modified:",
-                        WorkspaceIndexChange::DELETED => "deleted:",
-                    },
-                )
+                let label = match ch {
+                    WorkspaceIndexChange::MODIFIED => "modified:",
+                    WorkspaceIndexChange::DELETED => "deleted:",
+                };
+                (path, label)
             })
-        }),
-        Color::Red,
+        });
+    let untracked = report.untracked
+        .iter()
+        .map(|p| (p, ""));
+
+    print_section(
+        "Changes to be committed",
+        staged,
+        Style::for_stdout(Color::Green),
         &mut writer,
     )?;
-    print_changes(
+
+    print_section(
+        "Changes not staged for commit",
+        unstaged,
+        Style::for_stdout(Color::Red),
+        &mut writer,
+    )?;
+    print_section(
         "Untracked files",
-        report.untracked.iter().map(|p| (p, "")),
-        Color::Red,
+        untracked,
+        Style::for_stdout(Color::Red),
         &mut writer,
     )?;
     Ok(())
 }
 
-fn print_changes<'a, Iter, Writer>(
-    message: &str,
+fn print_section<'a, Iter, Writer>(
+    heading: &str,
     changes: Iter,
-    color: Color,
+    style: Style,
     out: &mut Writer,
 ) -> io::Result<()>
 where
     Iter: Iterator<Item = (&'a Vec<u8>, &'static str)>,
-    Writer: Write
+    Writer: Write,
 {
     let mut changes = changes.peekable();
     // empty section
     if changes.peek().is_none() {
         return Ok(());
     }
-    writeln!(out, "{message}:")?;
+
+    writeln!(out, "{heading}:")?;
     writeln!(out)?;
     for (path, label) in changes {
-        out.write(b"\t")?;
+        out.write_all(b"\t")?;
+        style.begin(out)?;
         if !label.is_empty() {
             write!(out, "{label:<LABEL_WIDTH$}")?;
         }
         out.write_all(&stdout_bytes(path))?;
+        style.end(out)?;
         out.write_all(b"\n")?;
     }
     writeln!(out)?;

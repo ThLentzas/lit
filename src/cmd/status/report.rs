@@ -71,7 +71,7 @@ impl Report {
         report.scan_workspace(&workspace, &index, Path::new(""))?;
         report.scan_index(&index, &workspace);
         // TODO: needs a better name
-        report.check_head_against_index(&index);
+        report.check_staged_deletions(&index);
 
         Ok(report)
     }
@@ -209,7 +209,8 @@ impl Report {
         }
     }
 
-    fn check_head_against_index(&mut self, index: &Index) {
+    // a path exists in HEAD, but not in the index, we need to stage that deletion  
+    fn check_staged_deletions(&mut self, index: &Index) {
         if self.head_entries.is_empty() {
             return;
         }
