@@ -6,8 +6,8 @@ use std::path::PathBuf;
 // automatically bad design. What matters is whether the enum represents the error domain of the layer/function.
 // that is the case for find_root() where it can return 2/3 variants
 
-use crate::cmd::config::parse::ParseError;
-use crate::cmd::object::SignatureError;
+use crate::command::config::parse::ParseError;
+use crate::command::object::SignatureError;
 
 // TODO: move errors to their respective modules and delete error.rs
 #[derive(Debug)]
@@ -39,8 +39,6 @@ pub(super) enum DbErrorKind {
     BadObject { oid: String },
     NotATree { oid: String },
     NotFound { oid: String },
-    ObjectTypeMisMatch { expected: String, found: String, oid: String }
-
 }
 
 #[derive(Debug)]
@@ -53,7 +51,6 @@ pub(super) enum WorkspaceError {
 #[derive(Debug)]
 pub(super) enum ConfigError {
     Io { path: PathBuf, source: io::Error },
-    Lockfile(LockfileError),
     // toDo: display the unexpected byte value as hex, git shows bad config line 1. We can provide
     // toDo: a message with more information such as the actual reason and the offset within the line
     InvalidFormat { line: usize, source: ParseError}
@@ -138,6 +135,7 @@ pub(super) enum AddError {
 #[derive(Debug)]
 pub(super) enum CommitError {
     Repo(RepoError),
+    Workspace(WorkspaceError),
     Index(IndexError),
     DbError(DbError),
     Lockfile(LockfileError),
@@ -177,6 +175,12 @@ impl From<DbError> for AddError {
 impl From<WorkspaceError> for AddError {
     fn from(err: WorkspaceError) -> Self {
         AddError::WsError(err)
+    }
+}
+
+impl From<WorkspaceError> for CommitError {
+    fn from(err: WorkspaceError) -> Self {
+        CommitError::Workspace(err)
     }
 }
 

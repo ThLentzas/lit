@@ -1,5 +1,5 @@
-use crate::cmd::error::{DbError, RefError};
-use crate::cmd::lockfile::Lockfile;
+use crate::command::error::{DbError, RefError};
+use crate::command::lockfile::Lockfile;
 use std::path::PathBuf;
 use std::{fs, io};
 
@@ -62,7 +62,7 @@ impl Refs {
     // Release the lock
     //
     // Steps 1, 2, 5, 6 are locking and HEAD operations, they belong in refs.rs. Steps 3 and 4 are
-    // commit-building logic, they belong in cmd.rs where we know about authors, messages, the database, etc.
+    // commit-building logic, they belong in command.rs where we know about authors, messages, the database, etc.
     // But the steps are interleaved. Step 3 needs the result of step 2 (the parent). Step 5 needs
     // the result of step 4 (the new OID). We can't separate them into two phases like "first do
     // all the lock stuff, then build the commit" because the data dependencies cross the boundary.

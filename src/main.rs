@@ -1,5 +1,5 @@
 pub mod cli;
-mod cmd;
+mod command;
 pub mod hex;
 
 // this should return Result<(), Error>

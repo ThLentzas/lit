@@ -1,9 +1,9 @@
 mod parse;
 pub(super) mod tree;
 
-use crate::cmd::error::{FormatError, FormatErrorKind, IndexError, PathError};
-use crate::cmd::index::parse::Parser;
-use crate::cmd::os;
+use crate::command::error::{FormatError, FormatErrorKind, IndexError, PathError};
+use crate::command::index::parse::Parser;
+use crate::command::os;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io;

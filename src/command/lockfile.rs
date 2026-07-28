@@ -2,7 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
-use crate::cmd::error::LockfileError;
+use crate::command::error::LockfileError;
 
 // https://git-scm.com/docs/api-lockfile
 // Lockfile guarantees mutual exclusion, atomic updates and cleanup of the tmp files in case of an

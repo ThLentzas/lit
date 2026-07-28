@@ -1,6 +1,6 @@
-use crate::cmd::error::{DbError, DbErrorKind};
-use crate::cmd::object::Object;
-use crate::cmd::os;
+use crate::command::error::{DbError, DbErrorKind};
+use crate::command::object::Object;
+use crate::command::os;
 use crate::hex;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
@@ -161,13 +161,11 @@ impl Database {
     ) -> Result<(), DbError> {
         let entries = match self.load(tree_oid)? {
             Some(Object::Tree(entries)) => entries,
-            Some(object) => return Err(DbError {
+            Some(_) => return Err(DbError {
                 path: os::bytes_to_path(prefix),
-                kind: DbErrorKind::ObjectTypeMisMatch {
+                kind: DbErrorKind::NotATree {
                     // to_string() calls String::from() and String::from() calls to_owned(). There is
                     // no performance cost in any of them
-                    expected: "tree".to_owned(),
-                    found: object.obj_type().to_owned(),
                     oid: tree_oid.to_owned(),
                 }
             }),

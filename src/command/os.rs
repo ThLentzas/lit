@@ -1,7 +1,7 @@
 use std::{fs, io};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use crate::cmd::index::StatNode;
+use crate::command::index::StatNode;
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;

@@ -1,11 +1,11 @@
-use crate::cmd::config::parse::{LineKind, LineParser, ParseError};
-use crate::cmd::error::ConfigError;
+use crate::command::config::parse::{LineKind, LineParser, ParseError};
+use crate::command::error::ConfigError;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use crate::cmd::os;
+use crate::command::os;
 
 pub(super) mod parse;
 

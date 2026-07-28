@@ -3,6 +3,7 @@ use super::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
 
+// TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;
 
 enum Color {
@@ -12,6 +13,8 @@ enum Color {
 }
 
 impl Color {
+    // https://en.wikipedia.org/wiki/ANSI_escape_code
+    // Read: Select Graphic Rendition parameters
     fn sgr(&self) -> &'static [u8] {
         match self {
             Color::Red => b"\x1b[31m",
@@ -103,7 +106,6 @@ fn print_long(report: &Report) -> io::Result<()> {
         Style::for_stdout(Color::Green),
         &mut writer,
     )?;
-
     print_section(
         "Changes not staged for commit",
         unstaged,

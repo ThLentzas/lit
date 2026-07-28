@@ -1,10 +1,10 @@
-use crate::cmd::db::Database;
-use crate::cmd::error::{DbError, IndexError, RefError, WorkspaceError};
-use crate::cmd::index::{Index, IndexEntry, StatNode};
-use crate::cmd::object::Object;
-use crate::cmd::refs::Refs;
-use crate::cmd::workspace::Workspace;
-use crate::cmd::{Repository, db, index, os};
+use crate::command::db::Database;
+use crate::command::error::{DbError, IndexError, RefError, WorkspaceError};
+use crate::command::index::{Index, IndexEntry, StatNode};
+use crate::command::object::Object;
+use crate::command::refs::Refs;
+use crate::command::workspace::Workspace;
+use crate::command::{Repository, db, index, os};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
@@ -44,10 +44,9 @@ pub(super) struct Change {
 pub(super) struct Report {
     head_entries: HashMap<Vec<u8>, ([u8; 20], u32)>,
     stats: BTreeMap<Vec<u8>, StatNode>,
-    // TODO: check if the UNTRACKED can be a variant in workspace <-> index relationship
     pub(super) untracked: BTreeSet<Vec<u8>>,
     pub(super) changes: BTreeMap<Vec<u8>, Change>,
-    pub(super) refreshes: HashMap<usize, StatNode>,
+    pub(super) refreshes: Vec<(usize, StatNode)>,
 }
 
 impl Report {
@@ -70,7 +69,6 @@ impl Report {
         report.load_head_entries(&refs, &db)?;
         report.scan_workspace(&workspace, &index, Path::new(""))?;
         report.scan_index(&index, &workspace);
-        // TODO: needs a better name
         report.check_staged_deletions(&index);
 
         Ok(report)
@@ -158,7 +156,7 @@ impl Report {
                     // miss it because workspace uses the underlying file systems and on Windows
                     // it should be foo\bar\baz. We have to create a platform specific Path from
                     // those bytes.
-                    // TODO: the prefixed \\?\ paths on Windows
+                    // TODO: the prefixed \\?\ paths on Windows, handle this unwrap()
                     let content = workspace.read_file(&path).unwrap();
                     if db::hash(b"blob", &content) != entry.oid {
                         self.changes
@@ -172,7 +170,7 @@ impl Report {
                         // entry.oid = oid where oid was the result of hash(). It was wrong because
                         // hash() computed an oid for an object that was never stored and the index
                         // now references a non-existing object.
-                        self.refreshes.insert(pos, ws_stat);
+                        self.refreshes.push((pos, ws_stat));
                     }
                 } // else: metadata match -> no changes, no I/O
             }
@@ -226,7 +224,7 @@ impl Report {
     }
 }
 
-fn times_match(this: &StatNode, other: &StatNode) -> bool {
+pub(crate) fn times_match(this: &StatNode, other: &StatNode) -> bool {
     this.ctime == other.ctime
         && this.ctime_nsec == other.ctime_nsec
         && this.mtime == other.mtime

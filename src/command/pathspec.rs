@@ -1,4 +1,4 @@
-use crate::cmd::error::PathspecError;
+use crate::command::error::PathspecError;
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 

@@ -1,7 +1,7 @@
-use crate::cmd::db::Database;
-use crate::cmd::error::DbError;
-use crate::cmd::index::Index;
-use crate::cmd::object::{Object, Entry};
+use crate::command::db::Database;
+use crate::command::error::DbError;
+use crate::command::index::Index;
+use crate::command::object::{Object, Entry};
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
 

@@ -1,26 +1,25 @@
-use crate::cmd::config::Config;
-use crate::cmd::db::Database;
-use crate::cmd::error::{AddError, CommitError, InitError, RepoError};
-use crate::cmd::index::tree::Tree;
-use crate::cmd::index::{Index, IndexEntry, StatNode};
-use crate::cmd::lockfile::Lockfile;
-use crate::cmd::object::{Object, Signature};
-use crate::cmd::pathspec::Pathspec;
-use crate::cmd::workspace::Workspace;
+use crate::command::config::Config;
+use crate::command::db::Database;
+use crate::command::error::{AddError, CommitError, InitError, LockfileError, RepoError};
+use crate::command::index::tree::Tree;
+use crate::command::index::{Index, IndexEntry, StatNode};
+use crate::command::lockfile::Lockfile;
+use crate::command::object::{Object, Signature};
+use crate::command::pathspec::Pathspec;
+use crate::command::refs::Refs;
+use crate::command::status::{report, Status};
+use crate::command::workspace::Workspace;
+use crate::hex;
 use std::env::Args;
 use std::io::ErrorKind;
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
-use crate::cmd::refs::Refs;
-use crate::cmd::status::Status;
-use crate::hex;
 
 pub mod db;
 mod lockfile;
 pub mod object;
 pub mod refs;
-
 mod config;
 mod error;
 pub mod index;
@@ -106,7 +105,7 @@ pub(super) struct Init {
 }
 
 impl Init {
-    // toDo: maybe those two methods could be one like cmd::init() since we don't really need state?
+    // toDo: maybe those two methods could be one like command::init() since we don't really need state?
     // we want to set the path to always be absolute, toDo: Read the Chapter for init on why
     // join() if the second path is absolute, it replaces the first entirely, else it gets appended.
     // lit init: creates .lit in the cwd
@@ -208,35 +207,27 @@ impl Add {
 pub(super) struct Commit;
 
 impl Commit {
+    // [master 1b9a196] Done with status, need to test it
+    //  3 files changed, 92 insertions(+), 46 deletions(-)
     fn execute(&self) -> Result<(), CommitError> {
         let repo = Repository::discover()?;
         let db = Database {
             path: repo.db_path(),
         };
+        let workspace = Workspace { root: repo.root.clone() };
         let refs = Refs { path: repo.refs_path() };
-        // TODO: modify index by refreshing the metadata and then it becomes a read-modify-write, and remove this comment it no longer stands
-        // for index itself
-        // We must acquire the lock on .lit/index for the entire commit, not just read the file.
-        // Lockfile's atomic rename guarantees we never read half-written/corrupted data, but that
-        // is not enough here. We read the index, build tree objects from it, write a commit, and
-        // update HEAD.
-        //
-        // It is a time-of-check to time-of-use case. Without holding the lock across the whole
-        // operation, a concurrent add could happen in between our read and our write:
-        //   commit reads the index
-        //   add acquires the lock, modifies the index
-        //   commit builds its tree from the old index without the new changes
-        //
-        // The result is an old-but-valid index: no corruption, but we committed a staged state the
-        // user had already moved past, and the committed tree now disagrees with .lit/index.
-        // Concurrent commits are not a concern , they are read only
-        //
-        // A question to ask here is how many different people work in a repository locally? Most
-        // of the time 1 so we could just call index.load() without acquiring the lock but now with
-        // agents it is a different story
         let mut index = Index::new(repo.index_path());
-        let _index_lock = Lockfile::acquire(&index.path)?;
         index.load()?;
+        // this is the same optimistic approach Git follows with status. For a tracked file by index
+        // in the workspace if any metadata have changed, it updates the corresponding index entry.
+        // it is explained in more detailed in report::Report::scan_against_workspace()
+        // TODO: when we implement the cache tree for Index we need to check this again.
+        match Lockfile::acquire(&index.path) {
+            Ok(lock) => Self::index_background_refreshing(&mut index, lock, &workspace)?,
+            Err(LockfileError::LockDenied { .. }) => (),
+            Err(err) => return Err(CommitError::Lockfile(err)),
+        };
+        
         // need to rethink how this load() is called because now load() is called without
         // knowing if Signature will actually read the info from config or env
         let mut config = Config::new(repo.config_path());
@@ -256,6 +247,37 @@ impl Commit {
             };
             db.store(Object::Commit(commit))
         })?;
+        Ok(())
+    }
+
+    fn index_background_refreshing(
+        index: &mut Index,
+        mut lock: Lockfile,
+        workspace: &Workspace) -> Result<(), CommitError> {
+        let mut refreshes = Vec::new();
+        
+        for(i, entry) in index.entries.iter().enumerate() {
+            let path = os::bytes_to_path(&entry.path);
+            let ws_stat = workspace.stat(&path)?;
+            
+            if !report::times_match(&entry.stat, &ws_stat) {
+                let content = workspace.read_file(&path)?;
+                if db::hash(b"blob", &content) == entry.oid {
+                    refreshes.push((i, ws_stat));
+                }
+            }
+        }
+        
+        if refreshes.is_empty() {
+            drop(lock);
+        } else {
+            for(i, stat) in refreshes {
+                index.refresh_entry_stat(i, stat);
+            }
+            lock.write(&index.serialize())?;
+            lock.commit()?;
+        }
+
         Ok(())
     }
 }

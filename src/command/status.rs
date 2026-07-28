@@ -1,11 +1,11 @@
-mod report;
+pub(crate) mod report;
 mod print;
 
-use crate::cmd::Repository;
-use crate::cmd::error::{LockfileError, RepoError};
-use crate::cmd::index::Index;
-use crate::cmd::lockfile::Lockfile;
-use crate::cmd::status::report::{Report, ReportError};
+use crate::command::Repository;
+use crate::command::error::{LockfileError, RepoError};
+use crate::command::index::Index;
+use crate::command::lockfile::Lockfile;
+use crate::command::status::report::{Report, ReportError};
 use std::io;
 
 // TODO:
@@ -52,8 +52,8 @@ impl Status {
 
         if let Some(mut lockfile) = lock {
             if !report.refreshes.is_empty() {
-                for (&i, &stat) in report.refreshes.iter() {
-                    index.refresh_entry_stat(i, stat);
+                for (i, stat) in report.refreshes.iter() {
+                    index.refresh_entry_stat(*i, *stat);
                 }
                 lockfile.write(&index.serialize())?;
                 lockfile.commit()?;

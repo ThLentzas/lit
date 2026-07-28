@@ -1,6 +1,6 @@
-use crate::cmd::error::WorkspaceError;
-use crate::cmd::index::StatNode;
-use crate::cmd::os;
+use crate::command::error::WorkspaceError;
+use crate::command::index::StatNode;
+use crate::command::os;
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 

@@ -4,10 +4,10 @@ use std::env;
 use std::env::VarError;
 use std::ffi::OsString;
 use std::io::Write;
-use crate::cmd::config::Config;
-use crate::cmd::index::IndexEntry;
-use crate::cmd::object::parse::ParseError;
-use crate::cmd::timestamp::Timestamp;
+use crate::command::config::Config;
+use crate::command::index::IndexEntry;
+use crate::command::object::parse::ParseError;
+use crate::command::timestamp::Timestamp;
 
 pub(super) struct Entry {
     pub(super) mode: u32,

@@ -1,6 +1,6 @@
-use crate::cmd::object::{Commit, Entry, Object, Signature};
-use crate::cmd::os;
-use crate::cmd::timestamp::{Timestamp, TimestampError};
+use crate::command::object::{Commit, Entry, Object, Signature};
+use crate::command::os;
+use crate::command::timestamp::{Timestamp, TimestampError};
 use crate::hex::{self, HexError};
 
 // Every parser that I wrote so far is a struct and all the parse_* methods are implemented in its

@@ -1,7 +1,7 @@
-use crate::cmd::{Add, Command, Commit, Init};
+use crate::command::{Add, Command, Commit, Init};
 use std::env;
 use std::path::PathBuf;
-use crate::cmd::status::Status;
+use crate::command::status::Status;
 
 // toDo: write a proper parser, dont pass the command args as fn args
 // write it as an external library and include it as a dependency
