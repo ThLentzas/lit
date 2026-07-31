@@ -1,12 +1,11 @@
-use crate::command::db::Database;
-use crate::command::error::{DbError, IndexError, RefError, WorkspaceError};
-use crate::command::index::{Index, IndexEntry, StatNode};
-use crate::command::object::Object;
-use crate::command::refs::Refs;
-use crate::command::workspace::Workspace;
-use crate::command::{Repository, db, index, os};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use crate::repo::db::{Database, DbError};
+use crate::repo::index::{Index, IndexEntry, StatNode};
+use crate::repo::object::Object;
+use crate::repo::refs::{RefError, Refs};
+use crate::repo::{index, Repository, db};
+use crate::repo::workspace::{Workspace, WorkspaceError};
 
 // green for new, orange for modified, red for deleted, something else for untracked
 pub(super) enum HeadIndexChange {
@@ -54,7 +53,7 @@ impl Report {
         Self::default()
     }
 
-    pub(super) fn generate(repo: &Repository, index: &mut Index) -> Result<Self,ReportError> {
+    pub(super) fn generate(repo: &Repository, index: &Index) -> Result<Self,ReportError> {
         let mut report = Self::new();
         let db = Database {
             path: repo.db_path(),
@@ -65,7 +64,6 @@ impl Report {
         let refs = Refs {
             path: repo.refs_path(),
         };
-        index.load()?;
         report.load_head_entries(&refs, &db)?;
         report.scan_workspace(&workspace, &index, Path::new(""))?;
         report.scan_index(&index, &workspace);
@@ -101,6 +99,7 @@ impl Report {
     ) -> Result<(), WorkspaceError> {
         for (path, stat) in workspace.dir_entries(prefix)? {
             // internally is_tracked() converts the OS specific path to an index path
+            // TODO: pass an empty RepoPath to trigger the recursion
             if index.is_tracked(&path) {
                 if stat.mode == os::DIR {
                     // found a dir that contains at least 1 index entry, we recurse
@@ -207,7 +206,7 @@ impl Report {
         }
     }
 
-    // a path exists in HEAD, but not in the index, we need to stage that deletion  
+    // a path exists in HEAD, but not in the index, we need to stage that deletion
     fn check_staged_deletions(&mut self, index: &Index) {
         if self.head_entries.is_empty() {
             return;
@@ -233,18 +232,11 @@ pub(crate) fn times_match(this: &StatNode, other: &StatNode) -> bool {
 
 #[derive(Debug)]
 pub(super) enum ReportError {
-    Index(IndexError),
     Workspace(WorkspaceError),
     DbError(DbError),
     RefError(RefError),
     HeadNotACommit { oid: String },
     HeadCommitNotFound { oid: String },
-}
-
-impl From<IndexError> for ReportError {
-    fn from(err: IndexError) -> Self {
-        ReportError::Index(err)
-    }
 }
 
 impl From<WorkspaceError> for ReportError {

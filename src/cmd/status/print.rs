@@ -1,7 +1,6 @@
-use super::Format;
-use super::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::borrow::Cow;
-use std::io::{self, IsTerminal, Write};
+use std::io;
+use std::io::Write;
 
 // TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;
@@ -59,28 +58,28 @@ impl Style {
     }
 }
 
-pub(super) fn print(report: &Report, format: Format) -> io::Result<()> {
+pub(super) fn print(report: &crate::command::status::report::Report, format: crate::command::status::Format) -> io::Result<()> {
     match format {
-        Format::Short => print_short(report),
-        Format::Long => print_long(report),
+        crate::command::status::Format::Short => print_short(report),
+        crate::command::status::Format::Long => print_long(report),
 
     }
 }
 
-fn print_short(report: &Report) -> io::Result<()> {
+fn print_short(report: &crate::command::status::report::Report) -> io::Result<()> {
     Ok(())
 }
 
-fn print_long(report: &Report) -> io::Result<()> {
+fn print_long(report: &crate::command::status::report::Report) -> io::Result<()> {
     let mut writer = io::stdout().lock();
     let staged = report.changes
         .iter()
         .filter_map(|(path, change)| {
             change.head_index.as_ref().map(|ch| {
                 let label = match ch {
-                    HeadIndexChange::ADDED => "new file:",
-                    HeadIndexChange::MODIFIED => "modified:",
-                    HeadIndexChange::DELETED => "deleted:",
+                    crate::command::status::report::HeadIndexChange::ADDED => "new file:",
+                    crate::command::status::report::HeadIndexChange::MODIFIED => "modified:",
+                    crate::command::status::report::HeadIndexChange::DELETED => "deleted:",
                 };
                 (path, label)
             })
@@ -90,8 +89,8 @@ fn print_long(report: &Report) -> io::Result<()> {
         .filter_map(|(path, change)| {
             change.workspace_index.as_ref().map(|ch| {
                 let label = match ch {
-                    WorkspaceIndexChange::MODIFIED => "modified:",
-                    WorkspaceIndexChange::DELETED => "deleted:",
+                    crate::command::status::report::WorkspaceIndexChange::MODIFIED => "modified:",
+                    crate::command::status::report::WorkspaceIndexChange::DELETED => "deleted:",
                 };
                 (path, label)
             })

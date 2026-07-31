@@ -1,7 +1,3 @@
-use crate::command::error::{FormatError, FormatErrorKind};
-use crate::command::index::{validate_path, IndexEntry, StatNode, PATH_MAX_SIZE};
-use crate::command::os;
-
 pub(super) struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,

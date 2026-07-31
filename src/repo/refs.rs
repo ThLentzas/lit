@@ -1,7 +1,8 @@
-use crate::command::error::{DbError, RefError};
-use crate::command::lockfile::Lockfile;
 use std::path::PathBuf;
 use std::{fs, io};
+use crate::hex;
+use crate::repo::db::DbError;
+use crate::repo::lockfile::{Lockfile, LockfileError};
 
 pub(super) struct Refs {
     pub(super) path: PathBuf
@@ -80,7 +81,7 @@ impl Refs {
         let parent = self.read_head()?;
         let parent = parent.map_or(Vec::new(), |s| vec![s]);
         let new_id = f(parent)?;
-        let new_id: String = new_id.iter().map(|c| format!("{:02x}", c)).collect();
+        let new_id: String = hex::bytes_as_hex(&new_id);
 
         lockfile.write(new_id.as_bytes())?;
         // lockfile.write("\n".as_bytes());
@@ -103,5 +104,25 @@ impl Refs {
                 source: err,
             }),
         }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum RefError {
+    Io { path: PathBuf, source: io::Error },
+    Lockfile(LockfileError),
+    DbError(DbError)
+}
+
+
+impl From<LockfileError> for RefError {
+    fn from(err: LockfileError) -> Self {
+        RefError::Lockfile(err)
+    }
+}
+
+impl From<DbError> for RefError {
+    fn from(err: DbError) -> Self {
+        RefError::DbError(err)
     }
 }

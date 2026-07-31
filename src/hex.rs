@@ -11,7 +11,10 @@ pub(super) fn bytes_as_hex(bytes: &[u8; 20]) -> String {
 pub(super) fn parse_hex(bytes: &[u8; 40]) -> Result<String, HexError> {
     for (index, &byte) in bytes.iter().enumerate() {
         if !is_hex_digit(byte) {
-            return Err(HexError { digit: byte, pos: index });
+            return Err(HexError {
+                digit: byte,
+                pos: index,
+            });
         }
     }
     // SAFETY: the previous loop guarantees that all bytes are ASCII
@@ -23,10 +26,16 @@ pub(super) fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {
     let second = buf[1];
 
     if !is_hex_digit(first) {
-        return Err(HexError { digit: first, pos: 0 });
+        return Err(HexError {
+            digit: first,
+            pos: 0,
+        });
     }
     if !is_hex_digit(second) {
-        return Err(HexError { digit: second, pos: 1 });
+        return Err(HexError {
+            digit: second,
+            pos: 1,
+        });
     }
 
     let first = to_base10_digit(first);
@@ -50,7 +59,11 @@ pub(super) fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {
 }
 
 fn to_base10_digit(byte: u8) -> u8 {
-    if matches!(byte, b'0'..=b'9') { byte - b'0' } else { byte - b'a' + 10 }
+    if matches!(byte, b'0'..=b'9') {
+        byte - b'0'
+    } else {
+        byte - b'a' + 10
+    }
 }
 
 // we can't use the is_ascii_hex() from std because it includes the capital case letters and Git

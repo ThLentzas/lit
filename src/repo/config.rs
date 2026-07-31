@@ -1,15 +1,11 @@
-use crate::command::config::parse::{LineKind, LineParser, ParseError};
-use crate::command::error::ConfigError;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
+use std::io;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use crate::command::os;
 
 pub(super) mod parse;
-
-mod utf8;
 
 // toDo: global, system, Read Chapter 25.2.3 and 25.3
 pub(super) struct Config {
@@ -281,4 +277,12 @@ fn try_downcase(buf: &[u8]) -> Option<Vec<u8>> {
 
 fn downcase(buf: &[u8]) -> Vec<u8> {
     buf.iter().map(|&byte| byte.to_ascii_lowercase()).collect()
+}
+
+#[derive(Debug)]
+pub(super) enum ConfigError {
+    Io { path: PathBuf, source: io::Error },
+    // toDo: display the unexpected byte value as hex, git shows bad config line 1. We can provide
+    // toDo: a message with more information such as the actual reason and the offset within the line
+    InvalidFormat { line: usize, source: ParseError}
 }

@@ -1,6 +1,3 @@
-use crate::command::object::{Commit, Entry, Object, Signature};
-use crate::command::os;
-use crate::command::timestamp::{Timestamp, TimestampError};
 use crate::hex::{self, HexError};
 
 // Every parser that I wrote so far is a struct and all the parse_* methods are implemented in its
@@ -8,12 +5,12 @@ use crate::hex::{self, HexError};
 // buffer. It is helps a lot approaching the parsing like this because of commit's structure.
 // Read parse_commit(). Every method that does not take &mut Cursor as arg, returns error indices
 // relative to the slice passed, but they get adjusted by the caller(parse_signature(), parse_oid()).
-struct Cursor<'a> {
+struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Cursor<'a> {
+impl<'a> Parser<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
@@ -195,7 +192,7 @@ struct Line<'a> {
 
 // object type, a space, the size of the object and a nul byte
 pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
-    let mut cursor = Cursor::new(buf);
+    let mut cursor = Parser::new(buf);
     let kind = cursor
         .read_until(b' ')
         .map_err(|err| ParseError::new(err.offset, ParseErrorKind::MissingHeaderSpace))?;
@@ -236,7 +233,7 @@ pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
     }
 }
 
-fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
+fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
     let start = cursor.pos;
     let buf = cursor
         .read_until(b' ')
@@ -299,7 +296,7 @@ fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
     })
 }
 
-fn parse_size(cursor: &mut Cursor) -> Result<usize, ParseError> {
+fn parse_size(cursor: &mut Parser) -> Result<usize, ParseError> {
     let start = cursor.pos;
     let size_buf = cursor
         .read_until(0)
@@ -341,7 +338,7 @@ fn parse_size(cursor: &mut Cursor) -> Result<usize, ParseError> {
 // parse value without bloating commit. tree and parent headers are followed by the same value a
 // 40-character hex string. After tree, parent header is optional so in the mismatch case we don't
 // error but pass line to the next check.
-fn parse_commit(cursor: &mut Cursor) -> Result<Commit, ParseError> {
+fn parse_commit(cursor: &mut Parser) -> Result<Commit, ParseError> {
     let line = parse_header(cursor)?;
     if line.key != b"tree" {
         return Err(ParseError::new(
@@ -422,7 +419,7 @@ fn parse_commit(cursor: &mut Cursor) -> Result<Commit, ParseError> {
 }
 
 // line.key and line.value live in cursor.buf so they share the same lifetime
-fn parse_header<'a>(cursor: &mut Cursor<'a>) -> Result<Line<'a>, ParseError> {
+fn parse_header<'a>(cursor: &mut Parser<'a>) -> Result<Line<'a>, ParseError> {
     let start = cursor.pos;
     let line = cursor
         .read_until(b'\n')

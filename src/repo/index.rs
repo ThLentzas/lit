@@ -1,9 +1,7 @@
 mod parse;
-pub(super) mod tree;
 
-use crate::command::error::{FormatError, FormatErrorKind, IndexError, PathError};
-use crate::command::index::parse::Parser;
-use crate::command::os;
+use crate::repo::index::parse::Parser;
+use crate::repo::path::RepoPath;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io;
@@ -72,9 +70,7 @@ impl Index {
     // The exact file is easy as mentioned. For the dir case, we already have the is_parent_path()
     // from resolve_conflicts() we need to find the child entry path. Read lower_bound()
     // This logic handles untracked(non-empty) directories.
-    pub(super) fn is_tracked(&self, path: &Path) -> bool {
-        let path = path_to_bytes(path);
-
+    pub(super) fn is_tracked(&self, path: &RepoPath) -> bool {
         if self.contains(&path) {
             return true;
         }
@@ -89,9 +85,10 @@ impl Index {
         // for a/b/ instead skips over a/b.txt and lands exactly on the first descendant if one exists
         let mut path = path.clone();
         path.push(b'/');
-        let pos = self.lower_bound(path.as_slice());
-        self.entries.get(pos)
-            .is_some_and(|entry| is_parent_path(path.as_slice(), entry.path.as_slice()))
+        let pos = self.lower_bound(&path);
+        self.entries
+            .get(pos)
+            .is_some_and(|entry| path.is_parent_of(&entry.path))
     }
 
     // Git requires index entries to be sorted by filename. It is a requirement for deterministic
@@ -264,10 +261,11 @@ impl Index {
     //  -in the previous case an existing entry was parent of the new entry, now it is the reversed,
     //  the new entry is parent of existing entries. New entry: lib, existing entry: lib/index/entry.rs
     //  we need to delete all the lib/ entries. This is why we make the call to is_parent_path() twice
-    fn resolve_conflicts(&mut self, path: &[u8]) {
-        self.entries.retain(|entry| {
-            !(is_parent_path(&entry.path, path) || is_parent_path(path, &entry.path))
-        })
+    fn resolve_conflicts(&mut self, path: &RepoPath) {
+        self.entries
+            .retain(|entry| {
+                !entry.path.is_parent_of(path) || path.is_parent_of(&entry.path)
+            })
     }
 
     // This method we have seen before on Leetcode is the next_greater() adaptation of binary search,
@@ -276,14 +274,15 @@ impl Index {
     // going to return true are entries that their path length is always greater than length of the
     // provided path because child_path.len() > parent_path.len(). Sure foo/bar.txt is one potential
     // candidate as is lexicographically greater than a/b/ but so is a/b/foo.txt.
-    fn lower_bound(&self, path: &[u8]) -> usize {
-        self.entries.binary_search_by(|entry| entry.path.as_slice().cmp(path))
+    fn lower_bound(&self, path: &RepoPath) -> usize {
+        self.entries
+            .binary_search_by(|entry| entry.path.cmp(path))
             .unwrap_or_else(|pos| pos)
     }
-    
-    pub(super) fn contains(&self, path: &[u8]) -> bool {
+
+    pub(super) fn contains(&self, path: &RepoPath) -> bool {
         self.entries
-            .binary_search_by(|entry| entry.path.as_slice().cmp(path))
+            .binary_search_by(|entry| entry.path.cmp(path))
             .is_ok()
     }
 }
@@ -312,12 +311,11 @@ pub(super) struct IndexEntry {
     pub(super) stat: StatNode,
     pub(super) oid: [u8; 20],
     flags: u16,
-    // always relative to root
-    pub(super) path: Vec<u8>,
+    pub(super) path: RepoPath,
 }
 
 impl IndexEntry {
-    pub(super) fn new(path: Vec<u8>, oid: [u8; 20], stat: StatNode) -> Self {
+    pub(super) fn new(path: RepoPath, oid: [u8; 20], stat: StatNode) -> Self {
         // https://git-scm.com/docs/index-format
         // the lowest 12 bits store the name length
         // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
@@ -352,7 +350,7 @@ impl IndexEntry {
 
         bytes.extend_from_slice(&self.oid);
         bytes.extend_from_slice(&self.flags.to_be_bytes());
-        bytes.extend_from_slice(&self.path);
+        bytes.extend_from_slice(&self.path.as_bytes());
         // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
         // multiple of 8
         //
@@ -425,7 +423,7 @@ fn validate_path(path: &[u8]) -> Result<(), PathError> {
             return Err(PathError::ReservedComponent);
         }
         // NUL cannot appear inside the path.
-        if component.contains(&0) {
+        if memchr::memchr(0, component).is_some() {
             return Err(PathError::ContainsNul);
         }
     }
@@ -448,16 +446,63 @@ pub(super) fn path_to_bytes(path: &Path) -> Vec<u8> {
     bytes
 }
 
-// read resolve_conflicts() first
-//
-// in order to have a conflict we need them to share the same parent directories, lib/index/main.rs
-// and src/index/main.rs are fine. We need to answer the question: Does the child start with the
-// parent path, and is the next byte a / ?
-//
-// the length of the child must be greater than the parent because parent is part of the child
-// for a conflict to exist the parent must be a parent dir of child
-// the 3rd condition is to avoid a false match, like parent: lib, child: library/file.rs it is not
-// enough for it to be a prefix, it has to be a parent dir
-fn is_parent_path(parent: &[u8], child: &[u8]) -> bool {
-    child.len() > parent.len() && child.starts_with(parent) && child[parent.len()] == b'/'
+// an error that can occur when creating IndexEntry or parsing .lit/index
+// Git when format is corrupted reports: Unknown Index Format
+// No more information is provided to the user because they can't do much if the format is invalid
+#[derive(Debug)]
+pub(super) enum IndexError {
+    InvalidChecksum,
+    UnsupportedVersion(u32),
+    InvalidFormat(FormatError),
+    Io { path: PathBuf, source: io::Error },
+}
+
+// TODO: we need to refactor this to include the actual bad path
+#[derive(Debug)]
+pub(super) enum PathError {
+    Empty,
+    LeadingSlash,
+    TrailingSlash,
+    EmptyComponent,
+    ReservedComponent,
+    ContainsNul,
+}
+
+#[derive(Debug)]
+pub(super) struct FormatError {
+    pub(super) offset: usize,
+    pub(super) kind: FormatErrorKind,
+}
+
+impl FormatError {
+    pub(super) fn at(offset: usize, kind: FormatErrorKind) -> Self {
+        Self { offset, kind }
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum FormatErrorKind {
+    Eof { needed: usize, remaining: usize },
+    InvalidChecksum,
+    InvalidSignature,
+    EntriesNotSorted,
+    EntriesCountMissMatch { actual: usize, expected: usize },
+    InvalidMode(u32),
+    InvalidNanoseconds,
+    MissingNulTerminator,
+    InvalidPadding,
+    LongPathLenMissMatch,
+    InvalidPathSyntax(PathError),
+}
+
+impl From<FormatError> for IndexError {
+    fn from(err: FormatError) -> Self {
+        IndexError::InvalidFormat(err)
+    }
+}
+
+impl From<PathError> for FormatErrorKind {
+    fn from(err: PathError) -> Self {
+        FormatErrorKind::InvalidPathSyntax(err)
+    }
 }

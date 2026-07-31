@@ -1,13 +1,11 @@
-pub mod parse;
-
-use std::env;
-use std::env::VarError;
+use std::env::{self, VarError};
 use std::ffi::OsString;
 use std::io::Write;
-use crate::command::config::Config;
-use crate::command::index::IndexEntry;
-use crate::command::object::parse::ParseError;
-use crate::command::timestamp::Timestamp;
+use crate::repo::config::Config;
+use crate::repo::object::parse::ParseError;
+use crate::repo::timestamp::Timestamp;
+
+mod parse;
 
 pub(super) struct Entry {
     pub(super) mode: u32,

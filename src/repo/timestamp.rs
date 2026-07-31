@@ -64,11 +64,13 @@ impl Timestamp {
             && timezone[1..].iter().all(u8::is_ascii_digit)
         {
             // always safe because we already checked that timezone contains only ASCII digits
-            let hours = (timezone[1] as char).to_digit(10)
+            let hours = (timezone[1] as char)
+                .to_digit(10)
                 .and_then(|n| n.checked_mul(10))
                 .and_then(|n| n.checked_add((timezone[2] as char).to_digit(10).unwrap()))
                 .unwrap();
-            let minutes = (timezone[3] as char).to_digit(10)
+            let minutes = (timezone[3] as char)
+                .to_digit(10)
                 .and_then(|n| n.checked_mul(10))
                 .and_then(|n| n.checked_add((timezone[4] as char).to_digit(10).unwrap()))
                 // we could also do: .ok_or(TimestampError::BadUnixTimeStamp)?;
@@ -77,7 +79,6 @@ impl Timestamp {
             if hours > 23 || minutes > 59 {
                 return Err(TimestampError::BadUnixTimeStamp);
             }
-
             Ok(Timestamp { unix, timezone })
         } else {
             Err(TimestampError::BadTimezone)
@@ -109,13 +110,16 @@ fn normalize_fws(input: &str) -> String {
     let mut i = 0;
 
     while i < bytes.len() {
-        if i + 2 < bytes.len() && bytes[i] == b'\r' && bytes[i + 1] == b'\n' && is_wsp(bytes[i + 2])
+        if i + 2 < bytes.len()
+            && bytes[i] == b'\r'
+            && bytes[i + 1] == b'\n'
+            && is_whitespace(bytes[i + 2])
         {
             // CRLF followed by WSP is folded whitespace.
             // Replace the whole folded whitespace run with one space.
             out.push(' ');
             i += 2;
-            while i < bytes.len() && is_wsp(bytes[i]) {
+            while i < bytes.len() && is_whitespace(bytes[i]) {
                 i += 1;
             }
         } else {
@@ -126,6 +130,6 @@ fn normalize_fws(input: &str) -> String {
     out
 }
 
-fn is_wsp(byte: u8) -> bool {
+fn is_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }

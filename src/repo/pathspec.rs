@@ -1,13 +1,13 @@
-use crate::command::error::PathspecError;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
+use crate::repo::os;
+use crate::repo::path::RepoPath;
 
 // toDo: add magic support
 // the set of paths certain commands should operate on
 #[derive(Debug)]
 pub(super) struct Pathspec {
-    // normalized repo relative path
-    pub(super) pattern: PathBuf,
+    pub(super) pattern: RepoPath,
 }
 
 impl Pathspec {
@@ -26,8 +26,8 @@ impl Pathspec {
     // In either case, `pattern` is a normalized repo relative path. Note that even when new() returns
     // we don't know if the path actually exists or not we never touched the fs, we just express it
     // relative to root
-    pub(super) fn new(arg: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> { 
-        let pattern = if Path::new(arg).is_absolute() {
+    pub(super) fn new(arg: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
+        let normalized = if Path::new(arg).is_absolute() {
             let absolute = normalize_absolute(arg.as_ref())?;
             absolute.strip_prefix(root)
                 .map(Path::to_path_buf)
@@ -37,6 +37,22 @@ impl Pathspec {
         } else {
             normalize_relative(arg.as_ref(), prefix)?
         };
+
+        let mut pattern = RepoPath::new();
+        // normalized was a created from a components() iterator, and it can not have empty components
+        // a//b was normalized to a/b
+        for component in normalized.components() {
+            // can't call map_err() inside the loop because it thinks that we try to move Err at
+            // each iteration after it has already being moved despite using ? at the end.
+            let name = match os::name_as_bytes(component.as_os_str()) {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(PathspecError::NotUnicode { path: normalized })
+            };
+            if memchr::memchr(0, &name).is_some() {
+                return Err(PathspecError::ContainsNul);
+            }
+            pattern = pattern.join(&name);
+        }
 
         Ok(Self { pattern })
     }
@@ -57,7 +73,7 @@ fn normalize_absolute(absolute: &Path) -> Result<PathBuf, PathspecError> {
             // large variety of prefix types, check docs
             // does not occur on Unix.
             //
-            // for absolute keep it as is
+            // for absolute, we keep it as is
             Component::Prefix(prefix) => path.push(prefix.as_os_str()),
             // Unix: "/"
             // Windows: the "\" after a prefix like "C:\"
@@ -93,8 +109,10 @@ fn normalize_relative(relative: &Path, prefix: &Path) -> Result<PathBuf, Pathspe
             Component::RootDir | Component::Prefix(_) => {
                 unreachable!("normalize_relative() was called with absolute path")
             }
-            Component::CurDir => {}
             // we don't push or pop any component we stay where we are which is the point of `.`
+            // this should never occur because components() does some normalization
+            // according to their docs: a/./b, a/b/, a/b/. and a/b all have a and b as components
+            Component::CurDir => {}
             Component::ParentDir => {
                 // Case: cwd = repo root, prefix = "" and the path is ../
                 // this falls outside the repository
@@ -116,6 +134,14 @@ fn normalize_relative(relative: &Path, prefix: &Path) -> Result<PathBuf, Pathspe
         }
     }
     Ok(path)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum PathspecError {
+    OutsideRepository { path: PathBuf },
+    ReservedComponent { path: PathBuf, component: OsString },
+    NotUnicode { path: PathBuf },
+    ContainsNul
 }
 
 #[cfg(test)]
