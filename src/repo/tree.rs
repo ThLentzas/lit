@@ -3,12 +3,11 @@ use crate::repo::index::Index;
 use crate::repo::object::{Entry, Object};
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
+use crate::repo::object::mode::Mode;
 use crate::repo::path::RepoPath;
 
-const MODE: u32 = 0o40000;
-
 enum TreeNode {
-    Blob { oid: [u8; 20], mode: u32 },
+    Blob { oid: [u8; 20], mode: Mode },
     Tree(IndexMap<Vec<u8>, TreeNode>),
 }
 
@@ -24,7 +23,7 @@ impl Tree {
         let mut tree = Self::new();
 
         for entry in index.entries {
-            tree.insert(entry.path, entry.oid, entry.stat.mode);
+            tree.insert(entry.path, entry.oid, entry.mode);
         }
 
         tree
@@ -42,7 +41,7 @@ impl Tree {
     // Instead of sorting + IndexMap we could use a BTreeMap. BTreeMap does not allow us to provide
     // a custom comparator. It sorts by the key’s Ord implementation. So we would need a custom key
     // type and impl Ord for it.
-    fn insert(&mut self, path: RepoPath, oid: [u8; 20], mode: u32) {
+    fn insert(&mut self, path: RepoPath, oid: [u8; 20], mode: Mode) {
         let mut entries = &mut self.entries;
         let mut components = path.components().peekable();
 
@@ -206,7 +205,7 @@ impl Tree {
                 TreeNode::Blob { oid, mode } => (oid, mode),
                 TreeNode::Tree(dir) => {
                     let child_oid = Tree { entries: dir }.write(db)?;
-                    (child_oid, MODE)
+                    (child_oid, Mode::Directory)
                 }
             };
             entries.push(Entry { oid, name, mode });

@@ -1,18 +1,17 @@
-use crate::repo::index::StatNode;
 use crate::repo::os;
 use crate::repo::path::RepoPath;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
-use crate::repo::os::OsError;
+use crate::repo::os::{FileKind, OsError, StatNode};
 
 // root relative path -> fs calls
 //
 // our internal language is root relative paths, that's what the index stores, what pathspec match
 // etc. The syscalls though need absolute paths, Workspace is responsible for doing this translation
 // It is the working tree viewed from the repo root.
-pub(super) struct Workspace {
+pub(crate) struct Workspace {
     // absolute root + relative to root path = absolute path
-    pub(super) root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl Workspace {
@@ -27,7 +26,7 @@ impl Workspace {
     //
     // we need the prefix to later compute repo relative paths
     // if cwd = root then prefix is ""
-    pub(super) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
+    pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
         let cwd = env::current_dir().map_err(|err| WorkspaceError::CurrentDir { err })?;
 
         cwd.strip_prefix(&self.root)
@@ -36,16 +35,17 @@ impl Workspace {
     }
 
     // returns the target's path
-    pub(super) fn read_link(&self, path: &RepoPath) -> Result<PathBuf, WorkspaceError> {
+    pub(crate) fn read_link(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
         let absolute = self.to_absolute(path)?;
-
-        fs::read_link(&absolute).map_err(|err| WorkspaceError::Io {
+        let path = fs::read_link(&absolute).map_err(|err| WorkspaceError::Io {
             path: absolute,
             source: err,
-        })
+        })?;
+        
+        Ok(os::name_as_bytes(path.as_os_str())?)
     }
 
-    pub(super) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
+    pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
         let absolute = self.to_absolute(path)?;
 
         fs::read(&absolute).map_err(|err| WorkspaceError::Io {
@@ -54,15 +54,16 @@ impl Workspace {
         })
     }
 
-    pub(super) fn stat(&self, path: &RepoPath) -> Result<StatNode, WorkspaceError> {
+    pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, WorkspaceError> {
         let absolute = self.to_absolute(path)?;
+        
         Ok(os::stat(&absolute)?)
     }
 
     // returns all entries of a directory pointed by the path
     // This approach returns a flat list, and it is up to the caller if they want to recurse for
     // subdirectories
-    pub(super) fn dir_entries(
+    pub(crate) fn dir_entries(
         &self,
         path: &RepoPath,
     ) -> Result<Vec<(RepoPath, StatNode)>, WorkspaceError> {
@@ -95,14 +96,14 @@ impl Workspace {
                     });
                 }
             };
-
             let name = entry.file_name();
             // TODO: remove .git and add .litignore
             if name == ".lit" || name == ".git" || name == "target" {
                 continue;
             }
-
             let bytes = os::name_as_bytes(&name)?;
+            // the root relative path of each entry is the root relative path of the parent + the
+            // entry's name
             let child = path.join(&bytes);
             let stat = self.stat(&child)?;
             entries.push((child, stat));
@@ -117,21 +118,20 @@ impl Workspace {
     pub(super) fn contains_trackable_file(
         &self,
         path: &RepoPath,
-        mode: u32,
+        kind: &FileKind,
     ) -> Result<bool, WorkspaceError> {
-        if matches!(mode, os::REGULAR | os::EXECUTABLE | os::SYMLINK) {
-            return Ok(true);
-        }
-        if mode != os::DIR {
-            return Ok(false);
-        }
-
-        for (path, stat) in self.dir_entries(path)? {
-            if self.contains_trackable_file(&path, stat.mode)? {
-                return Ok(true);
+        match kind {
+            FileKind::Regular { .. } | FileKind::Symlink => Ok(true),
+            FileKind::Other => Ok(false),
+            FileKind::Directory => {
+                for (path, stat) in self.dir_entries(path)? {
+                    if self.contains_trackable_file(&path, &stat.kind)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
             }
         }
-        Ok(false)
     }
 
     fn to_absolute(&self, path: &RepoPath) -> Result<PathBuf, WorkspaceError> {
@@ -140,7 +140,7 @@ impl Workspace {
 }
 
 #[derive(Debug)]
-pub(super) enum WorkspaceError {
+pub(crate) enum WorkspaceError {
     CurrentDir { err: io::Error },
     Io { path: PathBuf, source: io::Error },
     OutsideRepository { path: PathBuf },

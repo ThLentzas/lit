@@ -1,6 +1,10 @@
 use std::env;
 use std::path::PathBuf;
+use crate::cmd::add::Add;
 use crate::cmd::Command;
+use crate::cmd::commit::Commit;
+use crate::cmd::init::Init;
+use crate::cmd::status::Status;
 
 // toDo: write a proper parser, dont pass the command args as fn args
 // write it as an external library and include it as a dependency
@@ -23,3 +27,4 @@ pub(super) fn parse() -> Command {
         _ => todo!(),
     }
 }
+

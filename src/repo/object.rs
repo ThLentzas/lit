@@ -1,20 +1,21 @@
 use std::env::{self, VarError};
 use std::ffi::OsString;
-use std::io::Write;
 use crate::repo::config::Config;
+use crate::repo::object::mode::Mode;
 use crate::repo::object::parse::ParseError;
 use crate::repo::timestamp::Timestamp;
 
 mod parse;
+pub(crate) mod mode;
 
 pub(super) struct Entry {
-    pub(super) mode: u32,
+    pub(super) mode: Mode,
     // read the notes "Filenames"
     pub(super) name: Vec<u8>,
     pub(super) oid: [u8; 20],
 }
 
-pub(super) enum Object {
+pub(crate) enum Object {
     Blob(Vec<u8>),
     Tree(Vec<Entry>),
     Commit(Commit)
@@ -52,11 +53,8 @@ impl Object {
                     // for 33188(base 10) This will give us 100644 in base 10, and then we can just
                     // do b'0' + digit as in Leetcode problems. '1', '0', '0', '6', '4', '4'
                     // The output now is: [49, 48, 48, 54, 52, 52]
-                    //
-                    // It avoids allocation, write! formats directly into the buffer.
-                    // let s = format!("{:o} ", entry.mode);
-                    // bytes.extend_from_slice(s.as_bytes());
-                    write!(&mut bytes, "{:o} ", entry.mode).unwrap();
+                    bytes.extend_from_slice(entry.mode.as_octal_bytes());
+                    bytes.push(b' ');
                     bytes.extend(&entry.name);
                     bytes.push(0);
                     bytes.extend_from_slice(&entry.oid);
@@ -104,11 +102,11 @@ impl Object {
     }
 }
 
-pub(super) struct Commit {
-    pub(super) author: Signature,
-    pub(super) committer: Signature,
-    pub(super) parent: Vec<String>,
-    pub(super) message: String,
+pub(crate) struct Commit {
+    pub(crate) author: Signature,
+    pub(crate) committer: Signature,
+    pub(crate) parent: Vec<String>,
+    pub(crate) message: String,
     // Everything in a commit is already plain text, the author/committer names and emails, the
     // timestamp, the blank line separator, the message. Using a hex id for the tree reference keeps
     // the entire format consistent. Using 20 raw binary bytes in the middle of an otherwise text
@@ -116,24 +114,24 @@ pub(super) struct Commit {
     // Trees contain many entries. Using 20 raw bytes instead of 40 hex chars saves 50% per id,
     // which adds up significantly. Saving 20 bytes per commit is negligible. Saving 20 bytes per
     // entry in a tree with thousands of entries matters.
-    pub(super) root_id: String,
+    pub(crate) root_id: String,
 }
 
 #[derive(Debug)]
-pub(super) enum SignatureError {
+pub(crate) enum SignatureError {
     NotFound(& 'static str),
     NotUnicode(OsString),
 }
 
 // https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
-pub(super) struct Signature {
+pub(crate) struct Signature {
     pub(super) email: String,
     pub(super) name: String,
     pub(super) timestamp: Timestamp
 }
 
 impl Signature {
-    pub(super) fn author(config: &Config) -> Result<Self, SignatureError> {
+    pub(crate) fn author(config: &Config) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_AUTHOR_NAME") {
             Ok(s) => s,
             Err(err) => match err {
@@ -167,7 +165,7 @@ impl Signature {
         Ok(Self { name, email, timestamp: Timestamp::now() })
     }
 
-    pub(super) fn committer(config: &Config) -> Result<Self, SignatureError> {
+    pub(crate) fn committer(config: &Config) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_COMMITTER_NAME") {
             Ok(s) => s,
             Err(err) => match err {

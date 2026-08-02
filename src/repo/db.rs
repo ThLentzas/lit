@@ -1,13 +1,21 @@
-use std::io;
+use crate::hex;
+use crate::repo::object::Object;
+use crate::repo::object::mode::Mode;
+use crate::repo::path::RepoPath;
+use rand::RngExt;
+use rand::distr::Alphanumeric;
+use sha1::{Digest, Sha1};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::{fs, io};
 
-pub(super) struct Database {
-    pub(super) path: PathBuf,
+pub(crate) struct Database {
+    pub(crate) path: PathBuf,
 }
 
 // toDo: info and packs files
 impl Database {
-    pub(super) fn store(&self, object: Object) -> Result<[u8; 20], DbError> {
+    pub(crate) fn store(&self, object: Object) -> Result<[u8; 20], DbError> {
         let obj_type = object.obj_type().as_bytes();
         let content = object.serialize();
         let bytes = encode(obj_type, &content);
@@ -30,28 +38,33 @@ impl Database {
         // write tmp
         match fs::create_dir(&parent) {
             Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 if !parent.is_dir() {
                     let err = io::Error::new(
-                        ErrorKind::AlreadyExists,
+                        io::ErrorKind::AlreadyExists,
                         "object directory path exists but is not a directory",
                     );
-                    return Err(DbError {
+                    return Err(DbError::Io {
                         path: parent,
-                        kind: DbErrorKind::Io { source: err },
+                        source: err,
                     });
                 }
             }
             Err(err) => {
-                return Err(DbError {
+                return Err(DbError::Io {
                     path: parent,
-                    kind: DbErrorKind::Io { source: err },
+                    source: err,
                 });
             }
         }
 
         // If the hash already exists in .lit/objects/, the content is guaranteed to be identical
         // (same content -> same hash), so writing it again is pointless.
+        // TODO: the above comment is not entirely true, we still need to Sha1 collision detection by 
+        // checking the object type, object size, the uncompressed content.
+        // If any of those differ we need to return a collision error.
+        // Read Notes for Sha1 collision attacks, 
+        // TODO: eventually on the rewrite move to 256
         let path = parent.join(&hex[2..]);
         if path.exists() {
             return Ok(hash);
@@ -61,18 +74,18 @@ impl Database {
         // .lit/objects/90/tmp_obj_gNLJvt
         // TODO: maybe we use zlib?
         let compressed = deflate::deflate_bytes(&bytes);
-        fs::write(&tmp_path, compressed).map_err(|err| DbError {
+        fs::write(&tmp_path, compressed).map_err(|err| DbError::Io {
             path: parent.to_path_buf(),
-            kind: DbErrorKind::Io { source: err },
+            source: err,
         })?;
 
         // we return the rename error even if remove_file() fails because that was the main reason
         if let Err(err) = fs::rename(&tmp_path, &path) {
             // Try to clean up the temp file before returning the error
             let _ = fs::remove_file(&tmp_path);
-            return Err(DbError {
+            return Err(DbError::Io {
                 path: tmp_path,
-                kind: DbErrorKind::Io { source: err },
+                source: err,
             });
         }
         Ok(hash)
@@ -91,25 +104,20 @@ impl Database {
         let path = self.path.join(&oid[..2]).join(&oid[2..]);
         let content = match fs::read(&path) {
             Ok(content) => content,
-            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::IsADirectory) => {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::IsADirectory
+                ) =>
+            {
                 return Ok(None);
             }
-            Err(err) => {
-                return Err(DbError {
-                    path,
-                    kind: DbErrorKind::Io { source: err },
-                });
-            }
+            Err(err) => return Err(DbError::Io { path, source: err }),
         };
 
         let bytes = match inflate::inflate_bytes(&content) {
             Ok(bytes) => bytes,
-            Err(err) => {
-                return Err(DbError {
-                    path,
-                    kind: DbErrorKind::Decompress { reason: err },
-                });
-            }
+            Err(err) => return Err(DbError::Decompress { path, reason: err }),
         };
 
         let hash: [u8; 20] = Sha1::digest(&bytes).into();
@@ -117,56 +125,63 @@ impl Database {
         if hex != oid {
             // tampered object: someone opened the file, changed its contents, compressed the new
             // content and wrote back to the file, the hashes do not match
-            return Err(DbError {
+            return Err(DbError::HashMismatch {
                 path,
-                kind: DbErrorKind::HashMismatch {
-                    oid: oid.to_owned(),
-                },
+                oid: oid.to_owned(),
             });
         }
         // the information from any parsing error that occurs during loading an object is never returned
         // to the user. It means something is wrong with our on-disk format. Bad object with {oid}
         // is all they are going to see. The information is only needed for debugging.
-        Ok(Some(Object::deserialize(&bytes).map_err(|_| DbError {
-            path,
-            kind: DbErrorKind::BadObject {
+        Ok(Some(Object::deserialize(&bytes).map_err(|_| {
+            DbError::BadObject {
                 oid: oid.to_owned(),
-            },
+            }
         })?))
     }
 
-    pub(super) fn load_tree_files(&self, tree_oid: &str) -> Result<HashMap<Vec<u8>, ([u8; 20], u32)>, DbError> {
+    pub(super) fn load_tree_files(
+        &self,
+        tree_oid: &str,
+    ) -> Result<HashMap<RepoPath, ([u8; 20], Mode)>, DbError> {
         let mut files = HashMap::new();
-        self.collect_tree_files(&mut files, b"", tree_oid)?;
+        self.collect_tree_files(&mut files, &RepoPath::new(), tree_oid)?;
 
         Ok(files)
     }
 
     fn collect_tree_files(
         &self,
-        files: &mut HashMap<Vec<u8>, ([u8; 20], u32)>,
-        prefix: &[u8],
+        files: &mut HashMap<RepoPath, ([u8; 20], Mode)>,
+        prefix: &RepoPath,
         tree_oid: &str,
     ) -> Result<(), DbError> {
         let entries = match self.load(tree_oid)? {
             Some(Object::Tree(entries)) => entries,
-            Some(_) => return Err(DbError {
-                path: os::bytes_to_path(prefix),
-                kind: DbErrorKind::NotATree {
-                    // to_string() calls String::from() and String::from() calls to_owned(). There is
-                    // no performance cost in any of them
+            Some(_) => {
+                return Err(DbError::NotATree {
+                    path: prefix.clone(),
+                    // to_string() calls String::from() and String::from() calls to_owned().
+                    // There is no performance cost in any of them
                     oid: tree_oid.to_owned(),
-                }
-            }),
-            None => return Err(DbError {
-                path: os::bytes_to_path(prefix),
-                kind: DbErrorKind::NotFound { oid: tree_oid.to_owned() }
-            }),
+                });
+            }
+
+            None => {
+                return Err(DbError::NotFound {
+                    path: prefix.clone(),
+                    oid: tree_oid.to_owned(),
+                });
+            }
         };
 
         for entry in entries {
-            let path = extend_path(prefix, &entry.name);
-            if entry.mode == os::DIR {
+            // if we walk src and has 1 file: main.rs then the path stored on the map is src/main.rs
+            // it is the location of each file build incrementally one level at a time. The path then
+            // is compared against index paths to determine any changes. Read load_tree_files() and
+            // status::Status::head_entries().
+            let path = prefix.join(&entry.name);
+            if entry.mode.is_directory() {
                 // dfs
                 self.collect_tree_files(files, &path, &hex::bytes_as_hex(&entry.oid))?;
             } else {
@@ -177,7 +192,7 @@ impl Database {
     }
 }
 
-pub(super) fn hash(obj_type: &[u8], content: &[u8]) -> [u8; 20] {
+pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> [u8; 20] {
     Sha1::digest(encode(obj_type, content)).into()
 }
 
@@ -205,40 +220,12 @@ fn encode(obj_type: &[u8], content: &[u8]) -> Vec<u8> {
     bytes
 }
 
-// this method is used to builds the path when walking a tree starting from the root. if we walk
-// src and has 1 file: main.rs then the path stored on the map is src/main.rs it is the location of
-// the file build incrementally one level at a time. The path then is compared against index paths
-// to determine any changes. Read load_tree_files() and  status::Status::head_entries().
-fn extend_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
-    // root has no prefix
-    if prefix.is_empty() {
-        return name.to_vec();
-    }
-
-    let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
-    path.extend_from_slice(prefix);
-    // TODO: currently the path will be tested against index path which are of fixed format using
-    // TODO: using '/'. We could use the os separator and do the conversion to an index path in the
-    // TODO: caller. path.push(MAIN_SEPARATOR as u8);
-    path.push(b'/');
-    path.extend_from_slice(name);
-
-    path
-}
-
 #[derive(Debug)]
-pub(super) struct DbError {
-    pub(super) path: PathBuf,
-    pub(super) kind: DbErrorKind,
-}
-
-#[derive(Debug)]
-pub(super) enum DbErrorKind {
-    Io { source: io::Error },
-    Decompress { reason: String },
-    // hash mismatch on trying to load
-    HashMismatch { oid: String },
+pub(crate) enum DbError {
+    Io { path: PathBuf, source: io::Error },
+    Decompress { path: PathBuf, reason: String },
+    HashMismatch { path: PathBuf, oid: String },
     BadObject { oid: String },
-    NotATree { oid: String },
-    NotFound { oid: String },
+    NotATree { path: RepoPath, oid: String },
+    NotFound { path: RepoPath, oid: String },
 }

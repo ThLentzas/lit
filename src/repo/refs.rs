@@ -4,8 +4,8 @@ use crate::hex;
 use crate::repo::db::DbError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
 
-pub(super) struct Refs {
-    pub(super) path: PathBuf
+pub(crate) struct Refs {
+    pub(crate) path: PathBuf
 }
 
 impl Refs {
@@ -51,7 +51,7 @@ impl Refs {
     //
     // We pass the path to .lit. The caller does not know the path to HEAD. The functions know the path
     // to HEAD. Similar logic to the db_path. The database knows where to store the objects
-    pub(super) fn update_head<F>(&self, f: F) -> Result<(), RefError>
+    pub(crate) fn update_head<F>(&self, f: F) -> Result<(), RefError>
     where
     // For commit there are 6 steps:
     //
@@ -108,7 +108,7 @@ impl Refs {
 }
 
 #[derive(Debug)]
-pub(super) enum RefError {
+pub(crate) enum RefError {
     Io { path: PathBuf, source: io::Error },
     Lockfile(LockfileError),
     DbError(DbError)

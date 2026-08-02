@@ -4,18 +4,10 @@ use std::fs::File;
 use std::io;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
+use crate::repo::config::parse::{LineKind, LineParser, ParseError};
+use crate::repo::os;
 
 pub(super) mod parse;
-
-// toDo: global, system, Read Chapter 25.2.3 and 25.3
-pub(super) struct Config {
-    local: PathBuf,
-    // the buffer we read into
-    buf: Vec<u8>,
-    lines: Vec<Line>,
-    // Initially thought about an IndexMap to preserve the order, but it is already there in Vec<Line>
-    index: HashMap<ConfigKey, Vec<usize>>,
-}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Span {
@@ -28,8 +20,18 @@ struct Line {
     kind: LineKind,
 }
 
+// toDo: global, system, Read Chapter 25.2.3 and 25.3
+pub(crate) struct Config {
+    local: PathBuf,
+    // the buffer we read into
+    buf: Vec<u8>,
+    lines: Vec<Line>,
+    // Initially thought about an IndexMap to preserve the order, but it is already there in Vec<Line>
+    index: HashMap<ConfigKey, Vec<usize>>,
+}
+
 impl Config {
-    pub(super) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             local: path,
             buf: Vec::new(),
@@ -45,8 +47,8 @@ impl Config {
     // key = "a" b "c" -> should map to a b c
     //
     // name is an &OsStr because subsection can contain pretty much anything
-    // toDo: maybe we need to apply some stricter rules for what is allowed in subsection
-    pub(super) fn get(&self, name: &OsStr) -> Option<&[u8]> {
+    // TODO: maybe we need to apply some stricter rules for what is allowed in subsection
+    pub(crate) fn get(&self, name: &OsStr) -> Option<&[u8]> {
         let key = ConfigKey::from_name(name)?;
         let line_index = self.index.get(&key)?.last()?;
         let line = &self.lines[*line_index];
@@ -71,7 +73,7 @@ impl Config {
     //
     // This is a zero-copy approach. The name of a variable is a sub-slice of its line, which is a
     // sub-slice of the file.
-    pub(super) fn load(&mut self) -> Result<(), ConfigError> {
+    pub(crate) fn load(&mut self) -> Result<(), ConfigError> {
         let file = File::open(&self.local).map_err(|err| ConfigError::Io {
             path: self.local.clone(),
             source: err,
@@ -217,7 +219,7 @@ impl ConfigKey {
     //
     // This is where the implementation diverges. In real Git I couldn't find how they handle the
     // ambiguity of having '.' being a valid character of section and the separator for section/
-    // subsection. How do we interpret foo.bar.baz?
+    // subsection. foo.bar.baz is ambiguous
     //
     // It can mean [foo.bar] and baz = ...
     // It can also mean [foo "bar"] and baz = ...
@@ -227,11 +229,12 @@ impl ConfigKey {
     // For now, we mimic the behavior where name is everything past the last dot. Section is everything
     // up to the first dot, the rest is the subsection. If there is only one '.', it's always section-name
     fn from_name(name: &OsStr) -> Option<Self> {
-        let bytes = os::name_as_bytes(name);
+        let bytes = os::name_as_bytes(name).unwrap();
         // rposition finds '.' starting from the back
         let pos = bytes.iter().rposition(|&b| b == b'.')?;
         let header = &bytes[..pos];
         let name = &bytes[pos + 1..];
+        
         if header.is_empty() || name.is_empty() {
             return None;
         }
@@ -280,7 +283,7 @@ fn downcase(buf: &[u8]) -> Vec<u8> {
 }
 
 #[derive(Debug)]
-pub(super) enum ConfigError {
+pub(crate) enum ConfigError {
     Io { path: PathBuf, source: io::Error },
     // toDo: display the unexpected byte value as hex, git shows bad config line 1. We can provide
     // toDo: a message with more information such as the actual reason and the offset within the line

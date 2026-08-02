@@ -1,8 +1,18 @@
+use crate::repo::db::{Database, DbError};
+use crate::repo::index::{Index, IndexEntry, IndexError};
+use crate::repo::lockfile::{Lockfile, LockfileError};
+use crate::repo::object::Object;
+use crate::repo::object::mode::Mode;
+use crate::repo::os::{FileKind, StatNode};
+use crate::repo::path::RepoPath;
+use crate::repo::pathspec::{Pathspec, PathspecError};
+use crate::repo::workspace::{Workspace, WorkspaceError};
+use crate::repo::{RepoError, Repository};
 use std::path::{Path, PathBuf};
 
-pub(super) struct Add {
+pub(crate) struct Add {
     // user provided path
-    pub(super) paths: Vec<PathBuf>,
+    pub(crate) paths: Vec<PathBuf>,
 }
 
 impl Add {
@@ -16,19 +26,23 @@ impl Add {
     //
     // Git still knows the repository root is jolt and the index path should be src/parser/lexer.rs
     // not just lexer.rs(what the user provided, self.path in our case)
-    fn execute(&self) -> Result<(), AddError> {
+    pub(super) fn execute(&self) -> Result<(), AddError> {
         let repo = Repository::discover()?;
-        let db = Database { path: repo.db_path(), };
-        let workspace = Workspace { root: repo.root.clone(), };
+        let db = Database {
+            path: repo.db_path(),
+        };
+        let workspace = Workspace {
+            root: repo.root.clone(),
+        };
         let mut index = Index::new(repo.index_path());
         let mut lockfile = Lockfile::acquire(&index.path)?;
         index.load()?;
 
         for path in self.paths.iter() {
             // if the user called add . from root then the prefix is "" and the pathspec.pattern is
-            // also  "". This is fine because in collect_entries() for the dir case we call ws.list_dir()
-            // which does self.root.join(relative) so absolute root + "" give us the absolute to root
-            // path which is what we want.
+            // also  "". This is fine because in collect_entries() for the dir case we call dir_entries()
+            // which does self.to_absolute() so absolute root + "" give us the absolute root path
+            // which is what we want.
             let pathspec = if path.is_absolute() {
                 Pathspec::new(path.as_os_str(), Path::new(""), &repo.root)?
             } else {
@@ -51,14 +65,14 @@ impl Add {
 // all the work, but we had to pass 5 arguments:
 //  collect_entries(ws: &Workspace, rel: &Path, stat: StatNode, db: &Database, out: &mut Vec<IndexEntry>)
 struct EntryCollector<'a> {
-    workspace: &'a crate::command::workspace::Workspace,
-    db: &'a crate::command::db::Database,
-    path: &'a Path,
-    entries: Vec<crate::command::index::IndexEntry>,
+    workspace: &'a Workspace,
+    db: &'a Database,
+    path: &'a RepoPath,
+    entries: Vec<IndexEntry>,
 }
 
 impl<'a> EntryCollector<'a> {
-    fn new(workspace: &'a crate::command::workspace::Workspace, db: &'a crate::command::db::Database, path: &'a Path) -> Self {
+    fn new(workspace: &'a Workspace, db: &'a Database, path: &'a RepoPath) -> Self {
         Self {
             workspace,
             db,
@@ -69,55 +83,55 @@ impl<'a> EntryCollector<'a> {
 
     // standard recursive approach, collect is the function that triggers the recursion with some initial
     // state
-    fn collect(&mut self) -> Result<(), crate::command::error::AddError> {
-        let stat = self.workspace.stat(self.path)?;
-        self.collect_entries(self.path, stat)?;
+    fn collect(&mut self) -> Result<(), AddError> {
+        let stat = self.workspace.stat(&self.path)?;
+        self.collect_entries(&self.path, stat)?;
 
         Ok(())
     }
 
-    // we don't have to call index::validate_path() because the path is result of Pathspec::new()
-    // and we have already done lexical normalization
-    fn collect_entries(&mut self, relative: &Path, stat: crate::command::index::StatNode) -> Result<(), crate::command::error::AddError> {
-        match stat.mode {
-            0o100644 | 0o100755 => {
-                let content = self.workspace.read_file(relative)?;
-                let oid = self.db.store(crate::command::object::Object::Blob(content))?;
-                let path_bytes = index::path_to_bytes(relative);
-                self.entries.push(crate::command::index::IndexEntry::new(path_bytes, oid, stat));
+    fn collect_entries(&mut self, path: &RepoPath, node: StatNode) -> Result<(), AddError> {
+        match node.kind {
+            FileKind::Regular(_) => {
+                let content = self.workspace.read_file(&path)?;
+                let oid = self.db.store(Object::Blob(content))?;
+                let mode = Mode::try_from(node.kind).unwrap();
+                self.entries
+                    .push(IndexEntry::new(path.clone(), oid, mode, node.stat));
             }
-            // https://stackoverflow.com/questions/954560/how-does-git-handle-symbolic-links
-            // the content of the blob is the target path as bytes
-            // the file size is the length of the above sequence
-            //
-            // if the user deletes target, then we have a dangling reference which is allowed. It's up
-            // to the user to remove the symlink
-            0o120000 => {
-                let target = self.workspace.read_link(relative)?;
-                let content = index::path_to_bytes(&target);
-                let size = content.len().min(u32::MAX as usize) as u32;
-                let oid = self.db.store(crate::command::object::Object::Blob(content))?;
-                // it is more of sanity check
-                // the call from os::stat() gives the link-target length so it will match anyway
-                // but not sure for windows. Setting it from the actual blob is clearer.
-                let stat = crate::command::index::StatNode {
-                    file_size: size,
-                    ..stat
-                };
-                let path_bytes = index::path_to_bytes(relative);
-                self.entries.push(crate::command::index::IndexEntry::new(path_bytes, oid, stat));
-            }
-
-            // toDo: check if the mode returned by stat() contains permission bits
-            0o040000 => {
-                // toDo: look at --ignore-errors flag
+            FileKind::Symlink => {
+                // https://stackoverflow.com/questions/954560/how-does-git-handle-symbolic-links
+                // the content of the blob is the target path as bytes
+                // the file size is the length of the above sequence
                 //
-                for (path, stat) in self.workspace.dir_entries(relative)? {
+                // if the user deletes target, then we have a dangling reference which is allowed. 
+                // It's up to the user to remove the symlink
+                //
+                // TODO: Test the following cases
+                //
+                // lstat's st_size for a symlink is the target's length in bytes, so node.stat.file_size
+                // already equals the blob length, we store those bytes verbatim without normalizing
+                // anything.
+                //
+                // For Windows, symlink metadata reports size 0, not target length. If we try to set
+                // size = content.len() when we call status, the stat call there will return 0,
+                // different size, we have to rehash and see that the oid are unchanged which is not
+                // correct, can't have different size but identical hashes.
+                let content = self.workspace.read_link(&path)?;
+                let oid = self.db.store(Object::Blob(content))?;
+                let mode = Mode::try_from(node.kind).unwrap();
+                self.entries
+                    .push(IndexEntry::new(path.clone(), oid, mode, node.stat));
+            }
+            FileKind::Directory => {
+                // TODO: check if the mode returned by stat() contains permission bits
+                // TODO: look at --ignore-errors flag
+                for (path, stat) in self.workspace.dir_entries(&path)? {
                     self.collect_entries(&path, stat)?;
                 }
             }
-            // toDo: for now we silently ignore unsupported type
-            _ => {}
+            // Unsupported file are silently ignored
+            FileKind::Other => {}
         }
         Ok(())
     }
@@ -129,46 +143,46 @@ impl<'a> EntryCollector<'a> {
 
 #[derive(Debug)]
 pub(super) enum AddError {
-    Repo(crate::command::error::RepoError),
-    Index(crate::command::error::IndexError),
-    DbError(crate::command::error::DbError),
-    WsError(crate::command::error::WorkspaceError),
-    Pathspec(crate::command::error::PathspecError),
-    Lockfile(crate::command::error::LockfileError),
+    Repo(RepoError),
+    Index(IndexError),
+    DbError(DbError),
+    WsError(WorkspaceError),
+    Pathspec(PathspecError),
+    Lockfile(LockfileError),
 }
 
-impl From<crate::command::error::RepoError> for AddError {
-    fn from(err: crate::command::error::RepoError) -> Self {
+impl From<RepoError> for AddError {
+    fn from(err: RepoError) -> Self {
         AddError::Repo(err)
     }
 }
 
-impl From<crate::command::error::PathspecError> for AddError {
-    fn from(err: crate::command::error::PathspecError) -> Self {
+impl From<PathspecError> for AddError {
+    fn from(err: PathspecError) -> Self {
         AddError::Pathspec(err)
     }
 }
 
-impl From<crate::command::error::IndexError> for AddError {
-    fn from(err: crate::command::error::IndexError) -> Self {
+impl From<IndexError> for AddError {
+    fn from(err: IndexError) -> Self {
         AddError::Index(err)
     }
 }
 
-impl From<crate::command::error::DbError> for AddError {
-    fn from(err: crate::command::error::DbError) -> Self {
+impl From<DbError> for AddError {
+    fn from(err: DbError) -> Self {
         AddError::DbError(err)
     }
 }
 
-impl From<crate::command::error::WorkspaceError> for AddError {
-    fn from(err: crate::command::error::WorkspaceError) -> Self {
+impl From<WorkspaceError> for AddError {
+    fn from(err: WorkspaceError) -> Self {
         AddError::WsError(err)
     }
 }
 
-impl From<crate::command::error::LockfileError> for AddError {
-    fn from(err: crate::command::error::LockfileError) -> Self {
+impl From<LockfileError> for AddError {
+    fn from(err: LockfileError) -> Self {
         AddError::Lockfile(err)
     }
 }

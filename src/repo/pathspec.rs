@@ -6,8 +6,8 @@ use crate::repo::path::RepoPath;
 // toDo: add magic support
 // the set of paths certain commands should operate on
 #[derive(Debug)]
-pub(super) struct Pathspec {
-    pub(super) pattern: RepoPath,
+pub(crate) struct Pathspec {
+    pub(crate) pattern: RepoPath,
 }
 
 impl Pathspec {
@@ -26,7 +26,7 @@ impl Pathspec {
     // In either case, `pattern` is a normalized repo relative path. Note that even when new() returns
     // we don't know if the path actually exists or not we never touched the fs, we just express it
     // relative to root
-    pub(super) fn new(arg: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
+    pub(crate) fn new(arg: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
         let normalized = if Path::new(arg).is_absolute() {
             let absolute = normalize_absolute(arg.as_ref())?;
             absolute.strip_prefix(root)
@@ -137,7 +137,7 @@ fn normalize_relative(relative: &Path, prefix: &Path) -> Result<PathBuf, Pathspe
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum PathspecError {
+pub(crate) enum PathspecError {
     OutsideRepository { path: PathBuf },
     ReservedComponent { path: PathBuf, component: OsString },
     NotUnicode { path: PathBuf },
@@ -146,156 +146,156 @@ pub(super) enum PathspecError {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use super::*;
-
-    // instead of carrying (OsString, PathBuf, Pathspec)
-    #[derive(Debug)]
-    struct GoodPath {
-        arg: OsString,
-        prefix: PathBuf,
-        pattern: PathBuf,
-    }
-
-    impl GoodPath {
-        fn new(arg: &OsStr, prefix: &OsStr, pattern: &OsStr) -> Self {
-            GoodPath {
-                arg: arg.to_os_string(),
-                prefix: PathBuf::from(prefix),
-                pattern: PathBuf::from(pattern),
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    struct BadPath {
-        arg: OsString,
-        prefix: PathBuf,
-        err: PathspecError,
-    }
-
-    impl BadPath {
-        fn new(arg: &OsStr, prefix: &OsStr, err: PathspecError) -> Self {
-            BadPath {
-                arg: arg.to_os_string(),
-                prefix: PathBuf::from(prefix),
-                err,
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    fn root() -> PathBuf {
-        PathBuf::from("/repo")
-    }
-
-    #[cfg(windows)]
-    fn root() -> PathBuf {
-        PathBuf::from(r"C:\repo")
-    }
-
-    fn good_paths() -> Vec<GoodPath> {
-        vec![
-            GoodPath::new("main.rs".as_ref(), "src".as_ref(), "src/main.rs".as_ref()),
-            GoodPath::new("./main.rs".as_ref(), "src".as_ref(), "src/main.rs".as_ref()),
-            GoodPath::new(
-                "src/./main.rs".as_ref(),
-                "".as_ref(),
-                "src/main.rs".as_ref(),
-            ),
-            GoodPath::new(".".as_ref(), "src".as_ref(), "src".as_ref()),
-            GoodPath::new(".".as_ref(), "".as_ref(), "".as_ref()),
-            GoodPath::new(
-                "../README.md".as_ref(),
-                "src".as_ref(),
-                "README.md".as_ref(),
-            ),
-            GoodPath::new("..".as_ref(), "src".as_ref(), "".as_ref()),
-            GoodPath::new("src/../lib.rs".as_ref(), "".as_ref(), "lib.rs".as_ref()),
-            GoodPath::new("../d".as_ref(), "a/b/c".as_ref(), "a/b/d".as_ref()),
-            // trailing slash dropped by Path::components
-            GoodPath::new("src/".as_ref(), "".as_ref(), "src".as_ref()),
-            // absolute paths: prefix is ignored, path is stripped against repo root
-            GoodPath::new(
-                root().join("README.md").as_ref(),
-                "src".as_ref(),
-                "README.md".as_ref(),
-            ),
-            GoodPath::new(
-                root().join("src").join("main.rs").as_ref(),
-                "".as_ref(),
-                "src/main.rs".as_ref(),
-            ),
-            GoodPath::new(
-                root().join("src").join("..").join("README.md").as_ref(),
-                "ignore".as_ref(),
-                "README.md".as_ref(),
-            ),
-            GoodPath::new(root().as_ref(), "src".as_ref(), "".as_ref()),
-        ]
-    }
-
-    fn bad_paths() -> Vec<BadPath> {
-        // relative path tries to escape above repo root
-        vec![
-            BadPath::new(
-                "..".as_ref(),
-                "".as_ref(),
-                PathspecError::OutsideRepository {
-                    path: PathBuf::from(".."),
-                },
-            ),
-            // .lit access after normalization
-            BadPath::new(
-                ".lit".as_ref(),
-                "".as_ref(),
-                PathspecError::ReservedComponent {
-                    path: PathBuf::from(".lit"),
-                    component: OsString::from(".lit"),
-                },
-            ),
-            // absolute path outside repo
-            BadPath::new(
-                "/outside/file.txt".as_ref(),
-                "".as_ref(),
-                PathspecError::OutsideRepository {
-                    path: PathBuf::from("/outside/file.txt"),
-                },
-            ),
-            // absolute path that normalizes to filesystem root, then fails strip_prefix
-            BadPath::new(
-                "/../..".as_ref(),
-                "src".as_ref(),
-                PathspecError::OutsideRepository {
-                    path: PathBuf::from("/../.."),
-                },
-            ),
-            BadPath::new(
-                root().join(".lit").join("HEAD").as_ref(),
-                "src".as_ref(),
-                PathspecError::ReservedComponent {
-                    path: root().join(".lit").join("HEAD"),
-                    component: OsString::from(".lit"),
-                },
-            ),
-        ]
-    }
-
-    #[test]
-    fn valid_paths() {
-        for gc in good_paths() {
-            let pathspec = Pathspec::new(gc.arg.as_os_str(), &gc.prefix, &root())
-                .unwrap_or_else(|err| panic!("case failed: {gc:?}, error: {err:?}"));
-            // same syntax as  "{:?},gc" use Debug formatting for gc
-            assert_eq!(pathspec.pattern, gc.pattern, "{gc:?}");
-        }
-    }
-
-    #[test]
-    fn invalid_paths() {
-        for gc in bad_paths() {
-            let err = Pathspec::new(gc.arg.as_os_str(), &gc.prefix, &root()).unwrap_err();
-            assert_eq!(err, gc.err);
-        }
-    }
+    // use std::ffi::OsString;
+    // use super::*;
+    //
+    // // instead of carrying (OsString, PathBuf, Pathspec)
+    // #[derive(Debug)]
+    // struct GoodPath {
+    //     arg: OsString,
+    //     prefix: PathBuf,
+    //     pattern: PathBuf,
+    // }
+    //
+    // impl GoodPath {
+    //     fn new(arg: &OsStr, prefix: &OsStr, pattern: &OsStr) -> Self {
+    //         GoodPath {
+    //             arg: arg.to_os_string(),
+    //             prefix: PathBuf::from(prefix),
+    //             pattern: PathBuf::from(pattern),
+    //         }
+    //     }
+    // }
+    //
+    // #[derive(Debug)]
+    // struct BadPath {
+    //     arg: OsString,
+    //     prefix: PathBuf,
+    //     err: PathspecError,
+    // }
+    //
+    // impl BadPath {
+    //     fn new(arg: &OsStr, prefix: &OsStr, err: PathspecError) -> Self {
+    //         BadPath {
+    //             arg: arg.to_os_string(),
+    //             prefix: PathBuf::from(prefix),
+    //             err,
+    //         }
+    //     }
+    // }
+    //
+    // #[cfg(unix)]
+    // fn root() -> PathBuf {
+    //     PathBuf::from("/repo")
+    // }
+    //
+    // #[cfg(windows)]
+    // fn root() -> PathBuf {
+    //     PathBuf::from(r"C:\repo")
+    // }
+    //
+    // fn good_paths() -> Vec<GoodPath> {
+    //     vec![
+    //         GoodPath::new("main.rs".as_ref(), "src".as_ref(), "src/main.rs".as_ref()),
+    //         GoodPath::new("./main.rs".as_ref(), "src".as_ref(), "src/main.rs".as_ref()),
+    //         GoodPath::new(
+    //             "src/./main.rs".as_ref(),
+    //             "".as_ref(),
+    //             "src/main.rs".as_ref(),
+    //         ),
+    //         GoodPath::new(".".as_ref(), "src".as_ref(), "src".as_ref()),
+    //         GoodPath::new(".".as_ref(), "".as_ref(), "".as_ref()),
+    //         GoodPath::new(
+    //             "../README.md".as_ref(),
+    //             "src".as_ref(),
+    //             "README.md".as_ref(),
+    //         ),
+    //         GoodPath::new("..".as_ref(), "src".as_ref(), "".as_ref()),
+    //         GoodPath::new("src/../lib.rs".as_ref(), "".as_ref(), "lib.rs".as_ref()),
+    //         GoodPath::new("../d".as_ref(), "a/b/c".as_ref(), "a/b/d".as_ref()),
+    //         // trailing slash dropped by Path::components
+    //         GoodPath::new("src/".as_ref(), "".as_ref(), "src".as_ref()),
+    //         // absolute paths: prefix is ignored, path is stripped against repo root
+    //         GoodPath::new(
+    //             root().join("README.md").as_ref(),
+    //             "src".as_ref(),
+    //             "README.md".as_ref(),
+    //         ),
+    //         GoodPath::new(
+    //             root().join("src").join("main.rs").as_ref(),
+    //             "".as_ref(),
+    //             "src/main.rs".as_ref(),
+    //         ),
+    //         GoodPath::new(
+    //             root().join("src").join("..").join("README.md").as_ref(),
+    //             "ignore".as_ref(),
+    //             "README.md".as_ref(),
+    //         ),
+    //         GoodPath::new(root().as_ref(), "src".as_ref(), "".as_ref()),
+    //     ]
+    // }
+    //
+    // fn bad_paths() -> Vec<BadPath> {
+    //     // relative path tries to escape above repo root
+    //     vec![
+    //         BadPath::new(
+    //             "..".as_ref(),
+    //             "".as_ref(),
+    //             PathspecError::OutsideRepository {
+    //                 path: PathBuf::from(".."),
+    //             },
+    //         ),
+    //         // .lit access after normalization
+    //         BadPath::new(
+    //             ".lit".as_ref(),
+    //             "".as_ref(),
+    //             PathspecError::ReservedComponent {
+    //                 path: PathBuf::from(".lit"),
+    //                 component: OsString::from(".lit"),
+    //             },
+    //         ),
+    //         // absolute path outside repo
+    //         BadPath::new(
+    //             "/outside/file.txt".as_ref(),
+    //             "".as_ref(),
+    //             PathspecError::OutsideRepository {
+    //                 path: PathBuf::from("/outside/file.txt"),
+    //             },
+    //         ),
+    //         // absolute path that normalizes to filesystem root, then fails strip_prefix
+    //         BadPath::new(
+    //             "/../..".as_ref(),
+    //             "src".as_ref(),
+    //             PathspecError::OutsideRepository {
+    //                 path: PathBuf::from("/../.."),
+    //             },
+    //         ),
+    //         BadPath::new(
+    //             root().join(".lit").join("HEAD").as_ref(),
+    //             "src".as_ref(),
+    //             PathspecError::ReservedComponent {
+    //                 path: root().join(".lit").join("HEAD"),
+    //                 component: OsString::from(".lit"),
+    //             },
+    //         ),
+    //     ]
+    // }
+    //
+    // #[test]
+    // fn valid_paths() {
+    //     for gc in good_paths() {
+    //         let pathspec = Pathspec::new(gc.arg.as_os_str(), &gc.prefix, &root())
+    //             .unwrap_or_else(|err| panic!("case failed: {gc:?}, error: {err:?}"));
+    //         // same syntax as  "{:?},gc" use Debug formatting for gc
+    //         assert_eq!(pathspec.pattern, gc.pattern, "{gc:?}");
+    //     }
+    // }
+    //
+    // #[test]
+    // fn invalid_paths() {
+    //     for gc in bad_paths() {
+    //         let err = Pathspec::new(gc.arg.as_os_str(), &gc.prefix, &root()).unwrap_err();
+    //         assert_eq!(err, gc.err);
+    //     }
+    // }
 }

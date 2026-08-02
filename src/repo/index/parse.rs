@@ -1,3 +1,9 @@
+use super::{FormatError, FormatErrorKind, IndexEntry};
+use crate::repo::index;
+use crate::repo::object::mode::Mode;
+use crate::repo::os::FileStat;
+use crate::repo::path::RepoPath;
+
 pub(super) struct Parser<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -12,22 +18,31 @@ impl<'a> Parser<'a> {
     pub(super) fn next(&mut self) -> Result<IndexEntry, FormatError> {
         let entry_offset = self.offset();
 
-        let stat = StatNode {
-            ctime: u32::from_be_bytes(*self.take::<4>()?),
-            ctime_nsec: u32::from_be_bytes(*self.take::<4>()?),
-            mtime: u32::from_be_bytes(*self.take::<4>()?),
-            mtime_nsec: u32::from_be_bytes(*self.take::<4>()?),
-            dev: u32::from_be_bytes(*self.take::<4>()?),
-            ino: u32::from_be_bytes(*self.take::<4>()?),
-            mode: u32::from_be_bytes(*self.take::<4>()?),
-            uid: u32::from_be_bytes(*self.take::<4>()?),
-            gid: u32::from_be_bytes(*self.take::<4>()?),
-            file_size: u32::from_be_bytes(*self.take::<4>()?),
+        let [ctime, ctime_nsec, mtime, mtime_nsec, dev, ino] = self.u32_array::<6>()?;
+        let mode = self.read_u32()?;
+        let mode = Mode::from_raw(mode).ok_or(FormatError::at(
+            self.offset(),
+            FormatErrorKind::InvalidMode(mode),
+        ))?;
+        let [uid, gid, file_size] = self.u32_array::<3>()?;
+
+        let stat = FileStat {
+            ctime,
+            ctime_nsec,
+            mtime,
+            mtime_nsec,
+            dev,
+            ino,
+            uid,
+            gid,
+            file_size,
         };
-        if !matches!(stat.mode, os::REGULAR | os::EXECUTABLE | os::SYMLINK) {
+
+        // TODO: we need to rethink for DIR when we support sparse
+        if !matches!(mode, Mode::Regular | Mode::Executable | Mode::Symlink) {
             return Err(FormatError::at(
                 entry_offset,
-                FormatErrorKind::InvalidMode(stat.mode),
+                FormatErrorKind::InvalidMode(mode as u32),
             ));
         }
         // The nanoseconds field represents the fractional part of a second, so it lives in the range
@@ -41,19 +56,19 @@ impl<'a> Parser<'a> {
 
         let oid = self.take::<20>()?;
         let flags = u16::from_be_bytes(*self.take::<2>()?);
-        let mut path_bytes = Vec::new();
+        let path;
         // we extract the lowest 12 bits which is where we stored the path len
         let path_len = flags & 0xfff;
-        if path_len == PATH_MAX_SIZE {
-            path_bytes.extend_from_slice(self.read_path_until_nul()?);
+        if path_len == index::PATH_MAX_SIZE {
+            path = self.read_path_until_nul()?;
         } else {
-            path_bytes.extend_from_slice(self.read_path(path_len as usize)?);
+            path = self.read_path(path_len as usize)?;
         }
 
         let size = self.pos - entry_offset;
         self.skip_padding(size)?;
 
-        Ok(IndexEntry::new(path_bytes, *oid, stat))
+        Ok(IndexEntry::new(path, *oid, mode, stat))
     }
 
     // one of the things that we have to validate is that the path length from flags matches the
@@ -62,7 +77,7 @@ impl<'a> Parser<'a> {
     // if the real path is longer than path_len, the next byte will not be NUL, and we reject it
     // If the real path is shorter than path_len, then the path slice will include the NUL byte
     // inside it, and validate_index_path() will reject it
-    fn read_path(&mut self, path_len: usize) -> Result<&'a [u8], FormatError> {
+    fn read_path(&mut self, path_len: usize) -> Result<RepoPath, FormatError> {
         // need path_len bytes for the path, plus 1 byte for the required NUL terminator.
         if self.pos + path_len >= self.buf.len() {
             return Err(FormatError::at(
@@ -77,7 +92,7 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         let path_bytes = &self.buf[start..start + path_len];
         // path name needs to follow the rules of the index format
-        validate_path(path_bytes)
+        let path = RepoPath::from_bytes(path_bytes)
             .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // move to the next byte after the path that according to the format should be NUL
         self.pos = start + path_len;
@@ -101,8 +116,7 @@ impl<'a> Parser<'a> {
                 ));
             }
         }
-
-        Ok(path_bytes)
+        Ok(path)
     }
 
     // we use this method read the path when it's length exceeds PATH_MAX_SIZE
@@ -115,38 +129,36 @@ impl<'a> Parser<'a> {
     //
     // in read_path() we have to validate that the path length from flags matches the actual path
     // length. One caveat is that we can no longer verify that because we don't keep track of the
-    // exact length but we use a sentinel value
-    fn read_path_until_nul(&mut self) -> Result<&'a[u8], FormatError> {
+    // exact length, but we use a sentinel value
+    fn read_path_until_nul(&mut self) -> Result<RepoPath, FormatError> {
         let start = self.pos;
-        // TODO: use memchr the same way the Rust team does on read_until()
-        // check object::parser
-        let relative_pos = self.buf[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .ok_or_else(|| {
-                FormatError::at(
-                    self.buf.len(),
-                    FormatErrorKind::Eof {
-                        needed: 1,
-                        remaining: 0,
-                    },
-                )
-            })?;
+        let Some(relative_pos) = memchr::memchr(0, &self.buf[start..]) else {
+            return Err(FormatError::at(
+                self.buf.len(),
+                FormatErrorKind::Eof {
+                    needed: 1,
+                    remaining: 0,
+                },
+            ));
+        };
 
         // position() returns relative to the slice we searched not the entire buffer
         // the position of the NUL with respect to the whole buffer is start + relative
         let nul_pos = start + relative_pos;
-        if nul_pos - start < PATH_MAX_SIZE as usize {
-            return Err(FormatError::at(start, FormatErrorKind::LongPathLenMissMatch,));
+        if nul_pos - start < index::PATH_MAX_SIZE as usize {
+            return Err(FormatError::at(
+                start,
+                FormatErrorKind::LongPathLenMissMatch,
+            ));
         }
 
         let path_bytes = &self.buf[start..nul_pos];
-        validate_path(path_bytes)
+        let path = RepoPath::from_bytes(path_bytes)
             .map_err(|err| FormatError::at(start, FormatErrorKind::InvalidPathSyntax(err)))?;
         // skip NUL
         self.pos = nul_pos + 1;
 
-        Ok(path_bytes)
+        Ok(path)
     }
 
     // padding formula: size % 8 tells us how far past the last multiple of 8 we are. 67 % 8 = 3
@@ -180,6 +192,20 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    fn read_u32(&mut self) -> Result<u32, FormatError> {
+        Ok(u32::from_be_bytes(*self.take::<4>()?))
+    }
+
+    fn u32_array<const N: usize>(&mut self) -> Result<[u32; N], FormatError> {
+        let mut elements = [0u32; N];
+
+        for element in &mut elements {
+            *element = self.read_u32()?;
+        }
+
+        Ok(elements)
+    }
+
     // how far we read in the buffer
     pub(super) fn offset(&self) -> usize {
         self.pos
@@ -192,15 +218,16 @@ impl<'a> Parser<'a> {
     pub(super) fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], FormatError> {
         let remaining = self.buf.len().saturating_sub(self.pos);
 
-        let bytes: &[u8; N] = self.buf[self.pos..self.pos + N]
-            .try_into()
-            .map_err(|_| FormatError {
-                offset: self.pos,
-                kind: FormatErrorKind::Eof {
-                    needed: N,
-                    remaining,
-                },
-            })?;
+        let bytes: &[u8; N] =
+            self.buf[self.pos..self.pos + N]
+                .try_into()
+                .map_err(|_| FormatError {
+                    offset: self.pos,
+                    kind: FormatErrorKind::Eof {
+                        needed: N,
+                        remaining,
+                    },
+                })?;
         self.advance(N);
 
         Ok(bytes)

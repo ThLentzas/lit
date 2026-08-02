@@ -4,8 +4,8 @@ use std::io::ErrorKind;
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
 
-pub(super) struct Init {
-    pub(super) path: PathBuf,
+pub(crate) struct Init {
+    pub(crate) path: PathBuf,
 }
 
 impl Init {
@@ -14,7 +14,7 @@ impl Init {
     // join() if the second path is absolute, it replaces the first entirely, else it gets appended.
     // lit init: creates .lit in the cwd
     // lit init /home/thanos/projects/1: works fine it is already an absolute path
-    pub(super) fn new(args: &mut Peekable<Skip<Args>>) -> Self {
+    pub fn new(args: &mut Peekable<Skip<Args>>) -> Self {
         let cwd = env::current_dir().unwrap();
         let path = match args.next() {
             Some(p) => cwd.join(p),

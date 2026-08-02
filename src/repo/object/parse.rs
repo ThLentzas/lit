@@ -1,4 +1,7 @@
 use crate::hex::{self, HexError};
+use crate::repo::object::{Commit, Entry, Object, Signature};
+use crate::repo::object::mode::Mode;
+use crate::repo::timestamp::{Timestamp, TimestampError};
 
 // Every parser that I wrote so far is a struct and all the parse_* methods are implemented in its
 // impl block. Now we pass Cursor a struct that has some generic methods that are used to walk the
@@ -238,8 +241,8 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
     let buf = cursor
         .read_until(b' ')
         .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::MissingSpace))?;
-    let mut mode = 0u32;
-
+    
+    let mut value = 0u32;
     // this part is tricky, we have the mode as ASCII, something like '100644', we can't just convert
     // it to 100644 in base 10, we need base 8
     // "100644" octal -> 0o100644(33188 decimal)
@@ -250,7 +253,7 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
                 TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
             ));
         }
-        mode = mode
+        value = value
             .checked_mul(8)
             .and_then(|n| n.checked_add((b - b'0') as u32))
             .ok_or(TreeEntryError::new(
@@ -258,13 +261,12 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
                 TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
             ))?;
     }
-
-    if !matches!(mode, os::EXECUTABLE | os::REGULAR | os::SYMLINK | os::DIR) {
+    let Some(mode) = Mode::from_raw(value) else {
         return Err(TreeEntryError::new(
             start,
             TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
         ));
-    }
+    };
 
     let start = cursor.pos;
     let name = cursor

@@ -1,6 +1,4 @@
-use std::{fs, io};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
 use std::fs::Metadata;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -8,17 +6,48 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-use crate::repo::index::StatNode;
+use std::path::{Path, PathBuf};
+use std::{fs, io};
 
-pub(super) const REGULAR: u32 = 0o100644;
-pub(super) const EXECUTABLE: u32 = 0o100755;
-pub(super) const DIR: u32 = 0o040000;
-pub(super) const SYMLINK: u32 = 0o120000;
-const UNSUPPORTED: u32 = 0;
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct StatNode {
+    pub(crate) kind: FileKind,
+    pub(crate) stat: FileStat,
+}
+
 #[cfg(windows)]
 const EPOCH_DIFF: u64 = 11_644_473_000;
+
 #[cfg(windows)]
 const TICKS_PER_SECOND: u64 = 10_000_000;
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) enum FileKind {
+    // the flag determines if the file is executable or not by checking the permission bits
+    // true means it is an executable
+    Regular(bool),
+    Symlink,
+    Directory,
+    Other,
+}
+
+// toDo: add GitLink support.
+// cheap copy only 9 bytes
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct FileStat {
+    // change time, most recent time a file's attributes changed(owner group, perm, etc)
+    pub(crate) ctime: u32,
+    pub(crate) ctime_nsec: u32,
+    // modify time, most recent time a file's contents changed
+    pub(crate) mtime: u32,
+    pub(crate) mtime_nsec: u32,
+    pub(crate) dev: u32,
+    pub(crate) ino: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
+    // on disk size, truncated to 32-bit
+    pub(crate) file_size: u32,
+}
 
 // Read notes
 #[cfg(windows)]
@@ -37,21 +66,25 @@ pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
     //  fs::metadata(path) follows symlinks. If path is a symlink to target, we get metadata about
     //  target.
     //  fs::symlink_metadata(path) does not follow. We get metadata about the symlink itself.
-    let meta = fs::symlink_metadata(path).map_err(|err| {
-        OsError::Io { path: path.to_path_buf(), source: err }
+    let meta = fs::symlink_metadata(path).map_err(|err| OsError::Io {
+        path: path.to_path_buf(),
+        source: err,
     })?;
-
-    Ok(StatNode {
+    let file_stat = FileStat {
         ctime: meta.ctime() as u32,
         ctime_nsec: meta.ctime_nsec() as u32,
         mtime: meta.mtime() as u32,
         mtime_nsec: meta.mtime_nsec() as u32,
         dev: meta.dev() as u32,
         ino: meta.ino() as u32,
-        mode: mode(&meta),
         uid: meta.uid(),
         gid: meta.gid(),
         file_size: meta.size() as u32,
+    };
+
+    Ok(StatNode {
+        kind: file_kind(&meta),
+        stat: file_stat,
     })
 }
 
@@ -59,53 +92,61 @@ pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
 // TODO: a/b is a dir not a file named b inside a
 #[cfg(windows)]
 pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
-    let meta = fs::symlink_metadata(path).map_err(|err| {
-        OsError::Io { path: path.to_path_buf(), source: err }
+    let meta = fs::symlink_metadata(path).map_err(|err| OsError::Io {
+        path: path.to_path_buf(),
+        source: err,
     })?;
     let ctime = meta.creation_time();
     let mtime = meta.last_write_time();
 
-    Ok(StatNode {
+    let file_stat = FileStat {
         ctime: to_unix_time(ctime) as u32,
         ctime_nsec: to_unix_time_nsec(ctime) as u32,
         mtime: to_unix_time(mtime) as u32,
         mtime_nsec: to_unix_time_nsec(mtime) as u32,
         dev: 0,
         ino: 0,
-        mode: mode(&meta),
         uid: 0,
         gid: 0,
-        file_size: meta.file_size() as u32,
+        file_size: meta.size(),
+    };
+
+    Ok(StatNode {
+        kind: file_kind(&meta),
+        stat: file_stat,
     })
 }
 
 #[cfg(unix)]
-fn mode(meta: &Metadata) -> u32 {
+fn file_kind(meta: &Metadata) -> FileKind {
     let file_type = meta.file_type();
 
     if file_type.is_symlink() {
-        SYMLINK
-    } else if meta.is_file() {
-        if meta.mode() & 0o111 != 0 {
-            EXECUTABLE
+        FileKind::Symlink
+    } else if file_type.is_file() {
+        // many Unix permissions can mean executable 100700, 100710, 100711 etc
+        // Git does not preserve them all, instead if the owner has the x right it is enough to classify
+        // it as executable.
+        if meta.mode() & 0o100 != 0 {
+            FileKind::Regular(true)
         } else {
-            REGULAR
+            FileKind::Regular(false)
         }
-    } else if meta.is_dir() {
-        DIR
-    } else { // unsupported
-        UNSUPPORTED
+    } else if file_type.is_dir() {
+        FileKind::Directory
+    } else {
+        FileKind::Other
     }
 }
 
 #[cfg(unix)]
-pub(super) fn name_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError>  {
+pub(super) fn name_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
     Ok(name.as_bytes().to_vec())
 }
 
 #[cfg(unix)]
-pub(super) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsStr::from_bytes(bytes))
+pub(super) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, OsError> {
+    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
 }
 
 // TODO: check if true: Windows accepts / in paths. The Win32 file APIs (and therefore Rust's Path on
@@ -126,7 +167,9 @@ pub(super) fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 pub(super) fn name_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
     match name.to_str() {
         Some(utf8) => Ok(utf8.as_bytes().to_vec()),
-        None => Err(OsError::NotUnicode { bytes: name.as_encoded_bytes().to_vec() }),
+        None => Err(OsError::NotUnicode {
+            bytes: name.as_encoded_bytes().to_vec(),
+        }),
     }
 }
 
@@ -135,29 +178,29 @@ pub(super) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, OsError> {
     match str::from_utf8(bytes) {
         // FromIterator pushes each component with native separators
         Ok(utf8) => Ok(utf8.split('/').collect()),
-        Err(_) => Err(OsError::NotUnicode { bytes: bytes.to_vec() }),
+        Err(_) => Err(OsError::NotUnicode {
+            bytes: bytes.to_vec(),
+        }),
     }
 }
 
 #[cfg(windows)]
-fn mode(meta: &Metadata) -> u32 {
+fn file_kind(meta: &Metadata) -> FileKind {
     let file_type = meta.file_type();
 
     if file_type.is_symlink() {
-        SYMLINK
-    } else if meta.is_file() { // all files on Windows are treated as regular
-        REGULAR
-    } else if meta.is_dir() {
-        DIR
+        FileKind::Symlink
+    } else if file_type.is_file() {
+        FileKind::Regular(false)
+    } else if file_type.is_dir() {
+        FileKind::Directory
     } else {
-        UNSUPPORTED
+        FileKind::Other
     }
 }
 
 #[derive(Debug)]
 pub(super) enum OsError {
     NotUnicode { bytes: Vec<u8> },
-    Io { path: PathBuf, source: io::Error}
+    Io { path: PathBuf, source: io::Error },
 }
-
-

@@ -59,7 +59,7 @@ pub(super) fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {
 }
 
 fn to_base10_digit(byte: u8) -> u8 {
-    if matches!(byte, b'0'..=b'9') {
+    if byte.is_ascii_digit() {
         byte - b'0'
     } else {
         byte - b'a' + 10

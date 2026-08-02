@@ -1,11 +1,13 @@
 mod parse;
 
 use crate::repo::index::parse::Parser;
+use crate::repo::object::mode::Mode;
+use crate::repo::os::FileStat;
 use crate::repo::path::RepoPath;
 use sha1::{Digest, Sha1};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 // toDo:
 // Integrity validation:
 //   Did the bytes survive unchanged?
@@ -22,20 +24,20 @@ use std::path::{Path, PathBuf};
 // git has multiple versions(2, 3, 4) for the index format
 const INDEX_VERSION: u32 = 2;
 const PATH_MAX_SIZE: u16 = 0xfff;
-const SIGNATURE: &'static str = "DIRC";
+const SIGNATURE: &str = "DIRC";
 
 // toDo: caching tree
-pub(super) struct Index {
-    // TODO: on the rewrite test if a BTreeMap would work
-    pub(super) entries: Vec<IndexEntry>,
-    pub(super) path: PathBuf,
+pub(crate) struct Index {
+    // TODO: on the rewrite test if a BTreeMap could work
+    pub(crate) entries: Vec<IndexEntry>,
+    pub(crate) path: PathBuf,
     // a flag that is used to not unnecessary write if no changes detected
-    pub(super) modified: bool,
+    pub(crate) modified: bool,
 }
 
 // .lit/index is created lazily on the first write
 impl Index {
-    pub(super) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: PathBuf) -> Self {
         Self {
             path,
             entries: Vec::new(),
@@ -83,12 +85,13 @@ impl Index {
         // entry > "a/b"), is_parent_path("a/b", "a/b.txt") is false -> we return false, even though
         // a/b/c.txt makes a/b tracked. The real descendants live past the sibling file. Searching
         // for a/b/ instead skips over a/b.txt and lands exactly on the first descendant if one exists
-        let mut path = path.clone();
-        path.push(b'/');
-        let pos = self.lower_bound(&path);
+        let mut path_bytes = Vec::with_capacity(path.as_bytes().len() + 1);
+        path_bytes.extend_from_slice(path.as_bytes());
+        path_bytes.push(b'/');
+        let pos = self.lower_bound(&path_bytes);
         self.entries
             .get(pos)
-            .is_some_and(|entry| path.is_parent_of(&entry.path))
+            .is_some_and(|entry| entry.path.as_bytes().starts_with(&path_bytes))
     }
 
     // Git requires index entries to be sorted by filename. It is a requirement for deterministic
@@ -102,7 +105,7 @@ impl Index {
     // foo/src/a, foo/src/b and foo/README . In the final order README appears before src as the entries
     // of foo and a appears before b as the entries of src. Inserting in ascending order allows us
     // to do BS for retrieveing entries instead of appending + sorting. Read more Tree::write()
-    pub(super) fn add_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
+    pub(crate) fn add_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
         for entry in entries {
             self.resolve_conflicts(&entry.path);
 
@@ -122,11 +125,11 @@ impl Index {
         Ok(())
     }
 
-    pub(super) fn refresh_entry_stat(&mut self, index: usize, stat: StatNode) {
+    pub(crate) fn refresh_entry_stat(&mut self, index: usize, stat: FileStat) {
         self.entries[index].stat = stat;
     }
 
-    pub(super) fn serialize(&self) -> Vec<u8> {
+    pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SIGNATURE.as_bytes());
         bytes.extend_from_slice(&INDEX_VERSION.to_be_bytes());
@@ -142,7 +145,7 @@ impl Index {
     }
 
     // loads the context of .lit/index in memory
-    pub(super) fn load(&mut self) -> Result<(), IndexError> {
+    pub(crate) fn load(&mut self) -> Result<(), IndexError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -263,9 +266,7 @@ impl Index {
     //  we need to delete all the lib/ entries. This is why we make the call to is_parent_path() twice
     fn resolve_conflicts(&mut self, path: &RepoPath) {
         self.entries
-            .retain(|entry| {
-                !entry.path.is_parent_of(path) || path.is_parent_of(&entry.path)
-            })
+            .retain(|entry| !entry.path.is_parent_of(path) || path.is_parent_of(&entry.path))
     }
 
     // This method we have seen before on Leetcode is the next_greater() adaptation of binary search,
@@ -274,9 +275,9 @@ impl Index {
     // going to return true are entries that their path length is always greater than length of the
     // provided path because child_path.len() > parent_path.len(). Sure foo/bar.txt is one potential
     // candidate as is lexicographically greater than a/b/ but so is a/b/foo.txt.
-    fn lower_bound(&self, path: &RepoPath) -> usize {
+    fn lower_bound(&self, path_bytes: &[u8]) -> usize {
         self.entries
-            .binary_search_by(|entry| entry.path.cmp(path))
+            .binary_search_by(|entry| entry.path.as_bytes().cmp(path_bytes))
             .unwrap_or_else(|pos| pos)
     }
 
@@ -287,35 +288,22 @@ impl Index {
     }
 }
 
-// toDo: add GitLink support.
-// cheap copy only 40 bytes
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub(super) struct StatNode {
-    // change time, most recent time a file's attributes changed(owner group, perm, etc)
-    pub(super) ctime: u32,
-    pub(super) ctime_nsec: u32,
-    // modify time, most recent time a file's contents changed
-    pub(super) mtime: u32,
-    pub(super) mtime_nsec: u32,
-    pub(super) dev: u32,
-    pub(super) ino: u32,
-    pub(super) mode: u32,
-    pub(super) uid: u32,
-    pub(super) gid: u32,
-    // on disk size, truncated to 32-bit
-    pub(super) file_size: u32,
-}
-
 #[derive(PartialEq, Eq)]
-pub(super) struct IndexEntry {
-    pub(super) stat: StatNode,
-    pub(super) oid: [u8; 20],
+pub(crate) struct IndexEntry {
+    pub(super) stat: FileStat,
+    pub(super) mode: Mode,
+    pub(crate) oid: [u8; 20],
     flags: u16,
-    pub(super) path: RepoPath,
+    pub(crate) path: RepoPath,
 }
 
 impl IndexEntry {
-    pub(super) fn new(path: RepoPath, oid: [u8; 20], stat: StatNode) -> Self {
+    pub(crate) fn new(
+        path: RepoPath,
+        oid: [u8; 20],
+        mode: Mode,
+        stat: FileStat,
+    ) -> Self {
         // https://git-scm.com/docs/index-format
         // the lowest 12 bits store the name length
         // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
@@ -326,7 +314,15 @@ impl IndexEntry {
             oid,
             flags,
             path,
+            mode,
         }
+    }
+
+    pub(crate) fn times_match(&self, other: &FileStat) -> bool {
+        self.stat.ctime == other.ctime
+            && self.stat.ctime_nsec == other.ctime_nsec
+            && self.stat.mtime == other.mtime
+            && self.stat.mtime_nsec == other.mtime_nsec
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -343,18 +339,46 @@ impl IndexEntry {
         bytes.extend_from_slice(&self.stat.mtime_nsec.to_be_bytes());
         bytes.extend_from_slice(&self.stat.dev.to_be_bytes());
         bytes.extend_from_slice(&self.stat.ino.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mode.to_be_bytes());
+        // the next part is confusing in the docs
+        // it says: 32-bit mode, 4-bit type, 3 unused 9-bit permissions(3 per group)
+        //
+        // 31                                                0
+        //  ┌────────────┬─────────┬─────────────────────────┐
+        //  │ 4-bit type │ 3 unused│ 9-bit Unix permissions  │
+        //  └────────────┴─────────┴─────────────────────────┘
+        //
+        // bits 31..16: zero
+        // bits 15..12: object type
+        // bits 11..9:  unused
+        // bits 8..0:   Unix permission bits
+        //
+        // 100644 octal
+        // =
+        // 1000 000 110100100 binary (16bits the rest are padded with zeros)
+        // │    │   │
+        // │    │   └── 9 permission bits: 0644
+        // │    └────── 3 unused bits: 000
+        // └─────────── 4 object-type bits: 1000
+        //
+        // let mode: u32 = 0o100644;
+        //
+        // let object_type = (mode >> 12) & 0b1111;
+        // let unused = (mode >> 9) & 0b111;
+        // let permissions = mode & 0o777;
+        //
+        // we get the exact same behavior by calling Mode::from_raw() when parsing those bytes, for
+        // storing is just we write those in BE.
+        bytes.extend_from_slice(&(self.mode as u32).to_be_bytes());
         bytes.extend_from_slice(&self.stat.uid.to_be_bytes());
         bytes.extend_from_slice(&self.stat.gid.to_be_bytes());
         bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
-
-        bytes.extend_from_slice(&self.oid);
+        bytes.extend_from_slice(&self.oid); // in the docs this is called Object name
         bytes.extend_from_slice(&self.flags.to_be_bytes());
-        bytes.extend_from_slice(&self.path.as_bytes());
+        bytes.extend_from_slice(&self.path.as_bytes()); // in the docs, is called Entry path name
         // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
         // multiple of 8
         //
-        // For any path 4095 bytes or longer, the format stores 0xFFF as a sentinel meaning "too long,
+        // For any path 4095 bytes or longer, the format stores 0xFFF as a sentinel meaning "too long"
         // For those paths, the length field gives us nothing, we still need to find where the path
         // ends is by scanning for the NUL terminator.
         bytes.push(0);
@@ -397,60 +421,11 @@ impl IndexEntry {
     }
 }
 
-fn validate_path(path: &[u8]) -> Result<(), PathError> {
-    if path.is_empty() {
-        return Err(PathError::Empty);
-    }
-    // paths are relative to the repository root, so no leading slash.
-    if path[0] == b'/' {
-        return Err(PathError::LeadingSlash);
-    }
-    // trailing slash is not allowed.
-    if path[path.len() - 1] == b'/' {
-        return Err(PathError::TrailingSlash);
-    }
-
-    for component in path.split(|&b| b == b'/') {
-        // empty components: "src//main.rs"
-        if component.is_empty() {
-            return Err(PathError::EmptyComponent);
-        }
-        // ".", "..", and ".lit" as path components are not allowed
-        // src/./main.rs: stays in the current directory, redundant and not a real subdirectory
-        // src/../etc/passwd: escapes upward, would let a crafted index reference files outside the repo
-        // .lit/config: points into Lit's own metadata, never legitimate as a tracked file.
-        if matches!(component, b"." | b".." | b".lit") {
-            return Err(PathError::ReservedComponent);
-        }
-        // NUL cannot appear inside the path.
-        if memchr::memchr(0, component).is_some() {
-            return Err(PathError::ContainsNul);
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn path_to_bytes(path: &Path) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    let mut components = path.iter().peekable();
-
-    while let Some(component) = components.next() {
-        // Git compares entry names as raw byte sequences(memcmp), no encoding, no locale, no
-        // platform variation
-        bytes.extend_from_slice(os::name_as_bytes(component));
-        // no trailing slash
-        if components.peek().is_some() {
-            bytes.push(b'/');
-        }
-    }
-    bytes
-}
-
 // an error that can occur when creating IndexEntry or parsing .lit/index
 // Git when format is corrupted reports: Unknown Index Format
 // No more information is provided to the user because they can't do much if the format is invalid
 #[derive(Debug)]
-pub(super) enum IndexError {
+pub(crate) enum IndexError {
     InvalidChecksum,
     UnsupportedVersion(u32),
     InvalidFormat(FormatError),
@@ -482,6 +457,7 @@ impl FormatError {
 
 #[derive(Debug)]
 pub(super) enum FormatErrorKind {
+    // TODO: rethink this Eof
     Eof { needed: usize, remaining: usize },
     InvalidChecksum,
     InvalidSignature,
@@ -498,11 +474,5 @@ pub(super) enum FormatErrorKind {
 impl From<FormatError> for IndexError {
     fn from(err: FormatError) -> Self {
         IndexError::InvalidFormat(err)
-    }
-}
-
-impl From<PathError> for FormatErrorKind {
-    fn from(err: PathError) -> Self {
-        FormatErrorKind::InvalidPathSyntax(err)
     }
 }

@@ -1,11 +1,12 @@
-mod init;
-mod add;
-mod commit;
-mod status;
+pub(crate) mod init;
+pub(crate) mod add;
+pub(crate) mod commit;
+pub(crate) mod status;
 
+use crate::cmd::add::Add;
+use crate::cmd::commit::Commit;
 use crate::cmd::init::Init;
-use crate::command::{Add, Commit};
-use crate::command::status::Status;
+use crate::cmd::status::Status;
 
 // init creates repository structure
 // add creates/updates the index

@@ -11,7 +11,7 @@ use std::{fs, io};
 // acquired by atomically creating a .lock` file (lock is context specific extension). Other processes
 // attempting to acquire the same lock will fail until this lockfile is committed or dropped.
 // toDo:  explain why not some OS level lock
-pub(super) struct Lockfile {
+pub(crate) struct Lockfile {
     // the path to the file we want to write to
     pub(super) file_path: PathBuf,
     // the path to <filename>.lock
@@ -44,8 +44,7 @@ impl Lockfile {
     // returns Ok(Some(()) when it successfully acquires the lock
     // returns Ok(None) if it fails to acquire the lock
     // returns Err for any Io
-
-    pub(super) fn acquire(path: &Path) -> Result<Lockfile, LockfileError> {
+    pub(crate) fn acquire(path: &Path) -> Result<Lockfile, LockfileError> {
         let file_path = path.to_path_buf();
         let lock_path = PathBuf::from(format!("{}.lock", file_path.display()));
 
@@ -76,7 +75,7 @@ impl Lockfile {
         }
     }
 
-    pub(super) fn write(&mut self, content: &[u8]) -> Result<(), LockfileError> {
+    pub(crate) fn write(&mut self, content: &[u8]) -> Result<(), LockfileError> {
         // safe to call unwrap because file is None only when commit() returns
         let file = self.file.as_mut().unwrap();
         match file.write_all(content) {
@@ -94,7 +93,7 @@ impl Lockfile {
     //
     // we consume self because once we commit the changes Lockfile is no longer needed. It's a one
     // time use. We try to enforce it via the type system
-    pub(super) fn commit(mut self) -> Result<(), LockfileError> {
+    pub(crate) fn commit(mut self) -> Result<(), LockfileError> {
         let file = self.file.take().unwrap();
         // sync_all() does not closes the file, we can still call file.write_all()
         //
@@ -137,7 +136,7 @@ impl Drop for Lockfile {
 }
 
 #[derive(Debug)]
-pub(super) enum LockfileError {
+pub(crate) enum LockfileError {
     Io { path: PathBuf, source: io::Error, },
     LockDenied { path: PathBuf, },
 }
