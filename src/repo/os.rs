@@ -31,8 +31,9 @@ pub(crate) enum FileKind {
     Other,
 }
 
-// toDo: add GitLink support.
+// TODO: add GitLink support.
 // cheap copy only 9 bytes
+// TODO: explain why mode is not part of FileStat
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct FileStat {
     // change time, most recent time a file's attributes changed(owner group, perm, etc)
@@ -108,7 +109,7 @@ pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
         ino: 0,
         uid: 0,
         gid: 0,
-        file_size: meta.size(),
+        file_size: meta.size() as u32,
     };
 
     Ok(StatNode {
@@ -140,7 +141,7 @@ fn file_kind(meta: &Metadata) -> FileKind {
 }
 
 #[cfg(unix)]
-pub(super) fn name_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
+pub(super) fn os_str_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
     Ok(name.as_bytes().to_vec())
 }
 
@@ -164,7 +165,7 @@ pub(super) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, OsError> {
 // This is why for [00,41] we don't get two bytes in UTF8, because first it maps the byte sequence
 // to the codepoint(41) and then it turns that to UTF8 bytes.
 #[cfg(windows)]
-pub(super) fn name_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
+pub(super) fn os_str_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
     match name.to_str() {
         Some(utf8) => Ok(utf8.as_bytes().to_vec()),
         None => Err(OsError::NotUnicode {
@@ -201,6 +202,7 @@ fn file_kind(meta: &Metadata) -> FileKind {
 
 #[derive(Debug)]
 pub(super) enum OsError {
+    #[cfg(windows)]
     NotUnicode { bytes: Vec<u8> },
     Io { path: PathBuf, source: io::Error },
 }

@@ -5,7 +5,7 @@ use crate::repo::path::RepoPath;
 use crate::repo::refs::{RefError, Refs};
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use crate::repo::{Repository, db};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use crate::repo::object::mode::Mode;
 use crate::repo::os::{FileKind, StatNode};
 
@@ -44,8 +44,20 @@ pub(crate) struct Change {
 #[derive(Default)]
 pub(crate) struct Report {
     head_entries: HashMap<RepoPath, ([u8; 20], Mode)>,
-    stats: BTreeMap<RepoPath, StatNode>,
-    pub(crate) untracked: BTreeSet<RepoPath>,
+    // HashMap is enough for stats, we never care about order, we use it when we check index against
+    // workspace by making get() calls
+    stats: HashMap<RepoPath, StatNode>,
+    // we need to know the type of file because we want to display untracked dirs with a trailing
+    // slash, a/b -> a/b/.
+    // If we used a Map because this is the only place where we actually include directories in the
+    // output we need to follow Git's rule with the trailing slash. When we add the RepoPath, the 
+    // relative root to dir path does not include the trailing slash, which means we need to walk 
+    // the map create a new iterator where for dir's we append the trailing slash, sort that and then
+    // use the result to print. Map does nothing. Instead we use a vec apply the rules before printing
+    // and we sort once.
+    pub(crate) untracked: Vec<(RepoPath, FileKind)>,
+    // changes always report files, so we never have to consider Git's rules about the trailing slash
+    // for directories. Whatever order we get from, is later used to print the results.
     pub(crate) changes: BTreeMap<RepoPath, Change>,
     pub(crate) refreshes: Vec<(usize, StatNode)>,
 }
@@ -99,20 +111,20 @@ impl Report {
         index: &Index,
         prefix: &RepoPath,
     ) -> Result<(), WorkspaceError> {
-        for (path, stat) in workspace.dir_entries(prefix)? {
+        for (path, node) in workspace.dir_entries(prefix)? {
             if index.is_tracked(&path) {
-                if stat.kind == FileKind::Directory {
+                if node.kind == FileKind::Directory {
                     // found a dir that contains at least 1 index entry, we recurse
                     self.scan_workspace(workspace, index, &path)?;
                 } else {
                     // tracked file, pending to see if it is actually different from the Index Entry
-                    self.stats.insert(path, stat);
+                    self.stats.insert(path, node);
                 }
             // for an untracked path to be shown in the report it must be either a file or a
             // non-empty directory. We will show untracked directories that actually contain
             // at least 1 file. An empty-directory contains no file to actually add in the index.
-            } else if workspace.contains_trackable_file(&path, &stat.kind)? {
-                self.untracked.insert(path);
+            } else if workspace.contains_trackable_file(&path, &node.kind)? {
+                self.untracked.push((path, node.kind));
             }
             // we never descend into an empty directory
         }
@@ -166,7 +178,13 @@ impl Report {
                     // it should be foo\bar\baz. We have to create a platform specific Path from
                     // those bytes.
                     // TODO: the prefixed \\?\ paths on Windows, handle this unwrap()
-                    let content = workspace.read_file(&entry.path)?;
+                    // if we blindly called fs::read_file(), for symlinks we would follow the path and return
+                    // the target's content which is not what we store in the blob.
+                    let content = if entry.mode.is_symlink() {
+                        workspace.read_link(&entry.path)?
+                    } else {
+                        workspace.read_file(&entry.path)?
+                    };
                     if db::hash(b"blob", &content) != entry.oid {
                         self.changes
                             .entry(entry.path.clone())

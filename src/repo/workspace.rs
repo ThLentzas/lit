@@ -1,8 +1,8 @@
 use crate::repo::os;
+use crate::repo::os::{FileKind, OsError, StatNode};
 use crate::repo::path::RepoPath;
 use std::path::{Path, PathBuf};
 use std::{env, fs, io};
-use crate::repo::os::{FileKind, OsError, StatNode};
 
 // root relative path -> fs calls
 //
@@ -17,7 +17,7 @@ pub(crate) struct Workspace {
 impl Workspace {
     // resolves cwd path to root relative path
     //
-    // prefix refers to the path from the repository to the cwd
+    // prefix refers to the path from root to the cwd
     //
     // user provided path = main.rs
     // root = /repo
@@ -25,7 +25,7 @@ impl Workspace {
     // prefix = src
     //
     // we need the prefix to later compute repo relative paths
-    // if cwd = root then prefix is ""
+    // if cwd is root then prefix is ""
     pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
         let cwd = env::current_dir().map_err(|err| WorkspaceError::CurrentDir { err })?;
 
@@ -41,8 +41,8 @@ impl Workspace {
             path: absolute,
             source: err,
         })?;
-        
-        Ok(os::name_as_bytes(path.as_os_str())?)
+
+        Ok(os::os_str_as_bytes(path.as_os_str())?)
     }
 
     pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
@@ -56,13 +56,13 @@ impl Workspace {
 
     pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, WorkspaceError> {
         let absolute = self.to_absolute(path)?;
-        
+
         Ok(os::stat(&absolute)?)
     }
 
     // returns all entries of a directory pointed by the path
-    // This approach returns a flat list, and it is up to the caller if they want to recurse for
-    // subdirectories
+    // This approach returns a list of all entries that live under path, it is up to the caller if 
+    // they want to recurse for subdirectories
     pub(crate) fn dir_entries(
         &self,
         path: &RepoPath,
@@ -101,7 +101,7 @@ impl Workspace {
             if name == ".lit" || name == ".git" || name == "target" {
                 continue;
             }
-            let bytes = os::name_as_bytes(&name)?;
+            let bytes = os::os_str_as_bytes(&name)?;
             // the root relative path of each entry is the root relative path of the parent + the
             // entry's name
             let child = path.join(&bytes);
@@ -144,7 +144,7 @@ pub(crate) enum WorkspaceError {
     CurrentDir { err: io::Error },
     Io { path: PathBuf, source: io::Error },
     OutsideRepository { path: PathBuf },
-    Os(OsError)
+    Os(OsError),
 }
 
 impl From<OsError> for WorkspaceError {

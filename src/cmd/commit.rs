@@ -1,42 +1,48 @@
 use crate::hex;
 use crate::repo::config::{Config, ConfigError};
-use crate::repo::db::{Database, DbError};
+use crate::repo::db::{self, Database, DbError};
 use crate::repo::index::{Index, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
-use crate::repo::object::{Object, Signature, SignatureError};
+use crate::repo::object::mode::Mode;
+use crate::repo::object::{self, Object, Signature, SignatureError};
 use crate::repo::refs::{RefError, Refs};
-use crate::repo::{object, Repository, RepoError, db};
 use crate::repo::tree::Tree;
 use crate::repo::workspace::{Workspace, WorkspaceError};
+use crate::repo::{RepoError, Repository};
 
 pub(crate) struct Commit;
 
 impl Commit {
-    // [master 1b9a196] Done with status, need to test it
-    //  3 files changed, 92 insertions(+), 46 deletions(-)
+    // TODO: [master 1b9a196] Done with status, need to test it 3 files changed, 92 insertions(+),
+    // 46 deletions(-)
     pub(super) fn execute(&self) -> Result<(), CommitError> {
         let repo = Repository::discover()?;
         let db = Database {
             path: repo.db_path(),
         };
-        let workspace = Workspace { root: repo.root.clone() };
-        let refs = Refs { path: repo.refs_path() };
+        let workspace = Workspace {
+            root: repo.root.clone(),
+        };
+        let refs = Refs {
+            path: repo.refs_path(),
+        };
         let mut index = Index::new(repo.index_path());
         // this is the same optimistic approach Git follows with status. For a tracked file by index
         // in the workspace if any metadata have changed, it updates the corresponding index entry.
         // it is explained in more detailed in report::Report::scan_against_workspace()
-        // TODO: when we implement the cache tree for Index we need to check this again.
+        //
+        // the refresh is optional if for whatever reason we fail to acquire the lock we still want
+        // to commit our changes.
         let lock = match Lockfile::acquire(&index.path) {
             Ok(lock) => Some(lock),
-            Err(LockfileError::LockDenied { .. }) => None,
-            Err(err) => return Err(CommitError::Lockfile(err)),
+            Err(_) => None,
         };
+
         index.load()?;
         if let Some(lock) = lock {
-            Self::index_background_refreshing(&mut index, lock, &workspace)?;
+            index_background_refreshing(&mut index, lock, &workspace)?;
         }
-
-        // need to rethink how this load() is called because now load() is called without
+        // TODO: need to rethink how this load() is called because now load() is called without
         // knowing if Signature will actually read the info from config or env
         let mut config = Config::new(repo.config_path());
         config.load()?;
@@ -57,35 +63,50 @@ impl Commit {
         })?;
         Ok(())
     }
+}
+fn index_background_refreshing(
+    index: &mut Index,
+    mut lock: Lockfile,
+    workspace: &Workspace,
+) -> Result<(), CommitError> {
+    let mut refreshes = Vec::new();
 
-    fn index_background_refreshing(
-        index: &mut Index,
-        mut lock: Lockfile,
-        workspace: &Workspace) -> Result<(), CommitError> {
-        let mut refreshes = Vec::new();
-
-        for(i, entry) in index.entries.iter().enumerate() {
-            let ws_stat = workspace.stat(&entry.path)?;
-            if !entry.times_match(&ws_stat.stat) {
-                let content = workspace.read_file(&entry.path)?;
-                if db::hash(b"blob", &content) == entry.oid {
-                    refreshes.push((i, ws_stat));
-                }
-            }
+    for (i, entry) in index.entries.iter().enumerate() {
+        let node = match workspace.stat(&entry.path) {
+            Ok(node) => node,
+            Err(_) => continue,
+        };
+        let mode = Mode::try_from(node.kind).map_or(true, |mode| entry.mode != mode);
+        // different size/mode -> modified
+        if entry.stat.file_size != node.stat.file_size || mode {
+            continue;
         }
 
-        if refreshes.is_empty() {
-            drop(lock);
-        } else {
-            for(i, node) in refreshes {
-                index.refresh_entry_stat(i, node.stat);
+        if !entry.times_match(&node.stat) {
+            // if we blindly called fs::read_file(), for symlinks we would follow the path and return
+            // the target's content which is not what we store in the blob.
+            let content = if entry.mode.is_symlink() {
+                workspace.read_link(&entry.path)?
+            } else {
+                workspace.read_file(&entry.path)?
+            };
+            if db::hash(b"blob", &content) == entry.oid {
+                refreshes.push((i, node.stat));
             }
-            lock.write(&index.serialize())?;
-            lock.commit()?;
         }
-
-        Ok(())
     }
+
+    if refreshes.is_empty() {
+        drop(lock);
+    } else {
+        for (i, stat) in refreshes {
+            index.refresh_entry_stat(i, stat);
+        }
+        lock.write(&index.serialize())?;
+        lock.commit()?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -97,12 +118,13 @@ pub(super) enum CommitError {
     Lockfile(LockfileError),
     RefError(RefError),
     Signature(SignatureError),
-    Config(ConfigError)
+    Config(ConfigError),
 }
 
-
 impl From<RepoError> for CommitError {
-    fn from(err: RepoError) -> Self { CommitError::Repo(err) }
+    fn from(err: RepoError) -> Self {
+        CommitError::Repo(err)
+    }
 }
 
 impl From<WorkspaceError> for CommitError {

@@ -35,19 +35,14 @@ impl Status {
         // When status is called Git tries to acquire the lock for index because it does something
         // called Background Refresh: https://git-scm.com/docs/git-status#_background_refresh
         //
-        // If it fails to acquire the lock though, it does not error, it still reports changes but
-        // never updates the index.
+        // the refresh is optional if for whatever reason we fail to acquire the lock we still want
+        // to report the changes.
         let lock = match Lockfile::acquire(&index.path) {
             Ok(lock) => Some(lock),
-            // don't try to do Err(e) if e == LockfileError::LockDenied .. won't work because io::Error
-            // does not impl PartialEq. LockfileError is an Enum not a struct like io::Error where
-            // we had to check against err.kind
-            Err(LockfileError::LockDenied { .. }) => None,
-            // TODO: should we keep going if we fail to acquire the lock due to io::Error?
-            Err(err) => return Err(StatusError::from(err)),
+            Err(_) => None,
         };
         index.load()?;
-        let report = Report::generate(&repo, &mut index)?;
+        let report = Report::generate(&repo, &index)?;
 
         if let Some(mut lockfile) = lock {
             if !report.refreshes.is_empty() {

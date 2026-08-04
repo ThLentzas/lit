@@ -9,8 +9,9 @@ pub(crate) struct Init {
 }
 
 impl Init {
-    // toDo: maybe those two methods could be one like command::init() since we don't really need state?
-    // we want to set the path to always be absolute, toDo: Read the Chapter for init on why
+    // TODO: maybe those two methods could be one like command::init() since we don't really need state?
+    // we want to set the path to always be absolute, 
+    // TODO: Read the Chapter for init on why
     // join() if the second path is absolute, it replaces the first entirely, else it gets appended.
     // lit init: creates .lit in the cwd
     // lit init /home/thanos/projects/1: works fine it is already an absolute path
@@ -42,8 +43,8 @@ impl Init {
         // safe to call create_dir_all() in existing dirs, it will return without touching them
         fs::create_dir_all(&objects).map_err(|err| Self::io_error(&objects, err))?;
         fs::create_dir_all(&refs).map_err(|err| Self::io_error(&refs, err))?;
-        // toDo: At this point we need to some setup for template files
-        // toDo: one such case is to create the config file with the core section [core]
+        // TODO: At this point we need to some setup for template files
+        // TODO: one such case is to create the config file with the core section [core]
 
         if reinit {
             println!("Reinitialized existing Lit repository in {}", lit_dir.display());

@@ -1,11 +1,11 @@
+use crate::repo::config::parse::{LineKind, LineParser, ParseError};
+use crate::repo::os;
 use std::collections::HashMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use crate::repo::config::parse::{LineKind, LineParser, ParseError};
-use crate::repo::os;
 
 pub(super) mod parse;
 
@@ -20,7 +20,7 @@ struct Line {
     kind: LineKind,
 }
 
-// toDo: global, system, Read Chapter 25.2.3 and 25.3
+// TODO: global, system, Read Chapter 25.2.3 and 25.3
 pub(crate) struct Config {
     local: PathBuf,
     // the buffer we read into
@@ -40,15 +40,22 @@ impl Config {
         }
     }
 
-    // toDo: for now we return a slice which is tied to self which is fine for the case where we
+    // TODO: for now we return a slice which is tied to self which is fine for the case where we
     // retrieve the use info since it will be stored to commit and commit owns the data. In the future,
     // when we make this method returns values based on the --config we need to decode the actual
     // variable value and return owned data.
     // key = "a" b "c" -> should map to a b c
     //
+    // The api for retrieving values is designed as follows:
+    //  - when config is invoked as a command with get what we return is always a byte slice. The
+    //  returned value is then displayed with the same logic as status.
+    //  - when other commands need values from config it is up to the caller to invoke one of the
+    //  typed functions based on their requirements. For example, commit needs the user's information
+    //  which it can get from .config. In this case, the caller invokes get_str() because name/email
+    //  are human readable.
+    //
     // name is an &OsStr because subsection can contain pretty much anything
-    // TODO: maybe we need to apply some stricter rules for what is allowed in subsection
-    pub(crate) fn get(&self, name: &OsStr) -> Option<&[u8]> {
+    pub(crate) fn get(&self, name: &OsStr) -> Option<Option<&[u8]>> {
         let key = ConfigKey::from_name(name)?;
         let line_index = self.index.get(&key)?.last()?;
         let line = &self.lines[*line_index];
@@ -58,9 +65,27 @@ impl Config {
         };
 
         match value {
-            Some(span) => Some(&self.buf[span.start..span.end]),
-            // valueless boolean defaults to true
-            None => Some(b"true"),
+            Some(span) => Some(Some(&self.buf[span.start..span.end])),
+            // valueless boolean
+            None => Some(None),
+        }
+    }
+
+    pub(crate) fn get_str(&self, name: &OsStr) -> Result<Option<&str>, ConfigError> {
+        match self.get(name) {
+            // valueless boolean
+            Some(None) => Err(ConfigError::MissingValue {
+                name: name.to_os_string(),
+            }),
+            Some(Some(bytes)) => {
+                str::from_utf8(bytes)
+                    .map(Some)
+                    .map_err(|_| ConfigError::NotUnicode {
+                        key: name.to_os_string(),
+                        value: bytes.to_vec(),
+                    })
+            }
+            None => Ok(None),
         }
     }
 
@@ -123,7 +148,8 @@ impl Config {
             // each span represents the boundaries of each logical line which is the result of applying
             // the continuation rules in a physical line.
             let span = Span { start, end };
-            let kind = self.classify(&span)
+            let kind = self
+                .classify(&span)
                 // we can't pass self.lines.len() + 1 because that would result in the logical lines
                 // physical lines != logical lines
                 // the user sees the physical lines of the file
@@ -229,12 +255,12 @@ impl ConfigKey {
     // For now, we mimic the behavior where name is everything past the last dot. Section is everything
     // up to the first dot, the rest is the subsection. If there is only one '.', it's always section-name
     fn from_name(name: &OsStr) -> Option<Self> {
-        let bytes = os::name_as_bytes(name).unwrap();
+        let bytes = os::os_str_as_bytes(name).ok()?;
         // rposition finds '.' starting from the back
         let pos = bytes.iter().rposition(|&b| b == b'.')?;
         let header = &bytes[..pos];
         let name = &bytes[pos + 1..];
-        
+
         if header.is_empty() || name.is_empty() {
             return None;
         }
@@ -249,7 +275,7 @@ impl ConfigKey {
                         return None;
                     }
                     (section, Some(subsection))
-                },
+                }
                 None => (header, None),
             };
 
@@ -265,6 +291,7 @@ impl ConfigKey {
     }
 }
 
+// TODO: prefix try typically returns a Result, change the name
 fn try_downcase(buf: &[u8]) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(buf.len());
 
@@ -285,7 +312,9 @@ fn downcase(buf: &[u8]) -> Vec<u8> {
 #[derive(Debug)]
 pub(crate) enum ConfigError {
     Io { path: PathBuf, source: io::Error },
-    // toDo: display the unexpected byte value as hex, git shows bad config line 1. We can provide
-    // toDo: a message with more information such as the actual reason and the offset within the line
-    InvalidFormat { line: usize, source: ParseError}
+    // TODO: display the unexpected byte value as hex, git shows bad config line 1. We can provide
+    // TODO: a message with more information such as the actual reason and the offset within the line
+    InvalidFormat { line: usize, source: ParseError },
+    MissingValue { name: OsString },
+    NotUnicode { key: OsString, value: Vec<u8> },
 }

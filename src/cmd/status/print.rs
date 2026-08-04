@@ -1,12 +1,12 @@
-use std::borrow::Cow;
-use std::io::{self, IsTerminal, Write};
 use crate::cmd::status::Format;
+use crate::repo::os::FileKind;
 use crate::repo::path::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
+use std::borrow::Cow;
+use std::io::{self, IsTerminal, Write};
 
 // TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;
-
 
 // let mut name = path;
 // // for the a/b relative to root path we display it as a/b/ only if it is a dir
@@ -70,7 +70,6 @@ pub(super) fn print(report: &Report, format: Format) -> io::Result<()> {
     match format {
         Format::Short => print_short(report),
         Format::Long => print_long(report),
-
     }
 }
 
@@ -80,32 +79,33 @@ fn print_short(_report: &Report) -> io::Result<()> {
 
 fn print_long(report: &Report) -> io::Result<()> {
     let mut writer = io::stdout().lock();
-    let staged = report.changes
+    let staged = report.changes.iter().filter_map(|(path, change)| {
+        change.head_index.as_ref().map(|ch| {
+            let label = match ch {
+                HeadIndexChange::ADDED => "new file:",
+                HeadIndexChange::MODIFIED => "modified:",
+                HeadIndexChange::DELETED => "deleted:",
+            };
+            (path.as_bytes(), label)
+        })
+    });
+    let unstaged = report.changes.iter().filter_map(|(path, change)| {
+        change.workspace_index.as_ref().map(|ch| {
+            let label = match ch {
+                WorkspaceIndexChange::MODIFIED => "modified:",
+                WorkspaceIndexChange::DELETED => "deleted:",
+            };
+            (path.as_bytes(), label)
+        })
+    });
+
+    let mut untracked: Vec<Vec<u8>> = report
+        .untracked
         .iter()
-        .filter_map(|(path, change)| {
-            change.head_index.as_ref().map(|ch| {
-                let label = match ch {
-                    HeadIndexChange::ADDED => "new file:",
-                    HeadIndexChange::MODIFIED => "modified:",
-                    HeadIndexChange::DELETED => "deleted:",
-                };
-                (path, label)
-            })
-        });
-    let unstaged = report.changes
-        .iter()
-        .filter_map(|(path, change)| {
-            change.workspace_index.as_ref().map(|ch| {
-                let label = match ch {
-                    WorkspaceIndexChange::MODIFIED => "modified:",
-                    WorkspaceIndexChange::DELETED => "deleted:",
-                };
-                (path, label)
-            })
-        });
-    let untracked = report.untracked
-        .iter()
-        .map(|p| (p, ""));
+        .map(|(path, kind)| display_name(path, kind))
+        .collect();
+    untracked.sort();
+    let untracked = untracked.iter().map(|p| (p.as_slice(), ""));
 
     print_section(
         "Changes to be committed",
@@ -135,7 +135,7 @@ fn print_section<'a, Iter, Writer>(
     out: &mut Writer,
 ) -> io::Result<()>
 where
-    Iter: Iterator<Item = (&'a RepoPath, &'static str)>,
+    Iter: Iterator<Item = (&'a [u8], &'static str)>,
     Writer: Write,
 {
     let mut changes = changes.peekable();
@@ -152,7 +152,7 @@ where
         if !label.is_empty() {
             write!(out, "{label:<LABEL_WIDTH$}")?;
         }
-        out.write_all(&stdout_bytes(path.as_bytes()))?;
+        out.write_all(&stdout_bytes(path))?;
         style.end(out)?;
         out.write_all(b"\n")?;
     }
@@ -200,4 +200,13 @@ fn needs_quoting(b: u8) -> bool {
         || b >= 0x80 // non-ASCII, valid UTF-8 or not
         || b == b'"'
         || b == b'\\'
+}
+
+// sounds like we print something, but we actually get the name we will display in print()
+fn display_name(path: &RepoPath, kind: &FileKind) -> Vec<u8> {
+    let mut bytes = path.as_bytes().to_vec();
+    if *kind == FileKind::Directory {
+        bytes.push(b'/');
+    }
+    bytes
 }

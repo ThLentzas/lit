@@ -14,7 +14,7 @@ pub(super) struct Timestamp {
 }
 
 impl Timestamp {
-    // toDo: fow now the date for commit is generated at every new commit. In the future when we add
+    // TODO: fow now the date for commit is generated at every new commit. In the future when we add
     // support for Date formats we will adjust the logic.
     // https://git-scm.com/docs/git-commit#_date_formats
     pub(super) fn now() -> Self {

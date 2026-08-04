@@ -25,7 +25,7 @@ impl Mode {
     pub(crate) fn is_directory(self) -> bool {
         matches!(self, Self::Directory)
     }
-    
+
     pub(crate) fn from_raw(value: u32) -> Option<Self> {
         match value {
             0o100644 => Some(Mode::Regular),
@@ -43,7 +43,8 @@ impl Mode {
             Mode::Regular => b"100644",
             Mode::Executable => b"100755",
             Mode::Symlink => b"120000",
-            Mode::Directory => b"040000",
+            // it is stored without the leading 0, but it is displayed as 040000
+            Mode::Directory => b"40000",
         }
     }
 }

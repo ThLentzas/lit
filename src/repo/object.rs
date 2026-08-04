@@ -1,24 +1,25 @@
-use std::env::{self, VarError};
-use std::ffi::OsString;
-use crate::repo::config::Config;
+use crate::repo::config::{Config, ConfigError};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::parse::ParseError;
 use crate::repo::timestamp::Timestamp;
+use std::env::{self, VarError};
+use std::ffi::OsString;
 
-mod parse;
 pub(crate) mod mode;
+mod parse;
 
-pub(super) struct Entry {
+pub(crate) struct Entry {
     pub(super) mode: Mode,
     // read the notes "Filenames"
     pub(super) name: Vec<u8>,
+    // TODO: should this be a type?
     pub(super) oid: [u8; 20],
 }
 
 pub(crate) enum Object {
     Blob(Vec<u8>),
     Tree(Vec<Entry>),
-    Commit(Commit)
+    Commit(Commit),
 }
 
 impl Object {
@@ -117,85 +118,120 @@ pub(crate) struct Commit {
     pub(crate) root_id: String,
 }
 
-#[derive(Debug)]
-pub(crate) enum SignatureError {
-    NotFound(& 'static str),
-    NotUnicode(OsString),
-}
-
 // https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
 pub(crate) struct Signature {
     pub(super) email: String,
     pub(super) name: String,
-    pub(super) timestamp: Timestamp
+    pub(super) timestamp: Timestamp,
 }
 
 impl Signature {
     pub(crate) fn author(config: &Config) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_AUTHOR_NAME") {
-            Ok(s) => s,
+            Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => {
-                    // toDo: enforce in config that variables are always utf8 valid seq
-                    let name = config.get("author.name".as_ref())
-                        .or_else(|| config.get("user.name".as_ref()))
-                        .ok_or(SignatureError::NotFound("author name"))?;
-                    unsafe { String::from_utf8_unchecked(name.to_vec()) }
+                VarError::NotPresent => match config.get_str("author.name".as_ref())? {
+                    Some(name) => name,
+                    None => config
+                        .get_str("user.name".as_ref())?
+                        .ok_or(SignatureError::NotFound("author name"))?,
                 },
-                // write!(f, "environment variable was not valid unicode: {:?}", s)
-                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotUnicode(s) => {
+                    return Err(SignatureError::EnvNotUnicode {
+                        var: "GIT_AUTHOR_NAME",
+                        value: s,
+                    });
+                }
             }
+            .to_owned(),
         };
 
         let email = match env::var("GIT_AUTHOR_EMAIL") {
-            Ok(s) => s,
+            Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => {
-                    // toDo: enforce in config that variables are always utf8 valid seq
-                    let email = config.get("author.email".as_ref())
-                        .or_else(|| config.get("user.email".as_ref()))
-                        .ok_or(SignatureError::NotFound("author email"))?;
-                    unsafe { String::from_utf8_unchecked(email.to_vec()) }
+                VarError::NotPresent => match config.get_str("author.email".as_ref())? {
+                    Some(name) => name,
+                    None => config
+                        .get_str("user.email".as_ref())?
+                        .ok_or(SignatureError::NotFound("author email"))?,
                 },
-                // write!(f, "environment variable was not valid unicode: {:?}", s)
-                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotUnicode(s) => {
+                    return Err(SignatureError::EnvNotUnicode {
+                        var: "GIT_AUTHOR_EMAIL",
+                        value: s,
+                    });
+                }
             }
+            .to_owned(),
         };
 
-        Ok(Self { name, email, timestamp: Timestamp::now() })
+        Ok(Self {
+            name,
+            email,
+            timestamp: Timestamp::now(),
+        })
     }
 
     pub(crate) fn committer(config: &Config) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_COMMITTER_NAME") {
-            Ok(s) => s,
+            Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => {
-                    // toDo: enforce in config that variables are always utf8 valid seq
-                    let name = config.get("committer.name".as_ref())
-                        .or_else(|| config.get("user.name".as_ref()))
-                        .ok_or(SignatureError::NotFound("committer name"))?;
-                    unsafe { String::from_utf8_unchecked(name.to_vec()) }
+                VarError::NotPresent => match config.get_str("committer.name".as_ref())? {
+                    Some(name) => name,
+                    None => config
+                        .get_str("user.name".as_ref())?
+                        .ok_or(SignatureError::NotFound("committer name"))?,
                 },
-                // write!(f, "environment variable was not valid unicode: {:?}", s)
-                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotUnicode(s) => {
+                    return Err(SignatureError::EnvNotUnicode {
+                        var: "GIT_COMMITTER_NAME",
+                        value: s,
+                    });
+                }
             }
+            .to_owned(),
         };
 
         let email = match env::var("GIT_COMMITTER_EMAIL") {
-            Ok(s) => s,
+            Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => {
-                    // toDo: enforce in config that variables are always utf8 valid seq
-                    let email = config.get("committer.email".as_ref())
-                        .or_else(|| config.get("user.email".as_ref()))
-                        .ok_or(SignatureError::NotFound("committer email"))?;
-                    unsafe { String::from_utf8_unchecked(email.to_vec()) }
+                VarError::NotPresent => match config.get_str("committer.email".as_ref())? {
+                    Some(name) => name,
+                    None => config
+                        .get_str("user.email".as_ref())?
+                        .ok_or(SignatureError::NotFound("committer email"))?,
                 },
-                // write!(f, "environment variable was not valid unicode: {:?}", s)
-                VarError::NotUnicode(s) => return Err(SignatureError::NotUnicode(s))
+                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotUnicode(s) => {
+                    return Err(SignatureError::EnvNotUnicode {
+                        var: "GIT_COMMITTER_NAME",
+                        value: s,
+                    });
+                }
             }
+            .to_owned(),
         };
 
-        Ok(Self { name, email, timestamp: Timestamp::now() })
+        Ok(Self {
+            name,
+            email,
+            timestamp: Timestamp::now(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SignatureError {
+    NotFound(&'static str),
+    EnvNotUnicode { var: &'static str, value: OsString },
+    ConfigError(ConfigError),
+}
+
+impl From<ConfigError> for SignatureError {
+    fn from(err: ConfigError) -> Self {
+        SignatureError::ConfigError(err)
     }
 }

@@ -29,7 +29,7 @@ impl RepoPath {
     pub(crate) fn new() -> Self {
         Self::default()
     }
-    
+
     pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self, PathError> {
         if bytes.is_empty() {
             return Err(PathError::Empty);
@@ -62,19 +62,19 @@ impl RepoPath {
         }
         let mut inner = Vec::with_capacity(bytes.len());
         inner.extend_from_slice(bytes);
-        
+
         Ok(RepoPath { inner })
     }
 
     // we need to assert that bytes are not empty, do not contain '/' at the start or end and no NUL
     // byte
-    pub(super) fn join(&self, bytes: &[u8]) -> Self {
-        let mut inner = Vec::with_capacity(self.inner.len() + 1 + bytes.len());
+    pub(super) fn join(&self, component: &[u8]) -> Self {
+        let mut inner = Vec::with_capacity(self.inner.len() + 1 + component.len());
         inner.extend_from_slice(&self.inner);
         if !self.inner.is_empty() {
             inner.push(b'/');
         }
-        inner.extend_from_slice(bytes);
+        inner.extend_from_slice(component);
 
         RepoPath { inner }
     }

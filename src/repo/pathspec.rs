@@ -3,10 +3,11 @@ use std::path::{Component, Path, PathBuf};
 use crate::repo::os;
 use crate::repo::path::RepoPath;
 
-// toDo: add magic support
+// toDo: add magic support, what is known as glob
 // the set of paths certain commands should operate on
 #[derive(Debug)]
 pub(crate) struct Pathspec {
+    pub(crate) original: OsString,
     pub(crate) pattern: RepoPath,
 }
 
@@ -44,7 +45,7 @@ impl Pathspec {
         for component in normalized.components() {
             // can't call map_err() inside the loop because it thinks that we try to move Err at
             // each iteration after it has already being moved despite using ? at the end.
-            let name = match os::name_as_bytes(component.as_os_str()) {
+            let name = match os::os_str_as_bytes(component.as_os_str()) {
                 Ok(bytes) => bytes,
                 Err(_) => return Err(PathspecError::NotUnicode { path: normalized })
             };
@@ -54,7 +55,7 @@ impl Pathspec {
             pattern = pattern.join(&name);
         }
 
-        Ok(Self { pattern })
+        Ok(Self { original: arg.to_os_string(), pattern })
     }
 }
 

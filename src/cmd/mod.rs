@@ -19,7 +19,7 @@ pub(super) enum Command {
 }
 
 impl Command {
-    // toDo: error handling
+    // TODO: error handling
     pub(super) fn execute(&mut self) {
         match self {
             Command::Init(cmd) => cmd.execute().unwrap(),

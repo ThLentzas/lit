@@ -8,6 +8,8 @@ use crate::repo::path::RepoPath;
 use crate::repo::pathspec::{Pathspec, PathspecError};
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use crate::repo::{RepoError, Repository};
+use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub(crate) struct Add {
@@ -15,6 +17,8 @@ pub(crate) struct Add {
     pub(crate) paths: Vec<PathBuf>,
 }
 
+// TODO: when we add .litignore support, if a file is already tracked by lit and then added to .litignore
+// we still update it. .litignore rules apply for untracked files.
 impl Add {
     // cwd -> where the user ran the command from
     // root -> directory that owns .lit
@@ -49,52 +53,85 @@ impl Add {
                 let prefix = workspace.prefix()?;
                 Pathspec::new(path.as_os_str(), &prefix, &repo.root)?
             };
-            let mut collector = EntryCollector::new(&workspace, &db, &pathspec.pattern);
-            collector.collect()?;
-            index.add_entries(collector.finish())?;
+
+            let node = match workspace.stat(&pathspec.pattern) {
+                Ok(node) => Some(node),
+                Err(WorkspaceError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    None
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            match node {
+                Some(node) => {
+                    let mut collector =
+                        EntryCollector::new(&workspace, &db, &pathspec.pattern, &index, &node);
+                    collector.collect()?;
+                    index.add_entries(collector.finish())?;
+                }
+                // Case: a deleted file that index used to keep track of
+                //
+                // this is referred to as a stage deletion because index no longer contains the specific
+                // file next time we ran status or commit HEAD will have the file, but index will not
+                None if index.is_tracked(&pathspec.pattern) => {
+                    index.remove(&pathspec.pattern);
+                }
+                None => {
+                    return Err(AddError::NoMatch {
+                        path: pathspec.original,
+                    });
+                }
+            }
         }
         if index.modified {
             lockfile.write(&index.serialize())?;
+            lockfile.commit()?;
         }
-        lockfile.commit()?;
         Ok(())
     }
 }
 
-// it was created to replace the initial approach where we had a single collect() method that did
-// all the work, but we had to pass 5 arguments:
-//  collect_entries(ws: &Workspace, rel: &Path, stat: StatNode, db: &Database, out: &mut Vec<IndexEntry>)
 struct EntryCollector<'a> {
     workspace: &'a Workspace,
     db: &'a Database,
     path: &'a RepoPath,
+    index: &'a Index,
+    node: &'a StatNode,
     entries: Vec<IndexEntry>,
 }
 
 impl<'a> EntryCollector<'a> {
-    fn new(workspace: &'a Workspace, db: &'a Database, path: &'a RepoPath) -> Self {
+    fn new(
+        workspace: &'a Workspace,
+        db: &'a Database,
+        path: &'a RepoPath,
+        index: &'a Index,
+        node: &'a StatNode,
+    ) -> Self {
         Self {
             workspace,
             db,
             path,
+            index,
+            node,
             entries: Vec::new(),
         }
     }
 
-    // standard recursive approach, collect is the function that triggers the recursion with some initial
-    // state
+    // standard recursive approach, collect is the function that triggers the recursion with some
+    // initial state
     fn collect(&mut self) -> Result<(), AddError> {
-        let stat = self.workspace.stat(&self.path)?;
-        self.collect_entries(&self.path, stat)?;
-
-        Ok(())
+        Ok(self.collect_entries(&self.path, &self.node)?)
     }
 
-    fn collect_entries(&mut self, path: &RepoPath, node: StatNode) -> Result<(), AddError> {
+    fn collect_entries(&mut self, path: &RepoPath, node: &StatNode) -> Result<(), AddError> {
         match node.kind {
             FileKind::Regular(_) => {
                 let content = self.workspace.read_file(&path)?;
                 let oid = self.db.store(Object::Blob(content))?;
+                // Safe to unwarp because file kind is regular and has a corresponding Mode
                 let mode = Mode::try_from(node.kind).unwrap();
                 self.entries
                     .push(IndexEntry::new(path.clone(), oid, mode, node.stat));
@@ -104,7 +141,7 @@ impl<'a> EntryCollector<'a> {
                 // the content of the blob is the target path as bytes
                 // the file size is the length of the above sequence
                 //
-                // if the user deletes target, then we have a dangling reference which is allowed. 
+                // if the user deletes target, then we have a dangling reference which is allowed.
                 // It's up to the user to remove the symlink
                 //
                 // TODO: Test the following cases
@@ -119,6 +156,7 @@ impl<'a> EntryCollector<'a> {
                 // correct, can't have different size but identical hashes.
                 let content = self.workspace.read_link(&path)?;
                 let oid = self.db.store(Object::Blob(content))?;
+                // Safe to unwarp because file kind is symlink and has a corresponding Mode
                 let mode = Mode::try_from(node.kind).unwrap();
                 self.entries
                     .push(IndexEntry::new(path.clone(), oid, mode, node.stat));
@@ -126,12 +164,22 @@ impl<'a> EntryCollector<'a> {
             FileKind::Directory => {
                 // TODO: check if the mode returned by stat() contains permission bits
                 // TODO: look at --ignore-errors flag
-                for (path, stat) in self.workspace.dir_entries(&path)? {
-                    self.collect_entries(&path, stat)?;
+                for (path, node) in self.workspace.dir_entries(&path)? {
+                    self.collect_entries(&path, &node)?;
                 }
             }
-            // Unsupported file are silently ignored
-            FileKind::Other => {}
+            FileKind::Other => {
+                // this is the case where a tracked file gets deleted and a new file with the same
+                // name but unsupported type is created. Because the old tracked file and the new
+                // unsupported one have the same name(path) Git refuses to update the Index entry.
+                //
+                // src/foo was a regular tracked file that was deleted and now src/foo is socket, and
+                // we try lit add src/foo it must fail
+                if self.index.contains(path) {
+                    return Err(AddError::UnsupportedFileType);
+                }
+                // Untracked unsupported files are silently ignored
+            }
         }
         Ok(())
     }
@@ -146,9 +194,13 @@ pub(super) enum AddError {
     Repo(RepoError),
     Index(IndexError),
     DbError(DbError),
-    WsError(WorkspaceError),
+    Workspace(WorkspaceError),
     Pathspec(PathspecError),
     Lockfile(LockfileError),
+    // TODO: add the path to the unsupported file
+    UnsupportedFileType,
+    // user provided path verbatim
+    NoMatch { path: OsString },
 }
 
 impl From<RepoError> for AddError {
@@ -177,7 +229,7 @@ impl From<DbError> for AddError {
 
 impl From<WorkspaceError> for AddError {
     fn from(err: WorkspaceError) -> Self {
-        AddError::WsError(err)
+        AddError::Workspace(err)
     }
 }
 

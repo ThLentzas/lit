@@ -72,7 +72,7 @@ impl Index {
     // The exact file is easy as mentioned. For the dir case, we already have the is_parent_path()
     // from resolve_conflicts() we need to find the child entry path. Read lower_bound()
     // This logic handles untracked(non-empty) directories.
-    pub(super) fn is_tracked(&self, path: &RepoPath) -> bool {
+    pub(crate) fn is_tracked(&self, path: &RepoPath) -> bool {
         if self.contains(&path) {
             return true;
         }
@@ -124,10 +124,18 @@ impl Index {
         }
         Ok(())
     }
+    
+    pub(crate) fn remove(&mut self, path: &RepoPath) -> Option<IndexEntry> {
+       match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
+           Ok(index) => Some(self.entries.remove(index)),
+           Err(_) => None,
+       }
+    }
 
     pub(crate) fn refresh_entry_stat(&mut self, index: usize, stat: FileStat) {
         self.entries[index].stat = stat;
     }
+    
 
     pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -281,7 +289,7 @@ impl Index {
             .unwrap_or_else(|pos| pos)
     }
 
-    pub(super) fn contains(&self, path: &RepoPath) -> bool {
+    pub(crate) fn contains(&self, path: &RepoPath) -> bool {
         self.entries
             .binary_search_by(|entry| entry.path.cmp(path))
             .is_ok()
@@ -290,8 +298,8 @@ impl Index {
 
 #[derive(PartialEq, Eq)]
 pub(crate) struct IndexEntry {
-    pub(super) stat: FileStat,
-    pub(super) mode: Mode,
+    pub(crate) stat: FileStat,
+    pub(crate) mode: Mode,
     pub(crate) oid: [u8; 20],
     flags: u16,
     pub(crate) path: RepoPath,
@@ -459,7 +467,6 @@ impl FormatError {
 pub(super) enum FormatErrorKind {
     // TODO: rethink this Eof
     Eof { needed: usize, remaining: usize },
-    InvalidChecksum,
     InvalidSignature,
     EntriesNotSorted,
     EntriesCountMissMatch { actual: usize, expected: usize },
