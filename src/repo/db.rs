@@ -1,5 +1,4 @@
-use crate::hex;
-use crate::repo::object::Object;
+use crate::repo::object::{Object, Oid};
 use crate::repo::object::mode::Mode;
 use crate::repo::path::RepoPath;
 use rand::RngExt;
@@ -15,8 +14,8 @@ pub(crate) struct Database {
 
 // toDo: info and packs files
 impl Database {
-    pub(crate) fn store(&self, object: Object) -> Result<[u8; 20], DbError> {
-        let obj_type = object.obj_type().as_bytes();
+    pub(crate) fn store(&self, object: Object) -> Result<Oid, DbError> {
+        let obj_type = object.obj_type().as_str().as_bytes();
         let content = object.serialize();
         let bytes = encode(obj_type, &content);
         let hash: [u8; 20] = Sha1::digest(&bytes).into();
@@ -28,11 +27,12 @@ impl Database {
         // u8 spans from 0 to 255 which is equivalent to 0x00 - 0xFF
         // both the 20 raw bytes and the 40-character hex string are the same hash. They are two
         // representations of the same 160-bit value
-        let hex = hex::bytes_as_hex(&hash);
+        let oid = unsafe { Oid::from_bytes_unchecked(hash) };
         // the first 2 characters are the name of the folder in /objects, the rest are the name
         // of the file .lit/objects/90/3a71ad300d...
         // the two character split is just to avoid having of thousands of files in one directory,
         // which would slow down file systems
+        let hex = oid.to_hex();
         let parent = self.path.join(&hex[..2]);
         // if the parent dir does not exist, create parent first .lit/objects/90/ before trying to
         // write tmp
@@ -67,7 +67,7 @@ impl Database {
         // TODO: eventually on the rewrite move to 256
         let path = parent.join(&hex[2..]);
         if path.exists() {
-            return Ok(hash);
+            return Ok(oid);
         }
         let tmp_path = parent.join(gen_tmp_name());
         // this will create only the temp file and not any of the parent dir if missing
@@ -88,7 +88,7 @@ impl Database {
                 source: err,
             });
         }
-        Ok(hash)
+        Ok(oid)
     }
 
     // even if someone edits the contents of a blob, we rehash before we try to parse, and it will
@@ -97,11 +97,9 @@ impl Database {
     // make a tree point at it, this will also get caught because of the Merkle's tree nature. we
     // will hash the contents of the tree and it will fail because the hash of the tree is generated
     // by the hash of its children.
-    pub(super) fn load(&self, oid: &str) -> Result<Option<Object>, DbError> {
-        if oid.len() != 40 {
-            return Ok(None);
-        }
-        let path = self.path.join(&oid[..2]).join(&oid[2..]);
+    pub(crate) fn load(&self, oid: &Oid) -> Result<Option<Object>, DbError> {
+        let hex = oid.to_hex();
+        let path = self.path.join(&hex[..2]).join(&hex[2..]);
         let content = match fs::read(&path) {
             Ok(content) => content,
             Err(err)
@@ -121,56 +119,55 @@ impl Database {
         };
 
         let hash: [u8; 20] = Sha1::digest(&bytes).into();
-        let hex = hex::bytes_as_hex(&hash);
-        if hex != oid {
+        if hash != oid.inner() {
             // tampered object: someone opened the file, changed its contents, compressed the new
             // content and wrote back to the file, the hashes do not match
             return Err(DbError::HashMismatch {
                 path,
-                oid: oid.to_owned(),
+                oid: hex,
             });
         }
         // the information from any parsing error that occurs during loading an object is never returned
         // to the user. It means something is wrong with our on-disk format. Bad object with {oid}
         // is all they are going to see. The information is only needed for debugging.
-        Ok(Some(Object::deserialize(&bytes).map_err(|_| {
+        Ok(Some(Object::deserialize(&bytes).map_err(|_err| {
             DbError::BadObject {
-                oid: oid.to_owned(),
+                oid: hex,
             }
         })?))
     }
 
     pub(super) fn load_tree_files(
         &self,
-        tree_oid: &str,
-    ) -> Result<HashMap<RepoPath, ([u8; 20], Mode)>, DbError> {
+        oid: &Oid,
+    ) -> Result<HashMap<RepoPath, (Oid, Mode)>, DbError> {
         let mut files = HashMap::new();
-        self.collect_tree_files(&mut files, &RepoPath::new(), tree_oid)?;
+        self.collect_tree_files(&mut files, &RepoPath::new(), oid)?;
 
         Ok(files)
     }
 
     fn collect_tree_files(
         &self,
-        files: &mut HashMap<RepoPath, ([u8; 20], Mode)>,
+        files: &mut HashMap<RepoPath, (Oid, Mode)>,
         prefix: &RepoPath,
-        tree_oid: &str,
+        oid: &Oid,
     ) -> Result<(), DbError> {
-        let entries = match self.load(tree_oid)? {
+        let entries = match self.load(oid)? {
             Some(Object::Tree(entries)) => entries,
             Some(_) => {
                 return Err(DbError::NotATree {
                     path: prefix.clone(),
                     // to_string() calls String::from() and String::from() calls to_owned().
                     // There is no performance cost in any of them
-                    oid: tree_oid.to_owned(),
+                    oid: oid.to_hex(),
                 });
             }
 
             None => {
                 return Err(DbError::NotFound {
                     path: prefix.clone(),
-                    oid: tree_oid.to_owned(),
+                    oid: oid.to_hex(),
                 });
             }
         };
@@ -183,7 +180,7 @@ impl Database {
             let path = prefix.join(&entry.name);
             if entry.mode.is_directory() {
                 // dfs
-                self.collect_tree_files(files, &path, &hex::bytes_as_hex(&entry.oid))?;
+                self.collect_tree_files(files, &path, &entry.oid)?;
             } else {
                 files.insert(path, (entry.oid, entry.mode));
             }
@@ -192,8 +189,8 @@ impl Database {
     }
 }
 
-pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> [u8; 20] {
-    Sha1::digest(encode(obj_type, content)).into()
+pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> Oid {
+    unsafe { Oid::from_bytes_unchecked(Sha1::digest(encode(obj_type, content)).into()) }
 }
 
 // there is an edge case of a collision where 2 different processes could in theory generate the same

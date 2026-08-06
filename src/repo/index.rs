@@ -2,6 +2,7 @@ mod parse;
 
 use crate::repo::index::parse::Parser;
 use crate::repo::object::mode::Mode;
+use crate::repo::object::{Oid, OidError};
 use crate::repo::os::FileStat;
 use crate::repo::path::RepoPath;
 use sha1::{Digest, Sha1};
@@ -124,25 +125,24 @@ impl Index {
         }
         Ok(())
     }
-    
+
     pub(crate) fn remove(&mut self, path: &RepoPath) -> Option<IndexEntry> {
-       match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
-           Ok(index) => Some(self.entries.remove(index)),
-           Err(_) => None,
-       }
+        match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
+            Ok(index) => Some(self.entries.remove(index)),
+            Err(_) => None,
+        }
     }
 
     pub(crate) fn refresh_entry_stat(&mut self, index: usize, stat: FileStat) {
         self.entries[index].stat = stat;
     }
-    
 
     pub(crate) fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(SIGNATURE.as_bytes());
         bytes.extend_from_slice(&INDEX_VERSION.to_be_bytes());
         bytes.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
-        // toDo: at this point according to the format we are supposed to add Extensions
+        // TODO: at this point according to the format we are supposed to add Extensions
         for entry in self.entries.iter() {
             bytes.extend(entry.serialize());
         }
@@ -225,7 +225,7 @@ impl Index {
                 // if entry.path == last.path, the duplicate is adjacent and caught here
                 // if entry.path < last.path, sort order is broken; any earlier duplicate would also
                 // surface as a non-ascending pair somewhere in the sequence
-                // toDo: address sorting order when we add stage support
+                // TODO: address sorting order when we add stage support
                 if last.path >= entry.path {
                     return Err(FormatError::at(
                         entry_offset,
@@ -234,15 +234,6 @@ impl Index {
                 }
             }
             self.entries.push(entry);
-            if self.entries.len() > count as usize {
-                return Err(FormatError::at(
-                    parser.offset(),
-                    FormatErrorKind::EntriesCountMissMatch {
-                        actual: self.entries.len(),
-                        expected: count as usize,
-                    },
-                ))?;
-            }
         }
 
         if self.entries.len() != count as usize {
@@ -254,6 +245,16 @@ impl Index {
                 },
             ))?;
         }
+        // there are trailing bytes between the last index entry and the checksum
+        if !parser.is_exhausted() {
+            return Err(FormatError::at(
+                parser.offset(),
+                FormatErrorKind::TrailingData {
+                    remaining: parser.remaining(),
+                },
+            ))?;
+        }
+
         Ok(())
     }
 
@@ -300,18 +301,13 @@ impl Index {
 pub(crate) struct IndexEntry {
     pub(crate) stat: FileStat,
     pub(crate) mode: Mode,
-    pub(crate) oid: [u8; 20],
+    pub(crate) oid: Oid,
     flags: u16,
     pub(crate) path: RepoPath,
 }
 
 impl IndexEntry {
-    pub(crate) fn new(
-        path: RepoPath,
-        oid: [u8; 20],
-        mode: Mode,
-        stat: FileStat,
-    ) -> Self {
+    pub(crate) fn new(path: RepoPath, oid: Oid, mode: Mode, stat: FileStat) -> Self {
         // https://git-scm.com/docs/index-format
         // the lowest 12 bits store the name length
         // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
@@ -380,7 +376,7 @@ impl IndexEntry {
         bytes.extend_from_slice(&self.stat.uid.to_be_bytes());
         bytes.extend_from_slice(&self.stat.gid.to_be_bytes());
         bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
-        bytes.extend_from_slice(&self.oid); // in the docs this is called Object name
+        bytes.extend_from_slice(self.oid.as_bytes()); // in the docs this is called Object name
         bytes.extend_from_slice(&self.flags.to_be_bytes());
         bytes.extend_from_slice(&self.path.as_bytes()); // in the docs, is called Entry path name
         // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
@@ -476,6 +472,7 @@ pub(super) enum FormatErrorKind {
     InvalidPadding,
     LongPathLenMissMatch,
     InvalidPathSyntax(PathError),
+    TrailingData { remaining: usize },
 }
 
 impl From<FormatError> for IndexError {

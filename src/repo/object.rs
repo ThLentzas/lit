@@ -8,13 +8,94 @@ use std::ffi::OsString;
 pub(crate) mod mode;
 mod parse;
 
-pub(crate) struct Entry {
-    pub(super) mode: Mode,
-    // read the notes "Filenames"
-    pub(super) name: Vec<u8>,
-    // TODO: should this be a type?
-    pub(super) oid: [u8; 20],
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) struct Oid {
+    inner: [u8; 20],
 }
+
+impl Oid {
+    pub(crate) fn from_bytes(bytes: [u8; 20]) -> Result<Self, OidError> {
+        for (index, &b) in bytes.iter().enumerate() {
+            if !is_hex_digit(b) {
+                return Err(OidError::BadDigit { pos: index, digit: b });
+            }
+        }
+
+        Ok(Self { inner: bytes })
+    }
+
+    pub(crate) unsafe fn from_bytes_unchecked(bytes: [u8; 20]) -> Self {
+        Self { inner: bytes }
+    }
+
+    pub(crate) fn from_hex_bytes(hex: &[u8]) -> Result<Self, OidError> {
+        if hex.len() != 40 {
+            return Err(OidError::BadLength);
+        }
+        let mut inner = [0u8; 20];
+        let mut i = 0;
+
+        for pair in hex.chunks_exact(2) {
+            inner[i] = pair_to_u8(pair.try_into().unwrap()).map_err(|err| OidError::BadDigit {
+                pos: i + err.pos,
+                digit: err.digit,
+            })?;
+            i += 1;
+        }
+        Ok(Self { inner })
+    }
+
+    pub(crate) fn from_hex(hex: &str) -> Result<Self, OidError> {
+        let bytes = hex.as_bytes();
+        Self::from_hex_bytes(bytes)
+    }
+
+    pub(crate) fn to_hex(&self) -> String {
+        self.inner.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 20] {
+        &self.inner
+    }
+    pub(crate) fn inner(&self) -> [u8; 20] {
+        self.inner
+    }
+}
+
+pub(crate) struct Entry {
+    pub(crate) mode: Mode,
+    // read the notes "Filenames"
+    pub(crate) name: Vec<u8>,
+    pub(crate) oid: Oid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectType {
+    Blob,
+    Tree,
+    Commit,
+}
+
+impl ObjectType {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Blob => "blob",
+            Self::Tree => "tree",
+            Self::Commit => "commit",
+        }
+    }
+
+    pub(crate) fn try_from_str(val: &str) -> Option<Self> {
+        match val {
+            "blob" => Some(Self::Blob),
+            "tree" => Some(Self::Tree),
+            "commit" => Some(Self::Commit),
+            _ => None,
+        }
+    }
+}
+
+
 
 pub(crate) enum Object {
     Blob(Vec<u8>),
@@ -23,11 +104,11 @@ pub(crate) enum Object {
 }
 
 impl Object {
-    pub(super) fn obj_type(&self) -> &str {
+    pub(crate) fn obj_type(&self) -> ObjectType {
         match self {
-            Self::Blob(_) => "blob",
-            Self::Tree(_) => "tree",
-            Self::Commit(_) => "commit",
+            Self::Blob(_) => ObjectType::Blob,
+            Self::Tree(_) => ObjectType::Tree,
+            Self::Commit(_) => ObjectType::Commit,
         }
     }
 
@@ -58,7 +139,7 @@ impl Object {
                     bytes.push(b' ');
                     bytes.extend(&entry.name);
                     bytes.push(0);
-                    bytes.extend_from_slice(&entry.oid);
+                    bytes.extend_from_slice(entry.oid.as_bytes());
                 }
                 bytes
             }
@@ -76,11 +157,11 @@ impl Object {
                 // TODO: can we clean this up using write!()?
                 let mut bytes = Vec::new();
                 bytes.extend_from_slice(b"tree ");
-                bytes.extend_from_slice(commit.root_id.as_bytes());
+                bytes.extend_from_slice(commit.root_id.to_hex().as_bytes());
                 bytes.extend_from_slice(b"\n");
-                for parent in &commit.parent {
+                for parent in &commit.parents {
                     bytes.extend_from_slice(b"parent ");
-                    bytes.extend_from_slice(parent.as_bytes());
+                    bytes.extend_from_slice(parent.to_hex().as_bytes());
                     bytes.extend_from_slice(b"\n");
                 }
                 bytes.extend_from_slice(b"author ");
@@ -95,7 +176,7 @@ impl Object {
                 bytes.extend_from_slice(commit.committer.email.as_bytes());
                 bytes.extend_from_slice(b"> ");
                 bytes.extend_from_slice(commit.committer.timestamp.to_string().as_bytes());
-                bytes.extend_from_slice(b"\n\n<");
+                bytes.extend_from_slice(b"\n\n");
                 bytes.extend_from_slice(commit.message.as_bytes());
                 bytes
             }
@@ -106,7 +187,7 @@ impl Object {
 pub(crate) struct Commit {
     pub(crate) author: Signature,
     pub(crate) committer: Signature,
-    pub(crate) parent: Vec<String>,
+    pub(crate) parents: Vec<Oid>,
     pub(crate) message: String,
     // Everything in a commit is already plain text, the author/committer names and emails, the
     // timestamp, the blank line separator, the message. Using a hex id for the tree reference keeps
@@ -115,14 +196,14 @@ pub(crate) struct Commit {
     // Trees contain many entries. Using 20 raw bytes instead of 40 hex chars saves 50% per id,
     // which adds up significantly. Saving 20 bytes per commit is negligible. Saving 20 bytes per
     // entry in a tree with thousands of entries matters.
-    pub(crate) root_id: String,
+    pub(crate) root_id: Oid,
 }
 
 // https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
 pub(crate) struct Signature {
-    pub(super) email: String,
-    pub(super) name: String,
-    pub(super) timestamp: Timestamp,
+    pub(crate) email: String,
+    pub(crate) name: String,
+    pub(crate) timestamp: Timestamp,
 }
 
 impl Signature {
@@ -234,4 +315,68 @@ impl From<ConfigError> for SignatureError {
     fn from(err: ConfigError) -> Self {
         SignatureError::ConfigError(err)
     }
+}
+
+fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {
+    let first = buf[0];
+    let second = buf[1];
+
+    if !is_hex_digit(first) {
+        return Err(HexError {
+            digit: first,
+            pos: 0,
+        });
+    }
+    if !is_hex_digit(second) {
+        return Err(HexError {
+            digit: second,
+            pos: 1,
+        });
+    }
+
+    let first = to_base10_digit(first);
+    let second = to_base10_digit(second);
+    // there are a lot of ways to write the conversion
+    // This is what we want: second * 16u8.pow(0) + first * 16u8.pow(1) but because 16^0 is always 0
+    // and 16^1 is always 16 we can write as follows first * 16 + second
+    //
+    // 1 byte = [4 high] [4 bits]
+    // because each hex digit is in the 0 - 15 range we can use exactly 4 bits
+    // 'af' -> 'a' = 10 = 1010, 'f' = 15 = 1111, 10101111
+    //
+    // 1011 are the high bits 1111 are the low bits
+    // first << 4 moves first into the high bits and the low bits of the number are all 0s
+    // 'a' as u8 is written as 00001011 with extra padding, shifting 10110000
+    // next we want to set 'f' to the low bits, we use OR
+    // a OR 0 = a
+    // 'f' in u8 is 00001111 so the high bits of 'a' are ORed with 0 so they stay as is and the low
+    // bits of 'a' are 0s which are ORed with the low bits of 'f' and become 'f'
+    Ok((first << 4) | second)
+}
+
+fn to_base10_digit(byte: u8) -> u8 {
+    if byte.is_ascii_digit() {
+        byte - b'0'
+    } else {
+        byte - b'a' + 10
+    }
+}
+
+// we can't use the is_ascii_hex() from std because it includes the capital case letters and Git
+// writes the hash always using lower case letters. Even if they are same in some sense, we have to
+// stay case-sensitive because they produce different hashes when it comes to storing commits.
+fn is_hex_digit(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'9' | b'a'..=b'f')
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OidError {
+    BadDigit { pos: usize, digit: u8 },
+    BadLength,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct HexError {
+    digit: u8,
+    pos: usize,
 }

@@ -1,6 +1,7 @@
 use super::{FormatError, FormatErrorKind, IndexEntry};
 use crate::repo::index;
 use crate::repo::object::mode::Mode;
+use crate::repo::object::Oid;
 use crate::repo::os::FileStat;
 use crate::repo::path::RepoPath;
 
@@ -54,7 +55,14 @@ impl<'a> Parser<'a> {
             ));
         }
 
-        let oid = self.take::<20>()?;
+        let bytes = self.take::<20>()?;
+        // Any [u8; 20] is structurally a valid SHA-1 object id. We actually have to check that each
+        // entry’s oid matches the current contents at entry.path but this integrity check happens at
+        // other levels. Rehashing the workspace during load would incorrectly reject valid index states
+        // The index records the staged version of a path, while the workspace file may have changed
+        // or been deleted since git add. db.load() is such case where the object might be missing, or
+        // we can have a hash mismatch, the object stored under that OID is corrupt or misplaced.
+        let oid = unsafe { Oid::from_bytes_unchecked(*bytes) } ;
         let flags = u16::from_be_bytes(*self.take::<2>()?);
         let path;
         // we extract the lowest 12 bits which is where we stored the path len
@@ -68,7 +76,7 @@ impl<'a> Parser<'a> {
         let size = self.pos - entry_offset;
         self.skip_padding(size)?;
 
-        Ok(IndexEntry::new(path, *oid, mode, stat))
+        Ok(IndexEntry::new(path, oid, mode, stat))
     }
 
     // one of the things that we have to validate is that the path length from flags matches the
@@ -84,7 +92,7 @@ impl<'a> Parser<'a> {
                 self.pos,
                 FormatErrorKind::Eof {
                     needed: path_len,
-                    remaining: self.buf.len().saturating_sub(self.pos),
+                    remaining: self.remaining(),
                 },
             ));
         }
@@ -111,7 +119,7 @@ impl<'a> Parser<'a> {
                     self.pos,
                     FormatErrorKind::Eof {
                         needed: 1,
-                        remaining: self.buf.len().saturating_sub(self.pos),
+                        remaining: self.remaining(),
                     },
                 ));
             }
@@ -216,7 +224,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], FormatError> {
-        let remaining = self.buf.len().saturating_sub(self.pos);
+        let remaining = self.remaining();
 
         let bytes: &[u8; N] =
             self.buf[self.pos..self.pos + N]
@@ -231,5 +239,15 @@ impl<'a> Parser<'a> {
         self.advance(N);
 
         Ok(bytes)
+    }
+
+    pub(super) fn is_exhausted(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    // This would also work if our parser was bug-free self.buf.len().saturating_sub(self.pos) but
+    // using saturating_sub could hide a parser bug where pos accidentally moves beyond the buffer
+    pub(super) fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
     }
 }

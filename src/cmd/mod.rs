@@ -2,8 +2,11 @@ pub(crate) mod init;
 pub(crate) mod add;
 pub(crate) mod commit;
 pub(crate) mod status;
+pub(crate) mod cat_file;
+mod print;
 
 use crate::cmd::add::Add;
+use crate::cmd::cat_file::CatFile;
 use crate::cmd::commit::Commit;
 use crate::cmd::init::Init;
 use crate::cmd::status::Status;
@@ -16,6 +19,7 @@ pub(super) enum Command {
     Add(Add),
     Commit(Commit),
     Status(Status),
+    CatFile(CatFile)
 }
 
 impl Command {
@@ -26,6 +30,7 @@ impl Command {
             Command::Add(cmd) => cmd.execute().unwrap(),
             Command::Commit(cmd) => cmd.execute().unwrap(),
             Command::Status(cmd) => cmd.execute().unwrap(),
+            Command::CatFile(cmd) => cmd.execute().unwrap(),
         }
     }
 }

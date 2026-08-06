@@ -1,11 +1,11 @@
-use std::path::PathBuf;
-use std::{fs, io};
-use crate::hex;
 use crate::repo::db::DbError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
+use crate::repo::object::{Oid, OidError};
+use std::path::PathBuf;
+use std::{fs, io};
 
 pub(crate) struct Refs {
-    pub(crate) path: PathBuf
+    pub(crate) path: PathBuf,
 }
 
 impl Refs {
@@ -53,37 +53,39 @@ impl Refs {
     // to HEAD. Similar logic to the db_path. The database knows where to store the objects
     pub(crate) fn update_head<F>(&self, f: F) -> Result<(), RefError>
     where
-    // For commit there are 6 steps:
-    //
-    // Acquire the lock
-    // Read HEAD (parent OID)
-    // Build the commit object using that parent
-    // Store the commit -> get new OID
-    // Write the new OID to HEAD
-    // Release the lock
-    //
-    // Steps 1, 2, 5, 6 are locking and HEAD operations, they belong in refs.rs. Steps 3 and 4 are
-    // commit-building logic, they belong in command.rs where we know about authors, messages, the database, etc.
-    // But the steps are interleaved. Step 3 needs the result of step 2 (the parent). Step 5 needs
-    // the result of step 4 (the new OID). We can't separate them into two phases like "first do
-    // all the lock stuff, then build the commit" because the data dependencies cross the boundary.
-    //
-    // toDo: revisit this design choice
-    // A solution would be to pass all the logic to construct a commit to update_head() which leads
-    // to bad coupling, refs are responsible for HEAD and refs. With the closure approach we
-    // just provide the behavior once we get access to parent. Could also be an approach where we
-    // return the lock and continue our logic but this will need to change are refs api and lockfile
-    // quite a lot.
-        F: FnOnce(Vec<String>) -> Result<[u8; 20], DbError>,
+        // For commit there are 6 steps:
+        //
+        // Acquire the lock
+        // Read HEAD (parent OID)
+        // Build the commit object using that parent
+        // Store the commit -> get new OID
+        // Write the new OID to HEAD
+        // Release the lock
+        //
+        // Steps 1, 2, 5, 6 are locking and HEAD operations, they belong in refs.rs. Steps 3 and 4 are
+        // commit-building logic, they belong in command.rs where we know about authors, messages, the database, etc.
+        // But the steps are interleaved. Step 3 needs the result of step 2 (the parent). Step 5 needs
+        // the result of step 4 (the new OID). We can't separate them into two phases like "first do
+        // all the lock stuff, then build the commit" because the data dependencies cross the boundary.
+        //
+        // toDo: revisit this design choice
+        // A solution would be to pass all the logic to construct a commit to update_head() which leads
+        // to bad coupling, refs are responsible for HEAD and refs. With the closure approach we
+        // just provide the behavior once we get access to parent. Could also be an approach where we
+        // return the lock and continue our logic but this will need to change are refs api and lockfile
+        // quite a lot.
+        F: FnOnce(Vec<Oid>) -> Result<Oid, DbError>,
     {
         let head_path = self.path.join("HEAD");
         let mut lockfile = Lockfile::acquire(&head_path)?;
         let parent = self.read_head()?;
-        let parent = parent.map_or(Vec::new(), |s| vec![s]);
+        let parent = parent
+            .into_iter()
+            .map(|hex| Oid::from_hex(&hex).map_err(RefError::from))
+            .collect::<Result<Vec<_>, _>>()?;
         let new_id = f(parent)?;
-        let new_id: String = hex::bytes_as_hex(&new_id);
 
-        lockfile.write(new_id.as_bytes())?;
+        lockfile.write(new_id.to_hex().as_bytes())?;
         // lockfile.write("\n".as_bytes());
         lockfile.commit()?;
 
@@ -111,9 +113,9 @@ impl Refs {
 pub(crate) enum RefError {
     Io { path: PathBuf, source: io::Error },
     Lockfile(LockfileError),
-    DbError(DbError)
+    DbError(DbError),
+    OidError(OidError),
 }
-
 
 impl From<LockfileError> for RefError {
     fn from(err: LockfileError) -> Self {
@@ -124,5 +126,11 @@ impl From<LockfileError> for RefError {
 impl From<DbError> for RefError {
     fn from(err: DbError) -> Self {
         RefError::DbError(err)
+    }
+}
+
+impl From<OidError> for RefError {
+    fn from(err: OidError) -> Self {
+        RefError::OidError(err)
     }
 }

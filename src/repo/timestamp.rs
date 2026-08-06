@@ -6,7 +6,7 @@ pub(crate) enum TimestampError {
     BadTimezone,
 }
 
-pub(super) struct Timestamp {
+pub(crate) struct Timestamp {
     // i64 because a Unix timestamp is an offset in seconds from the Unix epoch: 1970-01-01 00:00:00 UTC
     // a negative value means before epoch
     pub(super) unix: i64,
@@ -85,7 +85,7 @@ impl Timestamp {
         }
     }
 
-    pub(super) fn to_string(&self) -> String {
+    pub(crate) fn to_string(&self) -> String {
         // SAFETY: the [u8; 5] is always ASCII
         let timezone = unsafe { String::from_utf8_unchecked(self.timezone.to_vec()) };
         format!("{} {}", self.unix.to_string(), timezone)

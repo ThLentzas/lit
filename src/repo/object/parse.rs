@@ -1,6 +1,5 @@
-use crate::hex::{self, HexError};
-use crate::repo::object::{Commit, Entry, Object, Signature};
 use crate::repo::object::mode::Mode;
+use crate::repo::object::{Commit, Entry, Object, Oid, OidError, Signature};
 use crate::repo::timestamp::{Timestamp, TimestampError};
 
 // Every parser that I wrote so far is a struct and all the parse_* methods are implemented in its
@@ -92,21 +91,6 @@ struct CursorError {
 impl CursorError {
     fn new(offset: usize, kind: CursorErrorKind) -> Self {
         Self { offset, kind }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum OidError {
-    WrongLen { offset: usize, len: usize },
-    BadDigit(HexError),
-}
-
-impl OidError {
-    fn offset(&self) -> usize {
-        match self {
-            OidError::WrongLen { offset, .. } => *offset,
-            OidError::BadDigit(err) => err.pos,
-        }
     }
 }
 
@@ -241,7 +225,7 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
     let buf = cursor
         .read_until(b' ')
         .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::MissingSpace))?;
-    
+
     let mut value = 0u32;
     // this part is tricky, we have the mode as ASCII, something like '100644', we can't just convert
     // it to 100644 in base 10, we need base 8
@@ -291,10 +275,11 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
         .take::<20>()
         .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::TruncatedOid))?;
 
+    let oid = unsafe { Oid::from_bytes_unchecked(*oid) };
     Ok(Entry {
         mode,
         name: name.to_vec(),
-        oid: *oid,
+        oid,
     })
 }
 
@@ -351,17 +336,28 @@ fn parse_commit(cursor: &mut Parser) -> Result<Commit, ParseError> {
             },
         ));
     }
-    let tree = parse_oid(line.value)
-        .map_err(|err| ParseError::new(line.vbase + err.offset(), ParseErrorKind::BadOid(err)))?;
+    let root_id = Oid::from_hex_bytes(line.value).map_err(|err| {
+        let offset = match err {
+            OidError::BadDigit { pos, .. } => line.vbase + pos,
+            OidError::BadLength => line.vbase,
+        };
+        ParseError::new(offset, ParseErrorKind::BadOid(err))
+    })?;
     let mut parents = Vec::new();
     let line = loop {
         let line = parse_header(cursor)?;
         if line.key != b"parent" {
             break line;
         }
-        parents.push(parse_oid(line.value).map_err(|err| {
-            ParseError::new(line.vbase + err.offset(), ParseErrorKind::BadOid(err))
-        })?);
+
+        let parent_oid= Oid::from_hex_bytes(line.value).map_err(|err| {
+            let offset = match err {
+                OidError::BadDigit { pos, .. } => line.vbase + pos,
+                OidError::BadLength => line.vbase,
+            };
+            ParseError::new(offset, ParseErrorKind::BadOid(err))
+        })?;
+        parents.push(parent_oid);
     };
     if line.key != b"author" {
         return Err(ParseError::new(
@@ -412,15 +408,15 @@ fn parse_commit(cursor: &mut Parser) -> Result<Commit, ParseError> {
     })?;
 
     Ok(Commit {
-        root_id: tree,
-        parent: parents,
+        root_id,
+        parents,
         author,
         committer,
         message,
     })
 }
 
-// line.key and line.value live in cursor.buf so they share the same lifetime
+// line.key and line.value live in cursor's buffer so they share the same lifetime
 fn parse_header<'a>(cursor: &mut Parser<'a>) -> Result<Line<'a>, ParseError> {
     let start = cursor.pos;
     let line = cursor
@@ -435,15 +431,6 @@ fn parse_header<'a>(cursor: &mut Parser<'a>) -> Result<Line<'a>, ParseError> {
         value: &line[index + 1..],
         vbase: start + index + 1,
     })
-}
-
-fn parse_oid(buf: &[u8]) -> Result<String, OidError> {
-    let bytes: &[u8; 40] = buf.try_into().map_err(|_| OidError::WrongLen {
-        offset: 0,
-        len: buf.len(),
-    })?;
-
-    Ok(hex::parse_hex(bytes).map_err(OidError::BadDigit)?)
 }
 
 fn parse_signature(buf: &[u8]) -> Result<Signature, SignatureError> {

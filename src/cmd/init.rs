@@ -1,6 +1,6 @@
 use std::{env, fs, io};
 use std::env::Args;
-use std::io::ErrorKind;
+use std::fs::{File, OpenOptions};
 use std::iter::{Peekable, Skip};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +10,7 @@ pub(crate) struct Init {
 
 impl Init {
     // TODO: maybe those two methods could be one like command::init() since we don't really need state?
-    // we want to set the path to always be absolute, 
+    // we want to set the path to always be absolute,
     // TODO: Read the Chapter for init on why
     // join() if the second path is absolute, it replaces the first entirely, else it gets appended.
     // lit init: creates .lit in the cwd
@@ -34,15 +34,27 @@ impl Init {
 
         let reinit = match fs::create_dir(&lit_dir) {
             Ok(_) => false,
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => true,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => true,
             Err(err) => return Err(Self::io_error(&lit_dir, err)),
         };
 
         let objects = lit_dir.join("objects");
         let refs = lit_dir.join("refs");
+        let config = lit_dir.join("config");
         // safe to call create_dir_all() in existing dirs, it will return without touching them
         fs::create_dir_all(&objects).map_err(|err| Self::io_error(&objects, err))?;
         fs::create_dir_all(&refs).map_err(|err| Self::io_error(&refs, err))?;
+        // File::create(&config).map_err(|err| Self::io_error(&config, err))?;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&config)
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(Self::io_error(&config, err)),
+        }
+
         // TODO: At this point we need to some setup for template files
         // TODO: one such case is to create the config file with the core section [core]
 

@@ -1,4 +1,3 @@
-use crate::hex;
 use crate::repo::config::{Config, ConfigError};
 use crate::repo::db::{self, Database, DbError};
 use crate::repo::index::{Index, IndexError};
@@ -50,14 +49,13 @@ impl Commit {
         let committer = Signature::committer(&config)?;
         let tree_id = Tree::from_index(index).write(&db)?;
 
-        refs.update_head(|parent| {
+        refs.update_head(|parents| {
             let commit = object::Commit {
                 author,
-                parent,
+                parents,
                 committer,
-                message: "".to_string(),
-                // convert the [u8, 20] to its hex value
-                root_id: hex::bytes_as_hex(&tree_id),
+                message: "hey".to_string(),
+                root_id: tree_id,
             };
             db.store(Object::Commit(commit))
         })?;

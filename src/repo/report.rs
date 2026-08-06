@@ -1,6 +1,6 @@
 use crate::repo::db::{Database, DbError};
 use crate::repo::index::{Index, IndexEntry};
-use crate::repo::object::Object;
+use crate::repo::object::{Object, Oid, OidError};
 use crate::repo::path::RepoPath;
 use crate::repo::refs::{RefError, Refs};
 use crate::repo::workspace::{Workspace, WorkspaceError};
@@ -43,7 +43,7 @@ pub(crate) struct Change {
 
 #[derive(Default)]
 pub(crate) struct Report {
-    head_entries: HashMap<RepoPath, ([u8; 20], Mode)>,
+    head_entries: HashMap<RepoPath, (Oid, Mode)>,
     // HashMap is enough for stats, we never care about order, we use it when we check index against
     // workspace by making get() calls
     stats: HashMap<RepoPath, StatNode>,
@@ -94,7 +94,7 @@ impl Report {
             return Ok(());
         };
 
-        let commit = match db.load(&head_oid)? {
+        let commit = match db.load(&Oid::from_hex(&head_oid)?)? {
             Some(Object::Commit(commit)) => commit,
             Some(_) => return Err(ReportError::HeadNotACommit { oid: head_oid }),
             // retrieved the oid of HEAD but is missing from db.
@@ -262,6 +262,7 @@ pub(crate) enum ReportError {
     RefError(RefError),
     HeadNotACommit { oid: String },
     HeadCommitNotFound { oid: String },
+    HeadBadOid(OidError)
 }
 
 impl From<WorkspaceError> for ReportError {
@@ -279,5 +280,11 @@ impl From<DbError> for ReportError {
 impl From<RefError> for ReportError {
     fn from(err: RefError) -> Self {
         ReportError::RefError(err)
+    }
+}
+
+impl From<OidError> for ReportError {
+    fn from(err: OidError) -> Self {
+        ReportError::HeadBadOid(err)
     }
 }

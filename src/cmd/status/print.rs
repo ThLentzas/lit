@@ -2,8 +2,8 @@ use crate::cmd::status::Format;
 use crate::repo::os::FileKind;
 use crate::repo::path::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
-use std::borrow::Cow;
 use std::io::{self, IsTerminal, Write};
+use crate::cmd::print;
 
 // TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;
@@ -66,6 +66,7 @@ impl Style {
     }
 }
 
+// TODO: nothing to commit, working tree clean
 pub(super) fn print(report: &Report, format: Format) -> io::Result<()> {
     match format {
         Format::Short => print_short(report),
@@ -79,6 +80,7 @@ fn print_short(_report: &Report) -> io::Result<()> {
 
 fn print_long(report: &Report) -> io::Result<()> {
     let mut writer = io::stdout().lock();
+    
     let staged = report.changes.iter().filter_map(|(path, change)| {
         change.head_index.as_ref().map(|ch| {
             let label = match ch {
@@ -152,54 +154,13 @@ where
         if !label.is_empty() {
             write!(out, "{label:<LABEL_WIDTH$}")?;
         }
-        out.write_all(&stdout_bytes(path))?;
+        out.write_all(&print::stdout_path_bytes(path))?;
         style.end(out)?;
         out.write_all(b"\n")?;
     }
     writeln!(out)?;
 
     Ok(())
-}
-
-fn stdout_bytes(path: &[u8]) -> Cow<'_, [u8]> {
-    if !path.iter().any(|&b| needs_quoting(b)) {
-        return Cow::Borrowed(path);
-    }
-
-    let mut out = Vec::with_capacity(path.len() + 2);
-    out.push(b'"');
-    for &b in path {
-        match b {
-            0x07 => out.extend_from_slice(b"\\a"),
-            0x08 => out.extend_from_slice(b"\\b"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            0x0b => out.extend_from_slice(b"\\v"),
-            0x0c => out.extend_from_slice(b"\\f"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            // printable ASCII stays as is
-            0x20..=0x7e => out.push(b),
-            // everything else remaining controls (incl. ESC 0x1b), DEL, all bytes >= 0x80 become
-            // 3-digit octal
-            _ => {
-                out.push(b'\\');
-                out.push(b'0' + ((b >> 6) & 0o7));
-                out.push(b'0' + ((b >> 3) & 0o7));
-                out.push(b'0' + (b & 0o7));
-            }
-        }
-    }
-    out.push(b'"');
-    Cow::Owned(out)
-}
-
-fn needs_quoting(b: u8) -> bool {
-    b.is_ascii_control() // includes 0x7f
-        || b >= 0x80 // non-ASCII, valid UTF-8 or not
-        || b == b'"'
-        || b == b'\\'
 }
 
 // sounds like we print something, but we actually get the name we will display in print()

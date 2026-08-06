@@ -1,5 +1,4 @@
 pub mod cli;
-pub mod hex;
 pub mod cmd;
 mod repo;
 

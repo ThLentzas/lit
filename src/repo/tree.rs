@@ -1,13 +1,13 @@
 use crate::repo::db::{Database, DbError};
 use crate::repo::index::Index;
-use crate::repo::object::{Entry, Object};
+use crate::repo::object::{Entry, Object, Oid};
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
 use crate::repo::object::mode::Mode;
 use crate::repo::path::RepoPath;
 
 enum TreeNode {
-    Blob { oid: [u8; 20], mode: Mode },
+    Blob { oid: Oid, mode: Mode },
     Tree(IndexMap<Vec<u8>, TreeNode>),
 }
 
@@ -41,7 +41,7 @@ impl Tree {
     // Instead of sorting + IndexMap we could use a BTreeMap. BTreeMap does not allow us to provide
     // a custom comparator. It sorts by the key’s Ord implementation. So we would need a custom key
     // type and impl Ord for it.
-    fn insert(&mut self, path: RepoPath, oid: [u8; 20], mode: Mode) {
+    fn insert(&mut self, path: RepoPath, oid: Oid, mode: Mode) {
         let mut entries = &mut self.entries;
         let mut components = path.components().peekable();
 
@@ -197,7 +197,7 @@ impl Tree {
     // its entries, we walk the list and check the mode if a directory is found we recurse. It is
     // very important to see that the entry's name is a directory level, there is no nesting. The name
     // never contains '/'
-    pub(crate) fn write(self, db: &Database) -> Result<[u8; 20], DbError> {
+    pub(crate) fn write(self, db: &Database) -> Result<Oid, DbError> {
         let mut entries = Vec::new();
 
         for (name, node) in self.entries {
