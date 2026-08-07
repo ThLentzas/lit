@@ -1,18 +1,19 @@
-use crate::repo::object::{Object, Oid};
 use crate::repo::object::mode::Mode;
+use crate::repo::object::{Object, Oid};
 use crate::repo::path::RepoPath;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
+use std::error::Error;
 use std::path::PathBuf;
-use std::{fs, io};
+use std::{fmt, fs, io};
 
 pub(crate) struct Database {
     pub(crate) path: PathBuf,
 }
 
-// toDo: info and packs files
+// TODO: info and packs files
 impl Database {
     pub(crate) fn store(&self, object: Object) -> Result<Oid, DbError> {
         let obj_type = object.obj_type().as_str().as_bytes();
@@ -60,19 +61,20 @@ impl Database {
 
         // If the hash already exists in .lit/objects/, the content is guaranteed to be identical
         // (same content -> same hash), so writing it again is pointless.
-        // TODO: the above comment is not entirely true, we still need to Sha1 collision detection by 
+        // TODO: the above comment is not entirely true, we still need to Sha1 collision detection by
         // checking the object type, object size, the uncompressed content.
         // If any of those differ we need to return a collision error.
-        // Read Notes for Sha1 collision attacks, 
+        // Read Notes for Sha1 collision attacks,
         // TODO: eventually on the rewrite move to 256
         let path = parent.join(&hex[2..]);
+        // TODO: can this exists() call be a TOCTOU issue?
         if path.exists() {
             return Ok(oid);
         }
         let tmp_path = parent.join(gen_tmp_name());
         // this will create only the temp file and not any of the parent dir if missing
         // .lit/objects/90/tmp_obj_gNLJvt
-        // TODO: maybe we use zlib?
+        // TODO: we need to change this to zlib
         let compressed = deflate::deflate_bytes(&bytes);
         fs::write(&tmp_path, compressed).map_err(|err| DbError::Io {
             path: parent.to_path_buf(),
@@ -99,6 +101,7 @@ impl Database {
     // by the hash of its children.
     pub(crate) fn load(&self, oid: &Oid) -> Result<Option<Object>, DbError> {
         let hex = oid.to_hex();
+        // always safe to index since hex is a valid 40 character long hex string
         let path = self.path.join(&hex[..2]).join(&hex[2..]);
         let content = match fs::read(&path) {
             Ok(content) => content,
@@ -115,26 +118,22 @@ impl Database {
 
         let bytes = match inflate::inflate_bytes(&content) {
             Ok(bytes) => bytes,
-            Err(err) => return Err(DbError::Decompress { path, reason: err }),
+            Err(err) => return Err(DbError::Decompress { oid: hex, reason: err }),
         };
 
         let hash: [u8; 20] = Sha1::digest(&bytes).into();
         if hash != oid.inner() {
             // tampered object: someone opened the file, changed its contents, compressed the new
-            // content and wrote back to the file, the hashes do not match
-            return Err(DbError::HashMismatch {
-                path,
-                oid: hex,
-            });
+            // content and wrote back to the file, the hashes do not match or someone changed the
+            // object's path and set it to whatever was provided to load
+            return Err(DbError::HashMismatch { path, expected: oid.inner(), actual: hash });
         }
         // the information from any parsing error that occurs during loading an object is never returned
         // to the user. It means something is wrong with our on-disk format. Bad object with {oid}
         // is all they are going to see. The information is only needed for debugging.
-        Ok(Some(Object::deserialize(&bytes).map_err(|_err| {
-            DbError::BadObject {
-                oid: hex,
-            }
-        })?))
+        Ok(Some(
+            Object::deserialize(&bytes).map_err(|_err| DbError::BadObject { oid: hex })?,
+        ))
     }
 
     pub(super) fn load_tree_files(
@@ -196,6 +195,7 @@ pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> Oid {
 // there is an edge case of a collision where 2 different processes could in theory generate the same
 // tmp file name, and they will overwrite each others content, we have a case of competing writes, rare
 // but can happen, could use Lockfile, but it is highly unlikely
+// this is very similar to how tempfile generates the name
 fn gen_tmp_name() -> String {
     let suffix: String = (0..6)
         .map(|_| rand::rng().sample(Alphanumeric) as char)
@@ -219,10 +219,47 @@ fn encode(obj_type: &[u8], content: &[u8]) -> Vec<u8> {
 
 #[derive(Debug)]
 pub(crate) enum DbError {
-    Io { path: PathBuf, source: io::Error },
-    Decompress { path: PathBuf, reason: String },
-    HashMismatch { path: PathBuf, oid: String },
-    BadObject { oid: String },
-    NotATree { path: RepoPath, oid: String },
-    NotFound { path: RepoPath, oid: String },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Decompress {
+        oid: String,
+        reason: String,
+    },
+    HashMismatch {
+        path: PathBuf,
+        expected: [u8; 20],
+        actual: [u8; 20],
+    },
+    BadObject {
+        oid: String,
+    },
+    NotATree {
+        path: RepoPath,
+        oid: String,
+    },
+    NotFound {
+        path: RepoPath,
+        oid: String,
+    },
+}
+
+impl Error for DbError {}
+
+impl fmt::Display for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DbError::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            DbError::Decompress { oid, reason } => {
+                write!(f, "unable to unpack object {oid}: {reason}")
+            }
+            DbError::HashMismatch { path, .. } => {
+                write!(f, "hash-path mismatch for '{}'", path.display())
+            }
+            DbError::BadObject { oid } => write!(f, "bad object {oid}"),
+            DbError::NotATree { oid, .. } => write!(f, "not a tree object: {oid}"),
+            DbError::NotFound { oid, .. } => write!(f, "object {oid} not found"),
+        }
+    }
 }

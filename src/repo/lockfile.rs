@@ -1,7 +1,8 @@
+use std::error::Error;
+use std::{fmt, fs, io};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
 
 // https://git-scm.com/docs/api-lockfile
 // Lockfile guarantees mutual exclusion, atomic updates and cleanup of the tmp files in case of an
@@ -10,7 +11,7 @@ use std::{fs, io};
 // While a Lockfile value exists, the holder has exclusive write access to file_path. The lock is
 // acquired by atomically creating a .lock` file (lock is context specific extension). Other processes
 // attempting to acquire the same lock will fail until this lockfile is committed or dropped.
-// toDo:  explain why not some OS level lock
+// TODO:  explain why not some OS level lock
 pub(crate) struct Lockfile {
     // the path to the file we want to write to
     pub(super) file_path: PathBuf,
@@ -22,7 +23,7 @@ pub(crate) struct Lockfile {
     // rename. The `None` state is only ever observed internally by Drop after a successful commit
     pub(super) file: Option<File>,
     // read drop() impl below
-    committed: bool
+    committed: bool,
 }
 
 impl Lockfile {
@@ -40,7 +41,7 @@ impl Lockfile {
     // a file handler atomically. If someone tries to get a handler for the same file it will fail. Now
     // we can write to that tmp file without getting interupted. It creates the file exclusively meaning
     // once a process holds the lock for the specific file any other process would fail to acquire it
-    // 
+    //
     // returns Ok(Some(()) when it successfully acquires the lock
     // returns Ok(None) if it fails to acquire the lock
     // returns Err for any Io
@@ -48,7 +49,7 @@ impl Lockfile {
         let file_path = path.to_path_buf();
         let lock_path = PathBuf::from(format!("{}.lock", file_path.display()));
 
-        // a naive implementation would be do if !path.exists() then create but this causes Time of
+        // a naive implementation would be if !path.exists() then create but this causes Time of
         // check Time of Use issues. Two processes can perform the check before either proceeds and
         // would try to create the same file twice. https://doc.rust-lang.org/std/fs/
         match OpenOptions::new()
@@ -63,15 +64,13 @@ impl Lockfile {
                 file: Some(file),
                 committed: false,
             }),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(LockfileError::LockDenied {
-                path: lock_path,
-            }),
-            Err(err) => {
-                Err(LockfileError::Io {
-                    path: lock_path,
-                    source: err,
-                })
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                Err(LockfileError::LockDenied { path: lock_path })
             }
+            Err(err) => Err(LockfileError::Io {
+                path: lock_path,
+                source: err,
+            }),
         }
     }
 
@@ -80,7 +79,10 @@ impl Lockfile {
         let file = self.file.as_mut().unwrap();
         match file.write_all(content) {
             Ok(_) => Ok(()),
-            Err(err) => Err(LockfileError::Io { path: self.lock_path.clone(), source: err })
+            Err(err) => Err(LockfileError::Io {
+                path: self.lock_path.clone(),
+                source: err,
+            }),
         }
     }
 
@@ -95,7 +97,7 @@ impl Lockfile {
     // time use. We try to enforce it via the type system
     pub(crate) fn commit(mut self) -> Result<(), LockfileError> {
         let file = self.file.take().unwrap();
-        // sync_all() does not closes the file, we can still call file.write_all()
+        // sync_all() does not close the file, we can still call file.write_all()
         //
         // From the docs:
         //      Files are automatically closed when they go out of scope. Errors detected on closing
@@ -129,6 +131,7 @@ impl Lockfile {
 // manual cleanup
 impl Drop for Lockfile {
     fn drop(&mut self) {
+        // tempfile implements the same logic in the drop for TempDir
         if !self.committed {
             let _ = fs::remove_file(&self.lock_path);
         }
@@ -137,6 +140,21 @@ impl Drop for Lockfile {
 
 #[derive(Debug)]
 pub(crate) enum LockfileError {
-    Io { path: PathBuf, source: io::Error, },
-    LockDenied { path: PathBuf, },
+    Io { path: PathBuf, source: io::Error },
+    LockDenied { path: PathBuf },
+}
+
+impl Error for LockfileError {}
+
+impl fmt::Display for LockfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockfileError::Io { path, source } => {
+                write!(f, "{}: {}", path.display(), source)
+            }
+            LockfileError::LockDenied { path } => {
+                write!(f, "could not acquire lock on {}", path.display())
+            }
+        }
+    }
 }

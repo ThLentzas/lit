@@ -1,13 +1,15 @@
 use crate::repo::db::{Database, DbError};
 use crate::repo::index::{Index, IndexEntry};
+use crate::repo::object::mode::Mode;
 use crate::repo::object::{Object, Oid, OidError};
+use crate::repo::os::{FileKind, StatNode};
 use crate::repo::path::RepoPath;
 use crate::repo::refs::{RefError, Refs};
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use crate::repo::{Repository, db};
 use std::collections::{BTreeMap, HashMap};
-use crate::repo::object::mode::Mode;
-use crate::repo::os::{FileKind, StatNode};
+use std::error::Error;
+use std::fmt;
 
 // green for new, orange for modified, red for deleted, something else for untracked
 pub(crate) enum HeadIndexChange {
@@ -50,8 +52,8 @@ pub(crate) struct Report {
     // we need to know the type of file because we want to display untracked dirs with a trailing
     // slash, a/b -> a/b/.
     // If we used a Map because this is the only place where we actually include directories in the
-    // output we need to follow Git's rule with the trailing slash. When we add the RepoPath, the 
-    // relative root to dir path does not include the trailing slash, which means we need to walk 
+    // output we need to follow Git's rule with the trailing slash. When we add the RepoPath, the
+    // relative root to dir path does not include the trailing slash, which means we need to walk
     // the map create a new iterator where for dir's we append the trailing slash, sort that and then
     // use the result to print. Map does nothing. Instead we use a vec apply the rules before printing
     // and we sort once.
@@ -148,7 +150,7 @@ impl Report {
             // if it has changed and refresh the index.
             Some(&ws_stat) => {
                 let mode_changed = Mode::try_from(ws_stat.kind)
-                    // for a tracked regular file like src/foo we might have changed its type to 
+                    // for a tracked regular file like src/foo we might have changed its type to
                     // some unsupported one like dev, or socket. We will report the change and that's
                     // it, Index will never hold a version of foo or any file that is unsupported.
                     // the good case is when the type is actually supported, but we still need to check
@@ -258,11 +260,32 @@ impl Report {
 #[derive(Debug)]
 pub(crate) enum ReportError {
     Workspace(WorkspaceError),
-    DbError(DbError),
-    RefError(RefError),
+    Database(DbError),
+    Ref(RefError),
     HeadNotACommit { oid: String },
     HeadCommitNotFound { oid: String },
-    HeadBadOid(OidError)
+    HeadBadOid(OidError),
+}
+
+impl Error for ReportError {}
+
+impl fmt::Display for ReportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReportError::Workspace(err) => write!(f, "{err}"),
+            ReportError::Database(err) => write!(f, "{err}"),
+            ReportError::Ref(err) => write!(f, "{err}"),
+            ReportError::HeadNotACommit { oid } => {
+                write!(f, "HEAD points to object {oid}, which is not a commit")
+            }
+            ReportError::HeadCommitNotFound { oid } => {
+                write!(f, "HEAD points to missing commit {oid}")
+            }
+            ReportError::HeadBadOid(err) => {
+                write!(f, "invalid object id in HEAD: {err}")
+            }
+        }
+    }
 }
 
 impl From<WorkspaceError> for ReportError {
@@ -273,13 +296,13 @@ impl From<WorkspaceError> for ReportError {
 
 impl From<DbError> for ReportError {
     fn from(err: DbError) -> Self {
-        ReportError::DbError(err)
+        ReportError::Database(err)
     }
 }
 
 impl From<RefError> for ReportError {
     fn from(err: RefError) -> Self {
-        ReportError::RefError(err)
+        ReportError::Ref(err)
     }
 }
 

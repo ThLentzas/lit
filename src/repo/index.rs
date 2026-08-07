@@ -1,33 +1,150 @@
 mod parse;
 
 use crate::repo::index::parse::Parser;
+use crate::repo::object::Oid;
 use crate::repo::object::mode::Mode;
-use crate::repo::object::{Oid, OidError};
 use crate::repo::os::FileStat;
-use crate::repo::path::RepoPath;
+use crate::repo::path::{PathError, RepoPath};
 use sha1::{Digest, Sha1};
-use std::fs;
+use std::error::Error;
 use std::io;
 use std::path::PathBuf;
-// toDo:
-// Integrity validation:
-//   Did the bytes survive unchanged?
-//   -> checksum
-//
-// Structural validation:
-//   Can these bytes be interpreted as an index file?
-//   -> header/version/entry boundaries/path terminators/padding
-//
-// Semantic validation:
-//   Do the parsed entries obey all Git rules?
-//   -> sorting/modes/stages/path rules
+use std::{fmt, fs};
 
 // git has multiple versions(2, 3, 4) for the index format
 const INDEX_VERSION: u32 = 2;
 const PATH_MAX_SIZE: u16 = 0xfff;
 const SIGNATURE: &str = "DIRC";
 
-// toDo: caching tree
+#[derive(PartialEq, Eq)]
+pub(crate) struct IndexEntry {
+    pub(crate) stat: FileStat,
+    pub(crate) mode: Mode,
+    pub(crate) oid: Oid,
+    flags: u16,
+    pub(crate) path: RepoPath,
+}
+
+impl IndexEntry {
+    pub(crate) fn new(path: RepoPath, oid: Oid, mode: Mode, stat: FileStat) -> Self {
+        // https://git-scm.com/docs/index-format
+        // the lowest 12 bits store the name length
+        // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
+        let flags = path.len().min(PATH_MAX_SIZE as usize) as u16;
+
+        Self {
+            stat,
+            oid,
+            flags,
+            path,
+            mode,
+        }
+    }
+
+    pub(crate) fn times_match(&self, other: &FileStat) -> bool {
+        self.stat.ctime == other.ctime
+            && self.stat.ctime_nsec == other.ctime_nsec
+            && self.stat.mtime == other.mtime
+            && self.stat.mtime_nsec == other.mtime_nsec
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        // 10 fields, 4 bytes each
+        // 20 bytes for the oid
+        // 2 bytes for flags
+        // at least 1 NUL byte, at this point at least 63
+        // path bytes
+        // padding
+        let mut bytes = Vec::with_capacity(64);
+        bytes.extend_from_slice(&self.stat.ctime.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.ctime_nsec.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.mtime.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.mtime_nsec.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.dev.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.ino.to_be_bytes());
+        // the next part is confusing in the docs
+        // it says: 32-bit mode, 4-bit type, 3 unused 9-bit permissions(3 per group)
+        //
+        // 31                                                0
+        //  ┌────────────┬─────────┬─────────────────────────┐
+        //  │ 4-bit type │ 3 unused│ 9-bit Unix permissions  │
+        //  └────────────┴─────────┴─────────────────────────┘
+        //
+        // bits 31..16: zero
+        // bits 15..12: object type
+        // bits 11..9:  unused
+        // bits 8..0:   Unix permission bits
+        //
+        // 100644 octal
+        // =
+        // 1000 000 110100100 binary (16bits the rest are padded with zeros)
+        // │    │   │
+        // │    │   └── 9 permission bits: 0644
+        // │    └────── 3 unused bits: 000
+        // └─────────── 4 object-type bits: 1000
+        //
+        // let mode: u32 = 0o100644;
+        //
+        // let object_type = (mode >> 12) & 0b1111;
+        // let unused = (mode >> 9) & 0b111;
+        // let permissions = mode & 0o777;
+        //
+        // we get the exact same behavior by calling Mode::from_raw() when parsing those bytes, for
+        // storing is just we write those in BE.
+        bytes.extend_from_slice(&(self.mode as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.stat.uid.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.gid.to_be_bytes());
+        bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
+        bytes.extend_from_slice(self.oid.as_bytes()); // in the docs this is called Object name
+        bytes.extend_from_slice(&self.flags.to_be_bytes());
+        bytes.extend_from_slice(&self.path.as_bytes()); // in the docs, is called Entry path name
+        // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
+        // multiple of 8
+        //
+        // For any path 4095 bytes or longer, the format stores 0xFFF as a sentinel meaning "too long"
+        // For those paths, the length field gives us nothing, we still need to find where the path
+        // ends is by scanning for the NUL terminator.
+        bytes.push(0);
+
+        // The size of each record(entry) according to the format rules has to be divisible by 8
+        // Since the path has variable length, the total size of an entry is not fixed.
+        //
+        // Why did they choose padding on v2/v3?
+        //
+        // I couldn't find the exact answer to that question. Maybe it has to with mmap. At first,
+        // I thought it will be some sort of 8-alignment, but not sure. Padding is dropped in v4.
+        // Maybe it is a rule that was set that each entry size must be a multiple of 8 bytes. Maybe
+        // it is to make the parsing process following a simple boundary rule where next_entry_offset
+        // = current_entry_offset + padded_entry_size
+        //
+        // next_entry_offset = current_entry_offset + padded_entry_size
+        //
+        // header
+        // offset 12:  [ fixed entry fields ... 62 bytes ... ]
+        // offset 74:  f
+        // offset 75:  o
+        // offset 76:  o
+        // offset 77:  \0   <- path terminator
+        // offset 78:  \0   <- padding
+        // offset 79:  \0   <- padding
+        // offset 80:  \0   <- padding
+        // offset 81:  \0   <- padding
+        // offset 82:  \0   <- padding
+        // offset 83:  \0   <- padding
+        // offset 84:  next entry starts here
+        //
+        // current_entry_offset = 12
+        // padded_entry_size = 72
+        //
+        // next_entry_offset = 12 + 72 = 84
+        while bytes.len() % 8 != 0 {
+            bytes.push(0);
+        }
+        bytes
+    }
+}
+
+// TODO: caching tree
 pub(crate) struct Index {
     // TODO: on the rewrite test if a BTreeMap could work
     pub(crate) entries: Vec<IndexEntry>,
@@ -172,7 +289,7 @@ impl Index {
             bytes.split_last_chunk::<20>().ok_or_else(|| {
                 FormatError::at(
                     0,
-                    FormatErrorKind::Eof {
+                    FormatErrorKind::UnexpectedEof {
                         needed: 20,
                         remaining: bytes.len(),
                     },
@@ -194,6 +311,9 @@ impl Index {
         // duplicate paths are rejected
         // mode is one of the allowed Git modes
         // after reading entry_count entries, the parser ends exactly where expected
+        //
+        // checking the SHA-1 before parsing anything is a boundary we set,
+        // we don't yet have reason to trust the bytes enough to report on their internal structure.
         if hash != *checksum {
             // it is not InvalidFormat, we don't know that yet, the contents have been tempered with
             return Err(IndexError::InvalidChecksum);
@@ -210,6 +330,10 @@ impl Index {
         }
 
         let count = u32::from_be_bytes(*parser.take::<4>()?);
+        // we need to be explicit with the type because the check for last.path happens before the
+        // entries.push(entry) where the type can be inferred.
+        let mut entries: Vec<IndexEntry> = Vec::with_capacity(count as usize);
+        // if we exhausted the buffer before we reach count we get UnexpectedEof
         for _ in 0..count {
             let entry_offset = parser.offset();
             let entry = parser.next()?;
@@ -217,7 +341,7 @@ impl Index {
             // don't do the C++/Java way of
             //  if !self.entries.is_empty() {
             //  let last = self.entries.last().unwrap();
-            if let Some(last) = self.entries.last() {
+            if let Some(last) = entries.last() {
                 // if the entries are not in ascending order the format is invalid
                 // in a sorted list duplicates must appear next to each other, and we check each entry
                 // with the previous one
@@ -225,28 +349,20 @@ impl Index {
                 // if entry.path == last.path, the duplicate is adjacent and caught here
                 // if entry.path < last.path, sort order is broken; any earlier duplicate would also
                 // surface as a non-ascending pair somewhere in the sequence
-                // TODO: address sorting order when we add stage support
+                // TODO: address sorting order when we add stage support during merge
                 if last.path >= entry.path {
                     return Err(FormatError::at(
                         entry_offset,
-                        FormatErrorKind::EntriesNotSorted,
+                        FormatErrorKind::EntriesOutOfSorted,
                     ))?;
                 }
             }
-            self.entries.push(entry);
+            entries.push(entry);
         }
 
-        if self.entries.len() != count as usize {
-            return Err(FormatError::at(
-                parser.offset(),
-                FormatErrorKind::EntriesCountMissMatch {
-                    actual: self.entries.len(),
-                    expected: count as usize,
-                },
-            ))?;
-        }
         // there are trailing bytes between the last index entry and the checksum
-        if !parser.is_exhausted() {
+        // this also handles the case where the actual number of entries was greater than count
+        if !parser.is_empty() {
             return Err(FormatError::at(
                 parser.offset(),
                 FormatErrorKind::TrailingData {
@@ -254,6 +370,7 @@ impl Index {
                 },
             ))?;
         }
+        self.entries = entries;
 
         Ok(())
     }
@@ -297,134 +414,6 @@ impl Index {
     }
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) struct IndexEntry {
-    pub(crate) stat: FileStat,
-    pub(crate) mode: Mode,
-    pub(crate) oid: Oid,
-    flags: u16,
-    pub(crate) path: RepoPath,
-}
-
-impl IndexEntry {
-    pub(crate) fn new(path: RepoPath, oid: Oid, mode: Mode, stat: FileStat) -> Self {
-        // https://git-scm.com/docs/index-format
-        // the lowest 12 bits store the name length
-        // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
-        let flags = path.len().min(PATH_MAX_SIZE as usize) as u16;
-
-        Self {
-            stat,
-            oid,
-            flags,
-            path,
-            mode,
-        }
-    }
-
-    pub(crate) fn times_match(&self, other: &FileStat) -> bool {
-        self.stat.ctime == other.ctime
-            && self.stat.ctime_nsec == other.ctime_nsec
-            && self.stat.mtime == other.mtime
-            && self.stat.mtime_nsec == other.mtime_nsec
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        // 10 fields, 4 bytes each
-        // 20 bytes for the oid
-        // 2 bytes for flags
-        // at least 1 NUL byte, at this point at least 63
-        // path bytes
-        // padding
-        let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(&self.stat.ctime.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.ctime_nsec.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mtime.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mtime_nsec.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.dev.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.ino.to_be_bytes());
-        // the next part is confusing in the docs
-        // it says: 32-bit mode, 4-bit type, 3 unused 9-bit permissions(3 per group)
-        //
-        // 31                                                0
-        //  ┌────────────┬─────────┬─────────────────────────┐
-        //  │ 4-bit type │ 3 unused│ 9-bit Unix permissions  │
-        //  └────────────┴─────────┴─────────────────────────┘
-        //
-        // bits 31..16: zero
-        // bits 15..12: object type
-        // bits 11..9:  unused
-        // bits 8..0:   Unix permission bits
-        //
-        // 100644 octal
-        // =
-        // 1000 000 110100100 binary (16bits the rest are padded with zeros)
-        // │    │   │
-        // │    │   └── 9 permission bits: 0644
-        // │    └────── 3 unused bits: 000
-        // └─────────── 4 object-type bits: 1000
-        //
-        // let mode: u32 = 0o100644;
-        //
-        // let object_type = (mode >> 12) & 0b1111;
-        // let unused = (mode >> 9) & 0b111;
-        // let permissions = mode & 0o777;
-        //
-        // we get the exact same behavior by calling Mode::from_raw() when parsing those bytes, for
-        // storing is just we write those in BE.
-        bytes.extend_from_slice(&(self.mode as u32).to_be_bytes());
-        bytes.extend_from_slice(&self.stat.uid.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.gid.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
-        bytes.extend_from_slice(self.oid.as_bytes()); // in the docs this is called Object name
-        bytes.extend_from_slice(&self.flags.to_be_bytes());
-        bytes.extend_from_slice(&self.path.as_bytes()); // in the docs, is called Entry path name
-        // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
-        // multiple of 8
-        //
-        // For any path 4095 bytes or longer, the format stores 0xFFF as a sentinel meaning "too long"
-        // For those paths, the length field gives us nothing, we still need to find where the path
-        // ends is by scanning for the NUL terminator.
-        bytes.push(0);
-
-        // The size of each record(entry) according to the format rules has to be divisible by 8
-        // Since the path has variable length, the total size of an entry is not fixed.
-        //
-        // Why did they choose padding on v2/v3?
-        //
-        // I couldn't find the exact answer to that question. Maybe it has to with mmap. At first,
-        // I thought it will be some sort of 8-alignment, but not sure. Padding is dropped in v4.
-        // Maybe it is a rule that was set that each entry size must be a multiple of 8 bytes. Maybe
-        // it is to make the parsing process following a simple boundary rule where next_entry_offset
-        // = current_entry_offset + padded_entry_size
-        //
-        // next_entry_offset = current_entry_offset + padded_entry_size
-        //
-        // header
-        // offset 12:  [ fixed entry fields ... 62 bytes ... ]
-        // offset 74:  f
-        // offset 75:  o
-        // offset 76:  o
-        // offset 77:  \0   <- path terminator
-        // offset 78:  \0   <- padding
-        // offset 79:  \0   <- padding
-        // offset 80:  \0   <- padding
-        // offset 81:  \0   <- padding
-        // offset 82:  \0   <- padding
-        // offset 83:  \0   <- padding
-        // offset 84:  next entry starts here
-        //
-        // current_entry_offset = 12
-        // padded_entry_size = 72
-        //
-        // next_entry_offset = 12 + 72 = 84
-        while bytes.len() % 8 != 0 {
-            bytes.push(0);
-        }
-        bytes
-    }
-}
-
 // an error that can occur when creating IndexEntry or parsing .lit/index
 // Git when format is corrupted reports: Unknown Index Format
 // No more information is provided to the user because they can't do much if the format is invalid
@@ -436,15 +425,46 @@ pub(crate) enum IndexError {
     Io { path: PathBuf, source: io::Error },
 }
 
-// TODO: we need to refactor this to include the actual bad path
 #[derive(Debug)]
-pub(super) enum PathError {
-    Empty,
-    LeadingSlash,
-    TrailingSlash,
-    EmptyComponent,
-    ReservedComponent,
-    ContainsNul,
+pub(super) enum FormatErrorKind {
+    UnexpectedEof { needed: usize, remaining: usize },
+    InvalidSignature,
+    EntriesOutOfSorted,
+    InvalidMode(u32),
+    InvalidNanoseconds,
+    MissingNulTerminator,
+    InvalidPadding,
+    LongPathLenMisMatch,
+    InvalidPathSyntax(PathError),
+    TrailingData { remaining: usize },
+}
+
+impl fmt::Display for FormatErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FormatErrorKind::UnexpectedEof { needed, remaining } => {
+                write!(
+                    f,
+                    "unexpected end of file: needed {needed} bytes, only {remaining} remaining"
+                )
+            }
+            FormatErrorKind::InvalidSignature => write!(f, "invalid index signature"),
+            FormatErrorKind::EntriesOutOfSorted => write!(f, "index entries are out of order"),
+            FormatErrorKind::InvalidMode(mode) => write!(f, "invalid index entry mode {mode:#o}"),
+            FormatErrorKind::InvalidNanoseconds => write!(f, "invalid nanosecond value"),
+            FormatErrorKind::MissingNulTerminator => write!(f, "missing NUL terminator"),
+            FormatErrorKind::InvalidPadding => write!(f, "invalid index entry padding"),
+            FormatErrorKind::LongPathLenMisMatch => {
+                write!(f, "path length does not match the index flags")
+            }
+            FormatErrorKind::InvalidPathSyntax(err) => {
+                write!(f, "invalid index path: {err}")
+            }
+            FormatErrorKind::TrailingData { remaining } => {
+                write!(f, "unexpected trailing data: {remaining} bytes remaining")
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -459,20 +479,12 @@ impl FormatError {
     }
 }
 
-#[derive(Debug)]
-pub(super) enum FormatErrorKind {
-    // TODO: rethink this Eof
-    Eof { needed: usize, remaining: usize },
-    InvalidSignature,
-    EntriesNotSorted,
-    EntriesCountMissMatch { actual: usize, expected: usize },
-    InvalidMode(u32),
-    InvalidNanoseconds,
-    MissingNulTerminator,
-    InvalidPadding,
-    LongPathLenMissMatch,
-    InvalidPathSyntax(PathError),
-    TrailingData { remaining: usize },
+impl Error for FormatError {}
+
+impl fmt::Display for FormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid index at byte {}: {}", self.offset, self.kind)
+    }
 }
 
 impl From<FormatError> for IndexError {

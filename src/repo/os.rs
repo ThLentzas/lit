@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::Metadata;
 #[cfg(unix)]
@@ -7,7 +8,7 @@ use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::{fmt, fs, io};
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct StatNode {
@@ -201,8 +202,31 @@ fn file_kind(meta: &Metadata) -> FileKind {
 }
 
 #[derive(Debug)]
-pub(super) enum OsError {
+pub(crate) enum OsError {
     #[cfg(windows)]
-    NotUnicode { bytes: Vec<u8> },
-    Io { path: PathBuf, source: io::Error },
+    NotUnicode {
+        bytes: Vec<u8>,
+    },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+}
+
+impl Error for OsError {}
+
+impl fmt::Display for OsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO: Since bytes may represent arbitrary path data, {:?} is useful for debugging but not especially user-friendly
+        // TODO: We need to use path printing logic of stdout_bytes()
+        match self {
+            #[cfg(windows)]
+            OsError::NotUnicode { bytes } => {
+                write!(f, "path contains invalid Unicode: {bytes:?}")
+            }
+            OsError::Io { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
+        }
+    }
 }

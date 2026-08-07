@@ -1,8 +1,9 @@
 use crate::repo::os;
 use crate::repo::os::{FileKind, OsError, StatNode};
 use crate::repo::path::RepoPath;
+use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::{env, fs, io};
+use std::{env, fmt, fs, io};
 
 // root relative path -> fs calls
 //
@@ -10,7 +11,6 @@ use std::{env, fs, io};
 // etc. The syscalls though need absolute paths, Workspace is responsible for doing this translation
 // It is the working tree viewed from the repo root.
 pub(crate) struct Workspace {
-    // absolute root + relative to root path = absolute path
     pub(crate) root: PathBuf,
 }
 
@@ -27,7 +27,8 @@ impl Workspace {
     // we need the prefix to later compute repo relative paths
     // if cwd is root then prefix is ""
     pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
-        let cwd = env::current_dir().map_err(|err| WorkspaceError::CurrentDir { err })?;
+        let cwd =
+            env::current_dir().map_err(|err| WorkspaceError::CurrentDirUnavailable { err })?;
 
         cwd.strip_prefix(&self.root)
             .map(Path::to_path_buf)
@@ -60,9 +61,8 @@ impl Workspace {
         Ok(os::stat(&absolute)?)
     }
 
-    // returns all entries of a directory pointed by the path
-    // This approach returns a list of all entries that live under path, it is up to the caller if 
-    // they want to recurse for subdirectories
+    // returns all entries of a directory pointed by the path, a list of all entries that live under
+    // path, it is up to the caller if they want to recurse for subdirectories
     pub(crate) fn dir_entries(
         &self,
         path: &RepoPath,
@@ -85,7 +85,7 @@ impl Workspace {
         // filesystem/network drive error
         // entries are deleted
         for entry in read_dir {
-            // If the iterator itself errs, there is no DirEntry, hence no name, the parent is
+            // if the iterator itself errs, there is no DirEntry, hence no name, the parent is
             // genuinely the most precise path available.
             let entry = match entry {
                 Ok(entry) => entry,
@@ -141,10 +141,31 @@ impl Workspace {
 
 #[derive(Debug)]
 pub(crate) enum WorkspaceError {
-    CurrentDir { err: io::Error },
+    CurrentDirUnavailable { err: io::Error },
     Io { path: PathBuf, source: io::Error },
     OutsideRepository { path: PathBuf },
     Os(OsError),
+}
+
+impl Error for WorkspaceError {}
+
+impl fmt::Display for WorkspaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkspaceError::CurrentDirUnavailable { err } => {
+                write!(f, "could not determine current directory: {err}")
+            }
+            WorkspaceError::Io { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
+            WorkspaceError::OutsideRepository { path } => {
+                write!(f, "path '{}' is outside the repository", path.display())
+            }
+            WorkspaceError::Os(err) => {
+                write!(f, "{err}")
+            }
+        }
+    }
 }
 
 impl From<OsError> for WorkspaceError {

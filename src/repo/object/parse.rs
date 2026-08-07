@@ -7,12 +7,12 @@ use crate::repo::timestamp::{Timestamp, TimestampError};
 // buffer. It is helps a lot approaching the parsing like this because of commit's structure.
 // Read parse_commit(). Every method that does not take &mut Cursor as arg, returns error indices
 // relative to the slice passed, but they get adjusted by the caller(parse_signature(), parse_oid()).
-struct Parser<'a> {
+struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
+impl<'a> Cursor<'a> {
     fn new(buf: &'a [u8]) -> Self {
         Self { buf, pos: 0 }
     }
@@ -140,7 +140,6 @@ impl TreeEntryError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ParseErrorKind {
-    DuplicateHeader { name: &'static str },
     MissingHeaderSpace,
     MissingHeaderNul,
     InvalidTreeEntry(TreeEntryErrorKind),
@@ -179,14 +178,18 @@ struct Line<'a> {
 
 // object type, a space, the size of the object and a nul byte
 pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
-    let mut cursor = Parser::new(buf);
-    let kind = cursor
+    // there is another approach where we could read_until(0) and map it to a CStr, which is a null
+    // terminated buffer. We still need to walk that silce that now represents the header and do
+    // validation.
+    let mut cursor = Cursor::new(buf);
+    let obj_type = cursor
         .read_until(b' ')
         .map_err(|err| ParseError::new(err.offset, ParseErrorKind::MissingHeaderSpace))?;
 
     let start = cursor.pos;
     let size = parse_size(&mut cursor)?;
     let rest = cursor.rest();
+    // this also handles the trailing byte case
     if size != rest.len() {
         return Err(ParseError::new(
             start,
@@ -197,7 +200,7 @@ pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
         ));
     }
 
-    match kind {
+    match obj_type {
         b"blob" => Ok(Object::Blob(rest.to_vec())),
         b"tree" => {
             // we have 2 choices: we either create a new cursor that holds rest and need to adjust
@@ -215,12 +218,12 @@ pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
         b"commit" => Ok(Object::Commit(parse_commit(&mut cursor)?)),
         _ => Err(ParseError::new(
             0,
-            ParseErrorKind::UnknownType { got: kind.to_vec() },
+            ParseErrorKind::UnknownType { got: obj_type.to_vec() },
         )),
     }
 }
 
-fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
+fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
     let start = cursor.pos;
     let buf = cursor
         .read_until(b' ')
@@ -274,7 +277,7 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
     let oid = cursor
         .take::<20>()
         .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::TruncatedOid))?;
-
+    // this exactly the same logic as index/parse.rs
     let oid = unsafe { Oid::from_bytes_unchecked(*oid) };
     Ok(Entry {
         mode,
@@ -283,7 +286,7 @@ fn parse_tree_entry(cursor: &mut Parser) -> Result<Entry, TreeEntryError> {
     })
 }
 
-fn parse_size(cursor: &mut Parser) -> Result<usize, ParseError> {
+fn parse_size(cursor: &mut Cursor) -> Result<usize, ParseError> {
     let start = cursor.pos;
     let size_buf = cursor
         .read_until(0)
@@ -302,7 +305,6 @@ fn parse_size(cursor: &mut Parser) -> Result<usize, ParseError> {
                 ParseErrorKind::InvalidSizeHeader,
             ));
         }
-
         // similar to the atoi!() macro in jolt
         size = size
             .checked_mul(10)
@@ -325,7 +327,7 @@ fn parse_size(cursor: &mut Parser) -> Result<usize, ParseError> {
 // parse value without bloating commit. tree and parent headers are followed by the same value a
 // 40-character hex string. After tree, parent header is optional so in the mismatch case we don't
 // error but pass line to the next check.
-fn parse_commit(cursor: &mut Parser) -> Result<Commit, ParseError> {
+fn parse_commit(cursor: &mut Cursor) -> Result<Commit, ParseError> {
     let line = parse_header(cursor)?;
     if line.key != b"tree" {
         return Err(ParseError::new(
@@ -417,7 +419,7 @@ fn parse_commit(cursor: &mut Parser) -> Result<Commit, ParseError> {
 }
 
 // line.key and line.value live in cursor's buffer so they share the same lifetime
-fn parse_header<'a>(cursor: &mut Parser<'a>) -> Result<Line<'a>, ParseError> {
+fn parse_header<'a>(cursor: &mut Cursor<'a>) -> Result<Line<'a>, ParseError> {
     let start = cursor.pos;
     let line = cursor
         .read_until(b'\n')
@@ -433,6 +435,8 @@ fn parse_header<'a>(cursor: &mut Parser<'a>) -> Result<Line<'a>, ParseError> {
     })
 }
 
+// index is always relative to the smaller buffers that we pass and pos is the absolute position on
+// the input buffer. When we access buf we always need absolute position
 fn parse_signature(buf: &[u8]) -> Result<Signature, SignatureError> {
     let mut pos = 0;
     let index = memchr::memchr(b'<', buf).ok_or(SignatureError::new(
@@ -458,7 +462,7 @@ fn parse_signature(buf: &[u8]) -> Result<Signature, SignatureError> {
         pos,
         SignatureErrorKind::MissingAngleBracket,
     ))?;
-    let email = buf[pos..index].to_vec();
+    let email = buf[pos..pos + index].to_vec();
     if email.is_empty() {
         return Err(SignatureError::new(pos, SignatureErrorKind::MissingEmail));
     }

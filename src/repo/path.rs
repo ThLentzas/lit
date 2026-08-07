@@ -1,4 +1,7 @@
-use crate::repo::index::PathError;
+use std::error::Error;
+use std::fmt;
+use crate::repo::pathspec::PathspecError;
+use crate::repo::workspace::WorkspaceError;
 
 // Represents the internal on disk path format. Paths are always root relative. No leading/trailing
 // slash, components can't be empty, can't contain NUL and components are always joined by '/' regardless
@@ -32,32 +35,50 @@ impl RepoPath {
 
     pub(super) fn from_bytes(bytes: &[u8]) -> Result<Self, PathError> {
         if bytes.is_empty() {
-            return Err(PathError::Empty);
+            return Err(PathError {
+                path: bytes.to_vec(),
+                kind: PathErrorKind::Empty,
+            });
         }
         // paths are relative to the repository root, so no leading slash.
         if bytes[0] == b'/' {
-            return Err(PathError::LeadingSlash);
+            return Err(PathError {
+                path: bytes.to_vec(),
+                kind: PathErrorKind::LeadingSlash,
+            });
         }
         // trailing slash is not allowed.
         if bytes[bytes.len() - 1] == b'/' {
-            return Err(PathError::TrailingSlash);
+            return Err(PathError {
+                path: bytes.to_vec(),
+                kind: PathErrorKind::TrailingSlash,
+            });
         }
 
         for component in bytes.split(|&b| b == b'/') {
             // empty components: "src//main.rs"
             if component.is_empty() {
-                return Err(PathError::EmptyComponent);
+                return Err(PathError {
+                    path: bytes.to_vec(),
+                    kind: PathErrorKind::EmptyComponent,
+                });
             }
             // ".", "..", and ".lit" as path components are not allowed
             // src/./main.rs: stays in the current directory, redundant and not a real subdirectory
             // src/../etc/passwd: escapes upward, would let a crafted index reference files outside the repo
             // .lit/config: points into Lit's own metadata, never legitimate as a tracked file.
             if matches!(component, b"." | b".." | b".lit") {
-                return Err(PathError::ReservedComponent);
+                return Err(PathError {
+                    path: bytes.to_vec(),
+                    kind: PathErrorKind::ReservedComponent,
+                });
             }
             // NUL cannot appear inside the path.
             if memchr::memchr(0, component).is_some() {
-                return Err(PathError::ContainsNul);
+                return Err(PathError {
+                    path: bytes.to_vec(),
+                    kind: PathErrorKind::ContainsNul,
+                });
             }
         }
         let mut inner = Vec::with_capacity(bytes.len());
@@ -107,5 +128,47 @@ impl RepoPath {
         // split actually returns a SplitIterator and next() returns slices up to the index that the
         // predicate returned true, this is why we can call componenets().peekable() and components.next()
         self.inner.split(|&byte| byte == b'/')
+    }
+    
+    pub(crate) fn display(&self,) -> String {
+       String::from_utf8_lossy(&self.inner).to_string()
+    }
+}
+
+
+#[derive(Debug)]
+pub(super) enum PathErrorKind {
+    Empty,
+    LeadingSlash,
+    TrailingSlash,
+    EmptyComponent,
+    ReservedComponent,
+    ContainsNul,
+}
+
+#[derive(Debug)]
+pub(super) struct PathError {
+    pub(super) path: Vec<u8>,
+    pub(super) kind: PathErrorKind,
+}
+
+impl Error for PathError {}
+
+impl fmt::Display for PathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            PathErrorKind::Empty => write!(f, "path is empty"),
+            PathErrorKind::LeadingSlash => write!(f, "path '{:?}' begins with '/'", self.path),
+            PathErrorKind::TrailingSlash => write!(f, "path '{:?}' ends with '/'", self.path),
+            PathErrorKind::EmptyComponent => {
+                write!(f, "path '{:?}' contains an empty component", self.path)
+            }
+            PathErrorKind::ReservedComponent => {
+                write!(f, "path '{:?}' contains a reserved component", self.path)
+            }
+            PathErrorKind::ContainsNul => {
+                write!(f, "path '{:?}' contains a NUL byte", self.path)
+            }
+        }
     }
 }

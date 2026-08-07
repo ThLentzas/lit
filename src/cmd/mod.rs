@@ -11,9 +11,7 @@ use crate::cmd::commit::Commit;
 use crate::cmd::init::Init;
 use crate::cmd::status::Status;
 
-// init creates repository structure
-// add creates/updates the index
-// commit consumes the index
+
 pub(super) enum Command {
     Init(Init),
     Add(Add),

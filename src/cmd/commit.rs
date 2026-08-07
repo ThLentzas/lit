@@ -7,7 +7,7 @@ use crate::repo::object::{self, Object, Signature, SignatureError};
 use crate::repo::refs::{RefError, Refs};
 use crate::repo::tree::Tree;
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{RepoError, Repository};
+use crate::repo::{DiscoverError, Repository};
 
 pub(crate) struct Commit;
 
@@ -109,7 +109,7 @@ fn index_background_refreshing(
 
 #[derive(Debug)]
 pub(super) enum CommitError {
-    Repo(RepoError),
+    Repo(DiscoverError),
     Workspace(WorkspaceError),
     Index(IndexError),
     DbError(DbError),
@@ -119,8 +119,8 @@ pub(super) enum CommitError {
     Config(ConfigError),
 }
 
-impl From<RepoError> for CommitError {
-    fn from(err: RepoError) -> Self {
+impl From<DiscoverError> for CommitError {
+    fn from(err: DiscoverError) -> Self {
         CommitError::Repo(err)
     }
 }

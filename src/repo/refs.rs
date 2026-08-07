@@ -1,8 +1,9 @@
 use crate::repo::db::DbError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::{Oid, OidError};
+use std::error::Error;
 use std::path::PathBuf;
-use std::{fs, io};
+use std::{fmt, fs, io};
 
 pub(crate) struct Refs {
     pub(crate) path: PathBuf,
@@ -68,7 +69,7 @@ impl Refs {
         // the result of step 4 (the new OID). We can't separate them into two phases like "first do
         // all the lock stuff, then build the commit" because the data dependencies cross the boundary.
         //
-        // toDo: revisit this design choice
+        // TODO: revisit this design choice
         // A solution would be to pass all the logic to construct a commit to update_head() which leads
         // to bad coupling, refs are responsible for HEAD and refs. With the closure approach we
         // just provide the behavior once we get access to parent. Could also be an approach where we
@@ -113,8 +114,23 @@ impl Refs {
 pub(crate) enum RefError {
     Io { path: PathBuf, source: io::Error },
     Lockfile(LockfileError),
-    DbError(DbError),
-    OidError(OidError),
+    Database(DbError),
+    Oid(OidError),
+}
+
+impl Error for RefError {}
+
+impl fmt::Display for RefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RefError::Io { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
+            RefError::Lockfile(err) => write!(f, "{err}"),
+            RefError::Database(err) => write!(f, "{err}"),
+            RefError::Oid(err) => write!(f, "{err}"),
+        }
+    }
 }
 
 impl From<LockfileError> for RefError {
@@ -125,12 +141,12 @@ impl From<LockfileError> for RefError {
 
 impl From<DbError> for RefError {
     fn from(err: DbError) -> Self {
-        RefError::DbError(err)
+        RefError::Database(err)
     }
 }
 
 impl From<OidError> for RefError {
     fn from(err: OidError) -> Self {
-        RefError::OidError(err)
+        RefError::Oid(err)
     }
 }

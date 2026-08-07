@@ -1,4 +1,13 @@
 use std::borrow::Cow;
+use std::io;
+
+// we could also define it as Printer<T>, it is classic associated types vs generics in traits
+pub(super) trait Printer {
+    // the type of value we need to print
+    type T;
+    
+    fn print(&self, value: &Self::T,) -> io::Result<()>;
+}
 
 pub(super) fn stdout_path_bytes(path: &[u8]) -> Cow<'_, [u8]> {
     if !path.iter().any(|&b| needs_quoting(b)) {

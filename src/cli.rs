@@ -9,9 +9,6 @@ use crate::cmd::status::Status;
 use crate::cmd::cat_file::CatFile;
 
 // TODO: if we use clap we need to make sure that we parse as env::args_os() and not env::args
-// args() forces every argument to be valid utf-9 but in our case what we want is a platform OsString
-// we know that unix allow pretty every byte sequence that does not contain NUL and / and windows
-// uses WTF-16. We don't want to reject non-utf8 paths.
 pub(super) fn parse() -> Command {
     let mut args = env::args().skip(1).into_iter().peekable();
     

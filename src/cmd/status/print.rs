@@ -3,7 +3,7 @@ use crate::repo::os::FileKind;
 use crate::repo::path::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::io::{self, IsTerminal, Write};
-use crate::cmd::print;
+use crate::cmd::print::{self, Printer};
 
 // TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;
@@ -66,11 +66,19 @@ impl Style {
     }
 }
 
+pub(super) struct StatusPrinter {
+    pub(super) format: Format
+}
+
 // TODO: nothing to commit, working tree clean
-pub(super) fn print(report: &Report, format: Format) -> io::Result<()> {
-    match format {
-        Format::Short => print_short(report),
-        Format::Long => print_long(report),
+impl Printer for StatusPrinter {
+    type T = Report;
+
+    fn print(&self, value: &Self::T) -> io::Result<()> {
+        match self.format {
+            Format::Short => print_short(&value),
+            Format::Long => print_long(&value),
+        }
     }
 }
 
@@ -79,6 +87,7 @@ fn print_short(_report: &Report) -> io::Result<()> {
 }
 
 fn print_long(report: &Report) -> io::Result<()> {
+    // if we don't acquire the lock, everytime we write stdout would have to acquire the lock.
     let mut writer = io::stdout().lock();
     
     let staged = report.changes.iter().filter_map(|(path, change)| {
@@ -130,15 +139,15 @@ fn print_long(report: &Report) -> io::Result<()> {
     Ok(())
 }
 
-fn print_section<'a, Iter, Writer>(
+fn print_section<'a, Iter, W>(
     heading: &str,
     changes: Iter,
     style: Style,
-    out: &mut Writer,
+    out: &mut W,
 ) -> io::Result<()>
 where
     Iter: Iterator<Item = (&'a [u8], &'static str)>,
-    Writer: Write,
+    W: Write,
 {
     let mut changes = changes.peekable();
     // empty section

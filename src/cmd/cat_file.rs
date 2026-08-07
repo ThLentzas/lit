@@ -1,8 +1,10 @@
 mod print;
 
+use crate::cmd::cat_file::print::CatFilePrinter;
+use crate::cmd::print::Printer;
 use crate::repo::db::{Database, DbError};
 use crate::repo::object::{ObjectType, Oid};
-use crate::repo::{RepoError, Repository};
+use crate::repo::{DiscoverError, Repository};
 use std::ffi::OsString;
 use std::io;
 
@@ -12,12 +14,14 @@ pub(crate) struct CatFile {
 }
 
 impl CatFile {
+    // TODO: we need to support the shortest prefix that is unique and since it is unique we can
+    // return that object, jon in his impl mentions using glob around 32:00
+    // if the user wrote cat-file <oid> this prints a message like "either provide the type or use -p flag"
     pub(super) fn execute(&self) -> Result<(), CatFileError> {
         let repo = Repository::discover()?;
         let db = Database {
             path: repo.db_path(),
         };
-        let mut out = io::stdout().lock();
 
         let oid = self
             .oid
@@ -36,7 +40,8 @@ impl CatFile {
                 if expected != actual {
                     return Err(CatFileError::TypeMisMatch { expected, actual });
                 }
-                print::print(&mut out, &object)?
+                let printer = CatFilePrinter{};
+                printer.print(&object)?;
             }
             None => return Err(CatFileError::NotFound(oid)),
         }
@@ -47,7 +52,7 @@ impl CatFile {
 
 #[derive(Debug)]
 pub(super) enum CatFileError {
-    RepoError(RepoError),
+    RepoError(DiscoverError),
     UnknownType(OsString),
     BadOid(OsString),
     DbError(DbError),
@@ -59,8 +64,8 @@ pub(super) enum CatFileError {
     Io(io::Error),
 }
 
-impl From<RepoError> for CatFileError {
-    fn from(err: RepoError) -> Self {
+impl From<DiscoverError> for CatFileError {
+    fn from(err: DiscoverError) -> Self {
         CatFileError::RepoError(err)
     }
 }

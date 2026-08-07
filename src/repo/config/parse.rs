@@ -2,7 +2,7 @@ use super::Span;
 
 // all the parse methods that we use to parse a LineKind like parse_section or parse_variable
 // do not return LineKind but the information of the kind they are parsing. We have seen this with
-// jolt and parse_array(). We didnt not return Value but Vec<Value> it is correct semmanticly. By
+// jolt and parse_array(). We did not return Value but Vec<Value> it is correct semmanticly. By
 // returning a LineKind someone could assume that we could return any kind of Line.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ParseError {
@@ -12,7 +12,7 @@ pub(crate) struct ParseError {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ParseErrorKind {
-    // toDo: make it expected, got
+    // TODO: make it expected, got
     UnexpectedByte(u8),
     UnterminatedQuote,
     UnexpectedEof,
@@ -172,8 +172,8 @@ impl<'a> LineParser<'a> {
         self.advance(1);
 
         // name can contain only alphanumeric characters and '-'
-        while let Some(b) = self.peek() {
-            if b.is_ascii_alphanumeric() || *b == b'-' {
+        while let Some(&b) = self.peek() {
+            if b.is_ascii_alphanumeric() || b == b'-' {
                 self.advance(1);
             } else {
                 break;
@@ -234,7 +234,7 @@ impl<'a> LineParser<'a> {
     // parse_value() must hold the invariance that the span of the value does not include any
     // leading/trailing ws.
     fn parse_value(&mut self) -> Result<Span, ParseError> {
-        // quotes and /<newline> are include if present, will be dropped later when we interpret the
+        // quotes and /<newline> are included if present, will be dropped later when we interpret the
         // value
         let start = self.pos;
         let mut in_quote = false;
@@ -604,5 +604,13 @@ mod tests {
         let err = ParseError { pos: 0, kind: ParseErrorKind::UnexpectedByte(b'@') };
         let res = parser.parse();
         assert_eq!(res, Err(err), "failed: {:?}", buf);
+    }
+
+    #[test]
+    fn test_email() {
+        // @
+        let buf = b"email = alex.morgan@example.com".as_slice();
+        let parser = LineParser::new(&buf);
+        let res = parser.parse();
     }
 }

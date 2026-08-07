@@ -7,10 +7,11 @@ use crate::repo::os::{FileKind, StatNode};
 use crate::repo::path::RepoPath;
 use crate::repo::pathspec::{Pathspec, PathspecError};
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{RepoError, Repository};
+use crate::repo::{DiscoverError, Repository};
+use std::error::Error;
 use std::ffi::OsString;
-use std::io;
 use std::path::{Path, PathBuf};
+use std::{fmt, io};
 
 pub(crate) struct Add {
     // user provided path
@@ -79,7 +80,7 @@ impl Add {
                     index.remove(&pathspec.pattern);
                 }
                 None => {
-                    return Err(AddError::NoMatch {
+                    return Err(AddError::FoundNoMatch {
                         path: pathspec.original,
                     });
                 }
@@ -176,7 +177,7 @@ impl<'a> EntryCollector<'a> {
                 // src/foo was a regular tracked file that was deleted and now src/foo is socket, and
                 // we try lit add src/foo it must fail
                 if self.index.contains(path) {
-                    return Err(AddError::UnsupportedFileType);
+                    return Err(AddError::UnsupportedFileType { path: path.clone() });
                 }
                 // Untracked unsupported files are silently ignored
             }
@@ -191,21 +192,48 @@ impl<'a> EntryCollector<'a> {
 
 #[derive(Debug)]
 pub(super) enum AddError {
-    Repo(RepoError),
+    Repository(DiscoverError),
     Index(IndexError),
-    DbError(DbError),
+    Database(DbError),
     Workspace(WorkspaceError),
     Pathspec(PathspecError),
     Lockfile(LockfileError),
-    // TODO: add the path to the unsupported file
-    UnsupportedFileType,
+    UnsupportedFileType { path: RepoPath },
     // user provided path verbatim
-    NoMatch { path: OsString },
+    FoundNoMatch { path: OsString },
 }
 
-impl From<RepoError> for AddError {
-    fn from(err: RepoError) -> Self {
-        AddError::Repo(err)
+impl Error for AddError {}
+
+impl fmt::Display for AddError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AddError::Repository(err) => write!(f, "{err}"),
+            // the actual index error is kept internally but no specific information is provided
+            // the user can't really do much with an error like bad padding at ...
+            AddError::Index(_) => write!(f, "invalid index format"),
+            // TODO: maybe same behavior as Index?
+            AddError::Database(err) => write!(f, "{err}"),
+            AddError::Workspace(err) => write!(f, "{err}"),
+            AddError::Pathspec(err) => write!(f, "{err}"),
+            AddError::Lockfile(err) => write!(f, "{err}"),
+            AddError::UnsupportedFileType { path } => {
+                write!(f, "unsupported file type at '{}'", path.display())
+            }
+            AddError::FoundNoMatch { path } => {
+                write!(
+                    f,
+                    "path '{}' did not match any files",
+                    path.to_string_lossy()
+                )
+            }
+        }
+    }
+}
+
+impl From<DiscoverError> for AddError {
+    fn from(err: DiscoverError) -> Self {
+        AddError::Repository(err)
     }
 }
 
@@ -223,7 +251,7 @@ impl From<IndexError> for AddError {
 
 impl From<DbError> for AddError {
     fn from(err: DbError) -> Self {
-        AddError::DbError(err)
+        AddError::Database(err)
     }
 }
 

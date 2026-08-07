@@ -1,6 +1,8 @@
 use std::io;
+use crate::cmd::print::Printer;
+use crate::cmd::status::print::StatusPrinter;
 use crate::repo::index::{Index, IndexError};
-use crate::repo::{RepoError, Repository};
+use crate::repo::{DiscoverError, Repository};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::report::{Report, ReportError};
 
@@ -53,7 +55,9 @@ impl Status {
                 lockfile.commit()?;
             }
         }
-        print::print(&report, Format::default()).map_err(StatusError::Io)?;
+        let printer = StatusPrinter { format: Format::default() };
+        printer.print(&report).map_err(StatusError::Io)?;
+
         Ok(())
     }
 }
@@ -63,15 +67,15 @@ pub(super) enum StatusError {
     Index(IndexError),
     BadReport(ReportError),
     Lockfile(LockfileError),
-    Repository(RepoError),
+    Repository(DiscoverError),
     // occurs when trying to print to the terminal, compared to the other Io variants we had there
     // is no path
     Io(io::Error),
 }
 
 
-impl From<RepoError> for StatusError {
-    fn from(err: RepoError) -> Self {
+impl From<DiscoverError> for StatusError {
+    fn from(err: DiscoverError) -> Self {
         StatusError::Repository(err)
     }
 }

@@ -1,10 +1,10 @@
 use crate::repo::db::{Database, DbError};
 use crate::repo::index::Index;
+use crate::repo::object::mode::Mode;
 use crate::repo::object::{Entry, Object, Oid};
+use crate::repo::path::RepoPath;
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
-use crate::repo::object::mode::Mode;
-use crate::repo::path::RepoPath;
 
 enum TreeNode {
     Blob { oid: Oid, mode: Mode },

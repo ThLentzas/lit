@@ -18,3 +18,4 @@ fn main() {
 // TODO: should Io error variants be merged if another variant which is also an enum has an Io variant too?
 // Workspace::Io and Workspace::OsError::Io
 // TODO: add a rustfmt file
+// TODO: expected, actual on errors.

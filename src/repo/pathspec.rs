@@ -1,9 +1,11 @@
-use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path, PathBuf};
 use crate::repo::os;
 use crate::repo::path::RepoPath;
+use std::error::Error;
+use std::ffi::{OsStr, OsString};
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
 
-// toDo: add magic support, what is known as glob
+// TODO: add magic support, what is known as glob
 // the set of paths certain commands should operate on
 #[derive(Debug)]
 pub(crate) struct Pathspec {
@@ -30,7 +32,8 @@ impl Pathspec {
     pub(crate) fn new(arg: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
         let normalized = if Path::new(arg).is_absolute() {
             let absolute = normalize_absolute(arg.as_ref())?;
-            absolute.strip_prefix(root)
+            absolute
+                .strip_prefix(root)
                 .map(Path::to_path_buf)
                 .map_err(|_| PathspecError::OutsideRepository {
                     path: PathBuf::from(arg),
@@ -47,15 +50,25 @@ impl Pathspec {
             // each iteration after it has already being moved despite using ? at the end.
             let name = match os::os_str_as_bytes(component.as_os_str()) {
                 Ok(bytes) => bytes,
-                Err(_) => return Err(PathspecError::NotUnicode { path: normalized })
+                Err(_) => {
+                    // we pass the user provided path not the normalized version
+                    return Err(PathspecError::NotUnicode {
+                        path: PathBuf::from(arg),
+                    });
+                }
             };
             if memchr::memchr(0, &name).is_some() {
-                return Err(PathspecError::ContainsNul);
+                return Err(PathspecError::ContainsNul {
+                    path: PathBuf::from(arg),
+                });
             }
             pattern = pattern.join(&name);
         }
 
-        Ok(Self { original: arg.to_os_string(), pattern })
+        Ok(Self {
+            original: arg.to_os_string(),
+            pattern,
+        })
     }
 }
 
@@ -137,12 +150,39 @@ fn normalize_relative(relative: &Path, prefix: &Path) -> Result<PathBuf, Pathspe
     Ok(path)
 }
 
+// we could do a struct with path, kind but too few variants
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PathspecError {
     OutsideRepository { path: PathBuf },
     ReservedComponent { path: PathBuf, component: OsString },
     NotUnicode { path: PathBuf },
-    ContainsNul
+    ContainsNul { path: PathBuf },
+}
+
+impl Error for PathspecError {}
+
+impl fmt::Display for PathspecError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PathspecError::OutsideRepository { path } => {
+                write!(f, "path '{}' is outside the repository", path.display())
+            }
+            PathspecError::ReservedComponent { path, component } => {
+                write!(
+                    f,
+                    "path '{}' contains reserved component '{}'",
+                    path.display(),
+                    component.to_string_lossy()
+                )
+            }
+            PathspecError::NotUnicode { path } => {
+                write!(f, "path '{}' is not valid Unicode", path.display())
+            }
+            PathspecError::ContainsNul { path } => {
+                write!(f, "path '{}' contains a NUL byte", path.display())
+            }
+        }
+    }
 }
 
 #[cfg(test)]

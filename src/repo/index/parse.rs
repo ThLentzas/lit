@@ -1,7 +1,7 @@
 use super::{FormatError, FormatErrorKind, IndexEntry};
 use crate::repo::index;
-use crate::repo::object::mode::Mode;
 use crate::repo::object::Oid;
+use crate::repo::object::mode::Mode;
 use crate::repo::os::FileStat;
 use crate::repo::path::RepoPath;
 
@@ -62,7 +62,7 @@ impl<'a> Parser<'a> {
         // The index records the staged version of a path, while the workspace file may have changed
         // or been deleted since git add. db.load() is such case where the object might be missing, or
         // we can have a hash mismatch, the object stored under that OID is corrupt or misplaced.
-        let oid = unsafe { Oid::from_bytes_unchecked(*bytes) } ;
+        let oid = unsafe { Oid::from_bytes_unchecked(*bytes) };
         let flags = u16::from_be_bytes(*self.take::<2>()?);
         let path;
         // we extract the lowest 12 bits which is where we stored the path len
@@ -72,7 +72,6 @@ impl<'a> Parser<'a> {
         } else {
             path = self.read_path(path_len as usize)?;
         }
-
         let size = self.pos - entry_offset;
         self.skip_padding(size)?;
 
@@ -90,7 +89,7 @@ impl<'a> Parser<'a> {
         if self.pos + path_len >= self.buf.len() {
             return Err(FormatError::at(
                 self.pos,
-                FormatErrorKind::Eof {
+                FormatErrorKind::UnexpectedEof {
                     needed: path_len,
                     remaining: self.remaining(),
                 },
@@ -105,24 +104,13 @@ impl<'a> Parser<'a> {
         // move to the next byte after the path that according to the format should be NUL
         self.pos = start + path_len;
 
-        match self.buf.get(self.pos) {
-            // move past NUL
-            Some(0) => self.advance(1),
-            Some(_) => {
-                return Err(FormatError::at(
-                    self.pos,
-                    FormatErrorKind::MissingNulTerminator,
-                ));
-            }
-            None => {
-                return Err(FormatError::at(
-                    self.pos,
-                    FormatErrorKind::Eof {
-                        needed: 1,
-                        remaining: self.remaining(),
-                    },
-                ));
-            }
+        if let Some(0) = self.buf.get(self.pos) {
+            self.advance(1);
+        } else {
+            return Err(FormatError::at(
+                self.pos,
+                FormatErrorKind::MissingNulTerminator,
+            ));
         }
         Ok(path)
     }
@@ -143,10 +131,7 @@ impl<'a> Parser<'a> {
         let Some(relative_pos) = memchr::memchr(0, &self.buf[start..]) else {
             return Err(FormatError::at(
                 self.buf.len(),
-                FormatErrorKind::Eof {
-                    needed: 1,
-                    remaining: 0,
-                },
+                FormatErrorKind::MissingNulTerminator,
             ));
         };
 
@@ -156,7 +141,7 @@ impl<'a> Parser<'a> {
         if nul_pos - start < index::PATH_MAX_SIZE as usize {
             return Err(FormatError::at(
                 start,
-                FormatErrorKind::LongPathLenMissMatch,
+                FormatErrorKind::LongPathLenMisMatch,
             ));
         }
 
@@ -187,9 +172,12 @@ impl<'a> Parser<'a> {
                 }
                 Some(_) => return Err(FormatError::at(self.pos, FormatErrorKind::InvalidPadding)),
                 None => {
+                    // self.pos is exactly the byte offset where we expected the next byte to exist
+                    // self.pos - 1 points to the last valid byte, which didn't actually cause the
+                    // error
                     return Err(FormatError::at(
-                        self.pos - 1,
-                        FormatErrorKind::Eof {
+                        self.pos,
+                        FormatErrorKind::UnexpectedEof {
                             needed: 1,
                             remaining: 0,
                         },
@@ -231,7 +219,7 @@ impl<'a> Parser<'a> {
                 .try_into()
                 .map_err(|_| FormatError {
                     offset: self.pos,
-                    kind: FormatErrorKind::Eof {
+                    kind: FormatErrorKind::UnexpectedEof {
                         needed: N,
                         remaining,
                     },
@@ -241,7 +229,7 @@ impl<'a> Parser<'a> {
         Ok(bytes)
     }
 
-    pub(super) fn is_exhausted(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.remaining() == 0
     }
 
