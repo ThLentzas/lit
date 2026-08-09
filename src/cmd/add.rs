@@ -124,13 +124,13 @@ impl<'a> EntryCollector<'a> {
     // standard recursive approach, collect is the function that triggers the recursion with some
     // initial state
     fn collect(&mut self) -> Result<(), AddError> {
-        Ok(self.collect_entries(&self.path, &self.node)?)
+        self.collect_entries(self.path, self.node)
     }
 
     fn collect_entries(&mut self, path: &RepoPath, node: &StatNode) -> Result<(), AddError> {
         match node.kind {
             FileKind::Regular(_) => {
-                let content = self.workspace.read_file(&path)?;
+                let content = self.workspace.read_file(path)?;
                 let oid = self.db.store(Object::Blob(content))?;
                 // Safe to unwarp because file kind is regular and has a corresponding Mode
                 let mode = Mode::try_from(node.kind).unwrap();
@@ -155,7 +155,7 @@ impl<'a> EntryCollector<'a> {
                 // size = content.len() when we call status, the stat call there will return 0,
                 // different size, we have to rehash and see that the oid are unchanged which is not
                 // correct, can't have different size but identical hashes.
-                let content = self.workspace.read_link(&path)?;
+                let content = self.workspace.read_link(path)?;
                 let oid = self.db.store(Object::Blob(content))?;
                 // Safe to unwarp because file kind is symlink and has a corresponding Mode
                 let mode = Mode::try_from(node.kind).unwrap();
@@ -165,7 +165,7 @@ impl<'a> EntryCollector<'a> {
             FileKind::Directory => {
                 // TODO: check if the mode returned by stat() contains permission bits
                 // TODO: look at --ignore-errors flag
-                for (path, node) in self.workspace.dir_entries(&path)? {
+                for (path, node) in self.workspace.dir_entries(path)? {
                     self.collect_entries(&path, &node)?;
                 }
             }

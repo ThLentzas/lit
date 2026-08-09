@@ -1,8 +1,8 @@
 mod parse;
 
 use crate::repo::index::parse::Parser;
-use crate::repo::object::Oid;
 use crate::repo::object::mode::Mode;
+use crate::repo::object::oid::Oid;
 use crate::repo::os::FileStat;
 use crate::repo::path::{PathError, RepoPath};
 use sha1::{Digest, Sha1};
@@ -97,7 +97,7 @@ impl IndexEntry {
         bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
         bytes.extend_from_slice(self.oid.as_bytes()); // in the docs this is called Object name
         bytes.extend_from_slice(&self.flags.to_be_bytes());
-        bytes.extend_from_slice(&self.path.as_bytes()); // in the docs, is called Entry path name
+        bytes.extend_from_slice(self.path.as_bytes()); // in the docs, is called Entry path name
         // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
         // multiple of 8
         //
@@ -191,7 +191,7 @@ impl Index {
     // from resolve_conflicts() we need to find the child entry path. Read lower_bound()
     // This logic handles untracked(non-empty) directories.
     pub(crate) fn is_tracked(&self, path: &RepoPath) -> bool {
-        if self.contains(&path) {
+        if self.contains(path) {
             return true;
         }
         // TODO: test it
@@ -425,8 +425,27 @@ pub(crate) enum IndexError {
     Io { path: PathBuf, source: io::Error },
 }
 
+impl Error for IndexError {}
+
+// errors that have IndexError as a variant will include a generic error message and not carry the
+// actual format error since the user can't do anything if the format is broken
+impl fmt::Display for IndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IndexError::InvalidChecksum => write!(f, "invalid index checksum"),
+            IndexError::UnsupportedVersion(version) => {
+                write!(f, "unsupported index version {version}")
+            }
+            IndexError::InvalidFormat(err) => write!(f, "{err}"),
+            IndexError::Io { path, source } => {
+                write!(f, "{}: {source}", path.display())
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
-pub(super) enum FormatErrorKind {
+pub(crate) enum FormatErrorKind {
     UnexpectedEof { needed: usize, remaining: usize },
     InvalidSignature,
     EntriesOutOfSorted,
@@ -468,7 +487,7 @@ impl fmt::Display for FormatErrorKind {
 }
 
 #[derive(Debug)]
-pub(super) struct FormatError {
+pub(crate) struct FormatError {
     pub(super) offset: usize,
     pub(super) kind: FormatErrorKind,
 }

@@ -1,7 +1,8 @@
 use crate::repo::db::{Database, DbError};
 use crate::repo::index::Index;
 use crate::repo::object::mode::Mode;
-use crate::repo::object::{Entry, Object, Oid};
+use crate::repo::object::oid::Oid;
+use crate::repo::object::{Entry, Object};
 use crate::repo::path::RepoPath;
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;

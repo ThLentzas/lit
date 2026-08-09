@@ -15,6 +15,7 @@ pub(super) mod workspace;
 use std::error::Error;
 use std::path::PathBuf;
 use std::{env, fmt, fs, io};
+// TODO: if repo never calls anything from cmd we good in terms of design it is clear separation
 
 // Repository knows the paths to files like .lit/objects, .lit/config etc, path layout
 // unlike the user provided paths that have to go through Workspace, these paths are known

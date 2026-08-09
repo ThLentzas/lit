@@ -1,10 +1,10 @@
-use std::io;
 use crate::cmd::print::Printer;
 use crate::cmd::status::print::StatusPrinter;
 use crate::repo::index::{Index, IndexError};
-use crate::repo::{DiscoverError, Repository};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::report::{Report, ReportError};
+use crate::repo::{DiscoverError, Repository};
+use std::io;
 
 mod print;
 
@@ -16,15 +16,16 @@ mod print;
 // submodule states
 // typechange as a separate status category
 
+// impl Default for Format {
+//     fn default() -> Self {
+//         Format::Long
+//     }
+// }
+#[derive(Default)]
 enum Format {
     Short,
+    #[default]
     Long,
-}
-
-impl Default for Format {
-    fn default() -> Self {
-        Format::Long
-    }
 }
 
 #[derive(Default)]
@@ -39,23 +40,22 @@ impl Status {
         //
         // the refresh is optional if for whatever reason we fail to acquire the lock we still want
         // to report the changes.
-        let lock = match Lockfile::acquire(&index.path) {
-            Ok(lock) => Some(lock),
-            Err(_) => None,
-        };
+        let lock = Lockfile::acquire(&index.path).ok();
         index.load()?;
         let report = Report::generate(&repo, &index)?;
 
-        if let Some(mut lockfile) = lock {
-            if !report.refreshes.is_empty() {
-                for (i, node) in report.refreshes.iter() {
-                    index.refresh_entry_stat(*i, node.stat);
-                }
-                lockfile.write(&index.serialize())?;
-                lockfile.commit()?;
+        if let Some(mut lockfile) = lock
+            && !report.refreshes.is_empty()
+        {
+            for (i, node) in report.refreshes.iter() {
+                index.refresh_entry_stat(*i, node.stat);
             }
+            lockfile.write(&index.serialize())?;
+            lockfile.commit()?;
         }
-        let printer = StatusPrinter { format: Format::default() };
+        let printer = StatusPrinter {
+            format: Format::default(),
+        };
         printer.print(&report).map_err(StatusError::Io)?;
 
         Ok(())
@@ -72,7 +72,6 @@ pub(super) enum StatusError {
     // is no path
     Io(io::Error),
 }
-
 
 impl From<DiscoverError> for StatusError {
     fn from(err: DiscoverError) -> Self {

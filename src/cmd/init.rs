@@ -151,7 +151,7 @@ impl fmt::Display for InitError {
                     f,
                     "{} already exists and is not a {}",
                     path.display(),
-                    entry.to_string()
+                    entry
                 )
             }
         }
@@ -166,14 +166,15 @@ pub(super) enum EntryType {
     Other,
 }
 
-impl EntryType {
-    fn to_string(&self) -> String {
-        match self {
-            EntryType::File => "file".to_owned(),
-            EntryType::Directory => "directory".to_owned(),
-            EntryType::Symlink => "symlink".to_owned(),
-            EntryType::Other => "other".to_owned(),
-        }
+impl fmt::Display for EntryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            EntryType::File => "file",
+            EntryType::Directory => "directory",
+            EntryType::Symlink => "symlink",
+            EntryType::Other => "other",
+        };
+        f.write_str(label)
     }
 }
 

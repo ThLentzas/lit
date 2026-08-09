@@ -32,10 +32,7 @@ impl Commit {
         //
         // the refresh is optional if for whatever reason we fail to acquire the lock we still want
         // to commit our changes.
-        let lock = match Lockfile::acquire(&index.path) {
-            Ok(lock) => Some(lock),
-            Err(_) => None,
-        };
+        let lock = Lockfile::acquire(&index.path).ok();
 
         index.load()?;
         if let Some(lock) = lock {
@@ -62,6 +59,7 @@ impl Commit {
         Ok(())
     }
 }
+
 fn index_background_refreshing(
     index: &mut Index,
     mut lock: Lockfile,

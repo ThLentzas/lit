@@ -3,8 +3,11 @@ mod print;
 use crate::cmd::cat_file::print::CatFilePrinter;
 use crate::cmd::print::Printer;
 use crate::repo::db::{Database, DbError};
-use crate::repo::object::{ObjectType, Oid};
+use crate::repo::object::ObjectType;
+use crate::repo::object::oid::Oid;
 use crate::repo::{DiscoverError, Repository};
+use core::fmt;
+use std::error::Error;
 use std::ffi::OsString;
 use std::io;
 
@@ -14,8 +17,6 @@ pub(crate) struct CatFile {
 }
 
 impl CatFile {
-    // TODO: we need to support the shortest prefix that is unique and since it is unique we can
-    // return that object, jon in his impl mentions using glob around 32:00
     // if the user wrote cat-file <oid> this prints a message like "either provide the type or use -p flag"
     pub(super) fn execute(&self) -> Result<(), CatFileError> {
         let repo = Repository::discover()?;
@@ -26,8 +27,13 @@ impl CatFile {
         let oid = self
             .oid
             .to_str()
-            .and_then(|s| Oid::from_hex(s).ok())
             .ok_or_else(|| CatFileError::BadOid(self.oid.clone()))?;
+        let oid = if oid.len() < 40 {
+            db.resolve_oid_prefix(oid)?
+        } else {
+            Oid::from_hex(oid).map_err(|_| CatFileError::BadOid(self.oid.clone()))?
+        };
+
         let actual = self
             .obj_type
             .to_str()
@@ -38,9 +44,9 @@ impl CatFile {
             Some(object) => {
                 let expected = object.obj_type();
                 if expected != actual {
-                    return Err(CatFileError::TypeMisMatch { expected, actual });
+                    return Err(CatFileError::TypeMismatch { expected, actual });
                 }
-                let printer = CatFilePrinter{};
+                let printer = CatFilePrinter {};
                 printer.print(&object)?;
             }
             None => return Err(CatFileError::NotFound(oid)),
@@ -52,27 +58,51 @@ impl CatFile {
 
 #[derive(Debug)]
 pub(super) enum CatFileError {
-    RepoError(DiscoverError),
+    Repository(DiscoverError),
     UnknownType(OsString),
     BadOid(OsString),
-    DbError(DbError),
+    Database(DbError),
     NotFound(Oid),
-    TypeMisMatch {
+    TypeMismatch {
         expected: ObjectType,
         actual: ObjectType,
     },
     Io(io::Error),
 }
 
+impl Error for CatFileError {}
+
+impl fmt::Display for CatFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CatFileError::Repository(err) => write!(f, "{err}"),
+            CatFileError::UnknownType(obj_type) => {
+                write!(f, "unknown object type '{}'", obj_type.to_string_lossy())
+            }
+            CatFileError::BadOid(oid) => {
+                write!(f, "invalid object id '{}'", oid.to_string_lossy())
+            }
+            CatFileError::Database(err) => write!(f, "{err}"),
+            CatFileError::NotFound(oid) => {
+                write!(f, "object {} not found", oid.to_hex())
+            }
+            CatFileError::TypeMismatch { expected, actual } => {
+                write!(f, "object type mismatch: expected {expected}, got {actual}")
+            }
+            CatFileError::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
 impl From<DiscoverError> for CatFileError {
     fn from(err: DiscoverError) -> Self {
-        CatFileError::RepoError(err)
+        CatFileError::Repository(err)
     }
 }
 
 impl From<DbError> for CatFileError {
     fn from(err: DbError) -> Self {
-        CatFileError::DbError(err)
+        CatFileError::Database(err)
     }
 }
 

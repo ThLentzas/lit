@@ -1,6 +1,7 @@
 use crate::repo::db::DbError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
-use crate::repo::object::{Oid, OidError};
+use crate::repo::object::OidError;
+use crate::repo::object::oid::Oid;
 use std::error::Error;
 use std::path::PathBuf;
 use std::{fmt, fs, io};

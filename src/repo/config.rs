@@ -3,8 +3,7 @@ use crate::repo::os;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
 pub(super) mod parse;
@@ -20,6 +19,8 @@ struct Line {
     kind: LineKind,
 }
 
+// the .gitconfig which the global file Git looks for any configuration is created lazily on first
+// write, unlike .git/config which is created when we call init
 // TODO: global, system, Read Chapter 25.2.3 and 25.3
 pub(crate) struct Config {
     local: PathBuf,
@@ -71,6 +72,7 @@ impl Config {
         }
     }
 
+    // TODO: when config is invoked as a command, impl Printer
     pub(crate) fn get_str(&self, name: &OsStr) -> Result<Option<&str>, ConfigError> {
         match self.get(name) {
             // valueless boolean
@@ -253,10 +255,10 @@ impl ConfigKey {
     // while the subsection must remain as is.
     //
     // For now, we mimic the behavior where name is everything past the last dot. Section is everything
-    // up to the first dot, the rest is the subsection. If there is only one '.', it's always section-name
+    // up to the first dot, the rest is the subsection. If there is only one '.', it's always
+    // section-name
     fn from_name(name: &OsStr) -> Option<Self> {
         let bytes = os::os_str_as_bytes(name).ok()?;
-        // rposition finds '.' starting from the back
         let pos = bytes.iter().rposition(|&b| b == b'.')?;
         let header = &bytes[..pos];
         let name = &bytes[pos + 1..];
@@ -291,7 +293,6 @@ impl ConfigKey {
     }
 }
 
-// TODO: prefix try typically returns a Result, change the name
 fn try_downcase(buf: &[u8]) -> Option<Vec<u8>> {
     let mut bytes = Vec::with_capacity(buf.len());
 

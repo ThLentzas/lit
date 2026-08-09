@@ -76,8 +76,8 @@ impl Printer for StatusPrinter {
 
     fn print(&self, value: &Self::T) -> io::Result<()> {
         match self.format {
-            Format::Short => print_short(&value),
-            Format::Long => print_long(&value),
+            Format::Short => print_short(value),
+            Format::Long => print_long(value),
         }
     }
 }
@@ -93,9 +93,9 @@ fn print_long(report: &Report) -> io::Result<()> {
     let staged = report.changes.iter().filter_map(|(path, change)| {
         change.head_index.as_ref().map(|ch| {
             let label = match ch {
-                HeadIndexChange::ADDED => "new file:",
-                HeadIndexChange::MODIFIED => "modified:",
-                HeadIndexChange::DELETED => "deleted:",
+                HeadIndexChange::Added => "new file:",
+                HeadIndexChange::Modified => "modified:",
+                HeadIndexChange::Deleted => "deleted:",
             };
             (path.as_bytes(), label)
         })
@@ -103,8 +103,8 @@ fn print_long(report: &Report) -> io::Result<()> {
     let unstaged = report.changes.iter().filter_map(|(path, change)| {
         change.workspace_index.as_ref().map(|ch| {
             let label = match ch {
-                WorkspaceIndexChange::MODIFIED => "modified:",
-                WorkspaceIndexChange::DELETED => "deleted:",
+                WorkspaceIndexChange::Modified => "modified:",
+                WorkspaceIndexChange::Deleted => "deleted:",
             };
             (path.as_bytes(), label)
         })

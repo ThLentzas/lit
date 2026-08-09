@@ -1,7 +1,5 @@
 use std::error::Error;
 use std::fmt;
-use crate::repo::pathspec::PathspecError;
-use crate::repo::workspace::WorkspaceError;
 
 // Represents the internal on disk path format. Paths are always root relative. No leading/trailing
 // slash, components can't be empty, can't contain NUL and components are always joined by '/' regardless
@@ -129,7 +127,7 @@ impl RepoPath {
         // predicate returned true, this is why we can call componenets().peekable() and components.next()
         self.inner.split(|&byte| byte == b'/')
     }
-    
+
     pub(crate) fn display(&self,) -> String {
        String::from_utf8_lossy(&self.inner).to_string()
     }
@@ -147,7 +145,7 @@ pub(super) enum PathErrorKind {
 }
 
 #[derive(Debug)]
-pub(super) struct PathError {
+pub(crate) struct PathError {
     pub(super) path: Vec<u8>,
     pub(super) kind: PathErrorKind,
 }

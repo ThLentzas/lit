@@ -1,3 +1,4 @@
+use std::fmt;
 use chrono::{Local, Offset};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -84,11 +85,13 @@ impl Timestamp {
             Err(TimestampError::BadTimezone)
         }
     }
+}
 
-    pub(crate) fn to_string(&self) -> String {
+impl fmt::Display for Timestamp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // SAFETY: the [u8; 5] is always ASCII
         let timezone = unsafe { String::from_utf8_unchecked(self.timezone.to_vec()) };
-        format!("{} {}", self.unix.to_string(), timezone)
+        write!(f, "{} {}", self.unix, timezone)
     }
 }
 
@@ -102,7 +105,7 @@ impl Timestamp {
 //       22:13:13 +0200
 //
 // The parser treats the CRLF followed by whitespace as if it were just a space. It exists because
-// RFC 2822 is an email-message format and Email headers can be long, so they can be “folded” across
+// RFC 2822 is an email-message format and Email headers can be long, so they can be folded across
 // multiple physical lines.
 fn normalize_fws(input: &str) -> String {
     let bytes = input.as_bytes();

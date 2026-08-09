@@ -1,7 +1,7 @@
 use super::{FormatError, FormatErrorKind, IndexEntry};
 use crate::repo::index;
-use crate::repo::object::Oid;
 use crate::repo::object::mode::Mode;
+use crate::repo::object::oid::Oid;
 use crate::repo::os::FileStat;
 use crate::repo::path::RepoPath;
 
@@ -62,16 +62,15 @@ impl<'a> Parser<'a> {
         // The index records the staged version of a path, while the workspace file may have changed
         // or been deleted since git add. db.load() is such case where the object might be missing, or
         // we can have a hash mismatch, the object stored under that OID is corrupt or misplaced.
-        let oid = unsafe { Oid::from_bytes_unchecked(*bytes) };
+        let oid = Oid::from_bytes(*bytes);
         let flags = u16::from_be_bytes(*self.take::<2>()?);
-        let path;
         // we extract the lowest 12 bits which is where we stored the path len
         let path_len = flags & 0xfff;
-        if path_len == index::PATH_MAX_SIZE {
-            path = self.read_path_until_nul()?;
+        let path = if path_len == index::PATH_MAX_SIZE {
+            self.read_path_until_nul()?
         } else {
-            path = self.read_path(path_len as usize)?;
-        }
+            self.read_path(path_len as usize)?
+        };
         let size = self.pos - entry_offset;
         self.skip_padding(size)?;
 
@@ -139,10 +138,7 @@ impl<'a> Parser<'a> {
         // the position of the NUL with respect to the whole buffer is start + relative
         let nul_pos = start + relative_pos;
         if nul_pos - start < index::PATH_MAX_SIZE as usize {
-            return Err(FormatError::at(
-                start,
-                FormatErrorKind::LongPathLenMisMatch,
-            ));
+            return Err(FormatError::at(start, FormatErrorKind::LongPathLenMisMatch));
         }
 
         let path_bytes = &self.buf[start..nul_pos];

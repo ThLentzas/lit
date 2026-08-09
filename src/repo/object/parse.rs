@@ -278,7 +278,7 @@ fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
         .take::<20>()
         .map_err(|err| TreeEntryError::new(err.offset, TreeEntryErrorKind::TruncatedOid))?;
     // this exactly the same logic as index/parse.rs
-    let oid = unsafe { Oid::from_bytes_unchecked(*oid) };
+    let oid = Oid::from_bytes(*oid);
     Ok(Entry {
         mode,
         name: name.to_vec(),

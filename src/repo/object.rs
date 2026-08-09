@@ -6,67 +6,11 @@ use std::env::{self, VarError};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
+use crate::repo::object::oid::Oid;
 
 pub(crate) mod mode;
 mod parse;
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct Oid {
-    inner: [u8; 20],
-}
-
-impl Oid {
-    pub(crate) fn from_bytes(bytes: [u8; 20]) -> Result<Self, OidError> {
-        for (index, &b) in bytes.iter().enumerate() {
-            if !is_hex_digit(b) {
-                return Err(OidError::BadDigit {
-                    pos: index,
-                    digit: b,
-                });
-            }
-        }
-
-        Ok(Self { inner: bytes })
-    }
-
-    pub(crate) unsafe fn from_bytes_unchecked(bytes: [u8; 20]) -> Self {
-        Self { inner: bytes }
-    }
-
-    pub(crate) fn from_hex_bytes(hex: &[u8]) -> Result<Self, OidError> {
-        if hex.len() != 40 {
-            return Err(OidError::BadLength);
-        }
-        let mut inner = [0u8; 20];
-        let mut i = 0;
-
-        for pair in hex.chunks_exact(2) {
-            inner[i] = pair_to_u8(pair.try_into().unwrap()).map_err(|err| OidError::BadDigit {
-                pos: i + err.pos,
-                digit: err.digit,
-            })?;
-            i += 1;
-        }
-        Ok(Self { inner })
-    }
-
-    pub(crate) fn from_hex(hex: &str) -> Result<Self, OidError> {
-        let bytes = hex.as_bytes();
-        Self::from_hex_bytes(bytes)
-    }
-
-    pub(crate) fn to_hex(&self) -> String {
-        self.inner.iter().map(|b| format!("{:02x}", b)).collect()
-    }
-
-    pub(crate) fn as_bytes(&self) -> &[u8; 20] {
-        &self.inner
-    }
-    // TODO: const and _inner()
-    pub(crate) fn inner(&self) -> [u8; 20] {
-        self.inner
-    }
-}
+pub(crate) mod oid;
 
 pub(crate) struct Entry {
     pub(crate) mode: Mode,
@@ -203,20 +147,23 @@ pub(crate) enum ObjectType {
 }
 
 impl ObjectType {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Blob => "blob",
-            Self::Tree => "tree",
-            Self::Commit => "commit",
-        }
-    }
-
     pub(crate) fn try_from_str(val: &str) -> Option<Self> {
         match val {
             "blob" => Some(Self::Blob),
             "tree" => Some(Self::Tree),
             "commit" => Some(Self::Commit),
             _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ObjectType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // when it is a literal we can write it directly without write!(f, "{}", "blob")
+            ObjectType::Blob => write!(f, "blob"),
+            ObjectType::Tree => write!(f, "tree"),
+            ObjectType::Commit => write!(f, "commit")
         }
     }
 }
@@ -321,6 +268,12 @@ impl From<ConfigError> for SignatureError {
     }
 }
 
+unsafe fn pair_to_u8_unchecked(buf: &[u8; 2]) -> u8 {
+    let first = to_base10_digit(buf[0]);
+    let second = to_base10_digit(buf[1]);
+    (first << 4) | second
+}
+
 fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {
     let first = buf[0];
     let second = buf[1];
@@ -369,7 +322,7 @@ fn to_base10_digit(byte: u8) -> u8 {
 // we can't use the is_ascii_hex() from std because it includes the capital case letters and Git
 // writes the hash always using lower case letters. Even if they are same in some sense, we have to
 // stay case-sensitive because they produce different hashes when it comes to storing commits.
-fn is_hex_digit(byte: u8) -> bool {
+pub(crate) fn is_hex_digit(byte: u8) -> bool {
     matches!(byte, b'0'..=b'9' | b'a'..=b'f')
 }
 

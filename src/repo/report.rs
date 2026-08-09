@@ -1,7 +1,8 @@
 use crate::repo::db::{Database, DbError};
 use crate::repo::index::{Index, IndexEntry};
 use crate::repo::object::mode::Mode;
-use crate::repo::object::{Object, Oid, OidError};
+use crate::repo::object::oid::Oid;
+use crate::repo::object::{Object, OidError};
 use crate::repo::os::{FileKind, StatNode};
 use crate::repo::path::RepoPath;
 use crate::repo::refs::{RefError, Refs};
@@ -13,15 +14,15 @@ use std::fmt;
 
 // green for new, orange for modified, red for deleted, something else for untracked
 pub(crate) enum HeadIndexChange {
-    ADDED,    // exists in the index but not in HEAD
-    MODIFIED, // exists in both but modified in the index
-    DELETED,  // exists in HEAD but not in the index
+    Added,    // exists in the index but not in HEAD
+    Modified, // exists in both but modified in the index
+    Deleted,  // exists in HEAD but not in the index
 }
 
 pub(crate) enum WorkspaceIndexChange {
     //   UNTRACKED, // exists in the workspac but not in index
-    MODIFIED, // exists in both but modified in workspace
-    DELETED,  // exists in index but not in workspace
+    Modified, // exists in both but modified in workspace
+    Deleted,  // exists in index but not in workspace
 }
 
 // A file can participate in both comparisons, Index <-> HEAD, Workspace <-> Index.
@@ -81,9 +82,9 @@ impl Report {
             path: repo.refs_path(),
         };
         report.load_head_entries(&refs, &db)?;
-        report.scan_workspace(&workspace, &index, &RepoPath::new())?;
-        report.check_index_against(&index, &workspace)?;
-        report.check_staged_deletions(&index);
+        report.scan_workspace(&workspace, index, &RepoPath::new())?;
+        report.check_index_against(index, &workspace)?;
+        report.check_staged_deletions(index);
 
         Ok(report)
     }
@@ -144,7 +145,7 @@ impl Report {
                 self.changes
                     .entry(entry.path.clone())
                     .or_default()
-                    .workspace_index = Some(WorkspaceIndexChange::DELETED);
+                    .workspace_index = Some(WorkspaceIndexChange::Deleted);
             }
             // At this point the entry is found in both workspace and index, we need to check
             // if it has changed and refresh the index.
@@ -165,7 +166,7 @@ impl Report {
                     self.changes
                         .entry(entry.path.clone())
                         .or_default()
-                        .workspace_index = Some(WorkspaceIndexChange::MODIFIED);
+                        .workspace_index = Some(WorkspaceIndexChange::Modified);
                     // this is the tricky part: Coglan mentions in 9.2.4 that a timestamp mismatch
                     // does not automatically mean modified, it means maybe changed, need to
                     // verify by reading and hashing the file. Because we can touch a file and
@@ -191,7 +192,7 @@ impl Report {
                         self.changes
                             .entry(entry.path.clone())
                             .or_default()
-                            .workspace_index = Some(WorkspaceIndexChange::MODIFIED);
+                            .workspace_index = Some(WorkspaceIndexChange::Modified);
                     } else {
                         // this is the only moment where we want to record the change to update
                         // the index entry based on if we acquired the lock.
@@ -213,13 +214,13 @@ impl Report {
                 self.changes
                     .entry(entry.path.clone())
                     .or_default()
-                    .head_index = Some(HeadIndexChange::MODIFIED);
+                    .head_index = Some(HeadIndexChange::Modified);
             }
             None => {
                 self.changes
                     .entry(entry.path.clone())
                     .or_default()
-                    .head_index = Some(HeadIndexChange::ADDED);
+                    .head_index = Some(HeadIndexChange::Added);
             }
             // no changes
             _ => {}
@@ -236,7 +237,7 @@ impl Report {
         workspace: &Workspace,
     ) -> Result<(), ReportError> {
         for (i, entry) in index.entries.iter().enumerate() {
-            self.check_against_workspace(workspace, i, &entry)?;
+            self.check_against_workspace(workspace, i, entry)?;
             self.check_against_head(entry);
         }
         Ok(())
@@ -249,9 +250,9 @@ impl Report {
         }
 
         for (key, _) in self.head_entries.iter() {
-            if !index.contains(&key) {
+            if !index.contains(key) {
                 self.changes.entry(key.clone()).or_default().head_index =
-                    Some(HeadIndexChange::DELETED);
+                    Some(HeadIndexChange::Deleted);
             }
         }
     }
