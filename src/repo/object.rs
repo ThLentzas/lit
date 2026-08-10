@@ -42,13 +42,13 @@ pub(crate) struct Signature {
 }
 
 impl Signature {
-    pub(crate) fn author(config: &Config) -> Result<Self, SignatureError> {
+    pub(crate) fn author(cfg: &Config) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_AUTHOR_NAME") {
             Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => match config.get_str("author.name".as_ref())? {
+                VarError::NotPresent => match cfg.get_str("author.name".as_ref())? {
                     Some(name) => name,
-                    None => config
+                    None => cfg
                         .get_str("user.name".as_ref())?
                         .ok_or(SignatureError::NotFound("author name"))?,
                 },
@@ -66,9 +66,9 @@ impl Signature {
         let email = match env::var("GIT_AUTHOR_EMAIL") {
             Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => match config.get_str("author.email".as_ref())? {
+                VarError::NotPresent => match cfg.get_str("author.email".as_ref())? {
                     Some(name) => name,
-                    None => config
+                    None => cfg
                         .get_str("user.email".as_ref())?
                         .ok_or(SignatureError::NotFound("author email"))?,
                 },
@@ -90,13 +90,13 @@ impl Signature {
         })
     }
 
-    pub(crate) fn committer(config: &Config) -> Result<Self, SignatureError> {
+    pub(crate) fn committer(cfg: &Config) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_COMMITTER_NAME") {
             Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => match config.get_str("committer.name".as_ref())? {
+                VarError::NotPresent => match cfg.get_str("committer.name".as_ref())? {
                     Some(name) => name,
-                    None => config
+                    None => cfg
                         .get_str("user.name".as_ref())?
                         .ok_or(SignatureError::NotFound("committer name"))?,
                 },
@@ -114,9 +114,9 @@ impl Signature {
         let email = match env::var("GIT_COMMITTER_EMAIL") {
             Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => match config.get_str("committer.email".as_ref())? {
+                VarError::NotPresent => match cfg.get_str("committer.email".as_ref())? {
                     Some(name) => name,
-                    None => config
+                    None => cfg
                         .get_str("user.email".as_ref())?
                         .ok_or(SignatureError::NotFound("committer email"))?,
                 },

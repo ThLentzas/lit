@@ -32,7 +32,7 @@ enum Format {
 pub(crate) struct Status {}
 
 impl Status {
-    pub(super) fn execute(&mut self) -> Result<(), StatusError> {
+    pub(super) fn execute(&self) -> Result<(), StatusError> {
         let repo = Repository::discover()?;
         let mut index = Index::new(repo.index_path());
         // When status is called Git tries to acquire the lock for index because it does something

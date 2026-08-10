@@ -425,6 +425,17 @@ pub(crate) enum IndexError {
     Io { path: PathBuf, source: io::Error },
 }
 
+impl IndexError {
+    pub(crate) fn is_format_error(&self) -> bool {
+        matches!(
+            self,
+            IndexError::InvalidChecksum
+                | IndexError::UnsupportedVersion(_)
+                | IndexError::InvalidFormat(_)
+        )
+    }
+}
+
 impl Error for IndexError {}
 
 // errors that have IndexError as a variant will include a generic error message and not carry the

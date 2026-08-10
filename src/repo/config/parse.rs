@@ -1,48 +1,36 @@
-use super::Span;
+use super::LineSpan;
 
 pub(super) struct LineParser<'a> {
     buf: &'a [u8],
     pos: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Header {
+    pub(super) name: LineSpan,
+    pub(super) subsection: Option<LineSpan>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LineKind {
     Blank,
     Comment,
-    Section {
-        name: Span,
-        subsection: Option<Span>,
-    },
-    Variable {
-        name: Span,
-        value: Option<Span>,
-    },
+    // the term section has different depending on the context
+    // for the parser is the header, the section name plus optional subsection. The variables that
+    // follow aren't part of the section token, they're separate variable lines that happen to sit
+    // under it. That is the whole point of this line oriented approach, we group by line.
+    //
+    // in the docs section means the header plus all the variables that belong to it, the whole block
+    // from one header until the next header (or EOF).
+    Header(Header),
+    Variable { name: LineSpan, value: Option<LineSpan> },
 }
 
-impl LineKind {
-    // LineParser parses a single logical line using spans that are relative to that line's slice.
-    // The Config buffer, however, stores the whole file, and all CST spans should point into that
-    // shared buffer. Shift every parsed child span by the line's starting offset so `name`,
-    // `subsection`, and `value` become absolute spans into the full input buffer.
-    pub(super) fn offset(self, base: usize) -> LineKind {
-        let shift = |s: Span| Span {
-            start: s.start + base,
-            end: s.end + base,
-        };
+// LineParser parses a single logical line using spans that are relative to that line's slice.
+// The Config buffer, however, stores the whole file, and all CST spans should point into that
+// shared buffer. Shift every parsed child span by the line's starting offset so `name`,
+// `subsection`, and `value` become absolute spans into the full input buffer.
 
-        match self {
-            LineKind::Section { name, subsection } => LineKind::Section {
-                name: shift(name),
-                subsection: subsection.map(shift),
-            },
-            LineKind::Variable { name, value } => LineKind::Variable {
-                name: shift(name),
-                value: value.map(shift),
-            },
-            other => other,
-        }
-    }
-}
 
 impl<'a> LineParser<'a> {
     pub(super) fn new(buf: &'a [u8]) -> Self {
@@ -60,12 +48,12 @@ impl<'a> LineParser<'a> {
 
         match self.peek() {
             Some(b'[') => {
-                let kind = self.parse_section()?;
+                let kind = self.parse_header()?;
                 self.check_trailing_comment()?;
-                Ok(LineKind::Section {
+                Ok(LineKind::Header(Header {
                     name: kind.0,
                     subsection: kind.1,
-                })
+                }))
             }
             Some(byte) if byte.is_ascii_alphabetic() => {
                 let variable = self.parse_variable()?;
@@ -94,12 +82,12 @@ impl<'a> LineParser<'a> {
         }
     }
 
-    fn parse_section(&mut self) -> Result<(Span, Option<Span>), ParseError> {
+    fn parse_header(&mut self) -> Result<(LineSpan, Option<LineSpan>), ParseError> {
         self.advance(1); // skip opening '['
         let start = self.pos;
 
         while let Some(&b) = self.peek() {
-            // Git supports also '.' as a value for the section name, we don't. Read config.rs
+            // Git supports also '.' as a value for the header name, we don't. Read config.rs
             if b.is_ascii_alphanumeric() || b == b'-' {
                 self.advance(1);
             } else {
@@ -107,7 +95,7 @@ impl<'a> LineParser<'a> {
             }
         }
 
-        let section = Span {
+        let section = LineSpan {
             start,
             end: self.pos,
         };
@@ -138,14 +126,14 @@ impl<'a> LineParser<'a> {
         Ok((section, Some(subsection)))
     }
 
-    fn parse_subsection(&mut self) -> Result<Span, ParseError> {
+    fn parse_subsection(&mut self) -> Result<LineSpan, ParseError> {
         let start = self.pos;
 
         // ws are allowed within ""
         while let Some(&byte) = self.peek() {
             match byte {
                 b'\"' => {
-                    let span = Span {
+                    let span = LineSpan {
                         start,
                         end: self.pos,
                     };
@@ -177,7 +165,8 @@ impl<'a> LineParser<'a> {
 
     // only values can be multiline so the check for '\' happens in parse_value() everywhere else
     // is an unexpected character.
-    fn parse_variable(&mut self) -> Result<(Span, Option<Span>), ParseError> {
+    // TODO: this should be a struct Variable similar to Header but with different semantics
+    fn parse_variable(&mut self) -> Result<(LineSpan, Option<LineSpan>), ParseError> {
         let start = self.pos;
         // the 1st character is verified that is alphabetic by the caller
         self.advance(1);
@@ -190,7 +179,7 @@ impl<'a> LineParser<'a> {
                 break;
             }
         }
-        let name = Span {
+        let name = LineSpan {
             start,
             end: self.pos,
         };
@@ -249,7 +238,7 @@ impl<'a> LineParser<'a> {
     // a Vec<Span> instead.
     // parse_value() must hold the invariance that the span of the value does not include any
     // leading/trailing ws.
-    fn parse_value(&mut self) -> Result<Span, ParseError> {
+    fn parse_value(&mut self) -> Result<LineSpan, ParseError> {
         // quotes and /<newline> are included if present, will be dropped later when we interpret the
         // value
         let start = self.pos;
@@ -292,7 +281,7 @@ impl<'a> LineParser<'a> {
                 }
                 // these 2 cases are the boundaries of the value, we either hit a newline or a comment
                 b'#' | b';' if !in_quote => break,
-                b'\n' | b'\r' => break,
+                b if b == b'\n' || b == b'\r' && matches!(self.peek(), Some(b'\n')) => break,
                 _ => self.advance(1),
             }
         }
@@ -310,7 +299,7 @@ impl<'a> LineParser<'a> {
         while end > start && matches!(self.buf[end - 1], b' ' | b'\t') {
             end -= 1;
         }
-        Ok(Span { start, end })
+        Ok(LineSpan { start, end })
     }
 
     fn check_trailing_comment(&mut self) -> Result<(), ParseError> {
@@ -407,88 +396,88 @@ mod tests {
             // section, no subsection
             (
                 b"[core]\n",
-                LineKind::Section {
-                    name: Span { start: 1, end: 5 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 5 },
                     subsection: None,
-                },
+                }),
             ),
             (
                 b"[123]",
-                LineKind::Section {
-                    name: Span { start: 1, end: 4 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 4 },
                     subsection: None,
-                },
+                }),
             ),
             (
                 b"[core]  \t\n",
-                LineKind::Section {
-                    name: Span { start: 1, end: 5 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 5 },
                     subsection: None,
-                },
+                }),
             ),
             (
                 b"[core];trailing comment\n",
-                LineKind::Section {
-                    name: Span { start: 1, end: 5 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 5 },
                     subsection: None,
-                },
+                }),
             ),
             (
                 b"[core]#trailing comment\n",
-                LineKind::Section {
-                    name: Span { start: 1, end: 5 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 5 },
                     subsection: None,
-                },
+                }),
             ),
             (
                 b"[foo-bar]",
-                LineKind::Section {
-                    name: Span { start: 1, end: 8 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 8 },
                     subsection: None,
-                },
+                }),
             ),
             (
                 b"[core ]",
-                LineKind::Section {
-                    name: Span { start: 1, end: 5 },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 5 },
                     subsection: None,
-                },
+                }),
             ),
             // section, subsection
             (
                 b"[remote \"origin\"]",
-                LineKind::Section {
-                    name: Span { start: 1, end: 7 },
-                    subsection: Some(Span { start: 9, end: 15 }),
-                },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 7 },
+                    subsection: Some(LineSpan { start: 9, end: 15 }),
+                }),
             ),
             (
                 b"[remote \"\"]",
-                LineKind::Section {
-                    name: Span { start: 1, end: 7 },
-                    subsection: Some(Span { start: 9, end: 9 }),
-                },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 7 },
+                    subsection: Some(LineSpan { start: 9, end: 9 }),
+                }),
             ),
             (
                 b"[remote \"a\\\"b\"]",
-                LineKind::Section {
-                    name: Span { start: 1, end: 7 },
-                    subsection: Some(Span { start: 9, end: 13 }),
-                },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 7 },
+                    subsection: Some(LineSpan { start: 9, end: 13 }),
+                }),
             ),
             (
                 b"[remote \"my origin\"]\n",
-                LineKind::Section {
-                    name: Span { start: 1, end: 7 },
-                    subsection: Some(Span { start: 9, end: 18 }),
-                },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 7 },
+                    subsection: Some(LineSpan { start: 9, end: 18 }),
+                }),
             ),
             (
                 b"[remote \"a b ; # c\"]\n",
-                LineKind::Section {
-                    name: Span { start: 1, end: 7 },
-                    subsection: Some(Span { start: 9, end: 18 }),
-                },
+                LineKind::Header(Header {
+                    name: LineSpan { start: 1, end: 7 },
+                    subsection: Some(LineSpan { start: 9, end: 18 }),
+                }),
             ),
         ]
     }
@@ -550,132 +539,132 @@ mod tests {
             (
                 b"key = value\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 11 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 11 }),
                 },
             ),
             (
                 b"key=value\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 4, end: 9 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 4, end: 9 }),
                 },
             ),
             // trailing ws
             (
                 b"key=value  \t\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 4, end: 9 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 4, end: 9 }),
                 },
             ),
             // internal spaces are retained
             (
                 b"name = John Doe\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 4 },
-                    value: Some(Span { start: 7, end: 15 }),
+                    name: LineSpan { start: 0, end: 4 },
+                    value: Some(LineSpan { start: 7, end: 15 }),
                 },
             ),
             // leading/trailing ws are retained within quotes
             (
                 b"key = \"  value \"",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 16 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 16 }),
                 },
             ),
             // partial quoting
             (
                 b"key = \" a \"b\" c \"",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 17 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 17 }),
                 },
             ),
             (
                 b"key = \" # not a comment\"",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 24 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 24 }),
                 },
             ),
             // trailing comment stops the value span
             (
                 b"key = \"value\" ; trailing comment",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 13 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 13 }),
                 },
             ),
             // trailing comment stops the value span
             (
                 b"key = \"value\" # trailing comment",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 13 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 13 }),
                 },
             ),
             // \t escaped
             (
                 b"key = \\t",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 8 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 8 }),
                 },
             ),
             // empty value
             (
                 b"key =",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 5, end: 5 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 5, end: 5 }),
                 },
             ),
             // empty value with leading ws
             (
                 b"key =    \n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 9, end: 9 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 9, end: 9 }),
                 },
             ),
             // empty value followed by comment
             (
                 b"key =  ; comment \n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 7, end: 7 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 7, end: 7 }),
                 },
             ),
             // continuation, folded value foo\<nl>bar, the internal ws are retained
             (
                 b"key = foo \\\n bar\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 16 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 16 }),
                 },
             ),
             // value begins with continuation
             (
                 b"key = \\\n bar\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 3 },
-                    value: Some(Span { start: 6, end: 12 }),
+                    name: LineSpan { start: 0, end: 3 },
+                    value: Some(LineSpan { start: 6, end: 12 }),
                 },
             ),
             // valueless
             (
                 b"flag\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 4 },
+                    name: LineSpan { start: 0, end: 4 },
                     value: None,
                 },
             ),
             (
                 b"flag ; comment\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 4 },
+                    name: LineSpan { start: 0, end: 4 },
                     value: None,
                 },
             ),
@@ -683,7 +672,7 @@ mod tests {
             (
                 b"a1-2-3 ; comment\n",
                 LineKind::Variable {
-                    name: Span { start: 0, end: 6 },
+                    name: LineSpan { start: 0, end: 6 },
                     value: None,
                 },
             ),

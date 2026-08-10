@@ -11,6 +11,8 @@ pub(super) trait Printer {
 
 pub(super) fn stdout_path_bytes(path: &[u8]) -> Cow<'_, [u8]> {
     if !path.iter().any(|&b| needs_quoting(b)) {
+        // this is safe, all characters that needs special handling are in the is_ascii_control()
+        // range check we do in needs_quoting()
         return Cow::Borrowed(path);
     }
 

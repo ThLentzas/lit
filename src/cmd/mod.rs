@@ -4,6 +4,7 @@ pub(crate) mod commit;
 pub(crate) mod status;
 pub(crate) mod cat_file;
 mod print;
+mod config;
 
 use crate::cmd::add::Add;
 use crate::cmd::cat_file::CatFile;
@@ -11,7 +12,7 @@ use crate::cmd::commit::Commit;
 use crate::cmd::init::Init;
 use crate::cmd::status::Status;
 
-
+// TODO: should all commands consume self since they are one and done?
 pub(super) enum Command {
     Init(Init),
     Add(Add),
@@ -22,7 +23,7 @@ pub(super) enum Command {
 
 impl Command {
     // TODO: error handling
-    pub(super) fn execute(&mut self) {
+    pub(super) fn execute(self) {
         match self {
             Command::Init(cmd) => cmd.execute().unwrap(),
             Command::Add(cmd) => cmd.execute().unwrap(),

@@ -211,7 +211,14 @@ impl fmt::Display for AddError {
             AddError::Repository(err) => write!(f, "{err}"),
             // the actual index error is kept internally but no specific information is provided
             // the user can't really do much with an error like bad padding at ...
-            AddError::Index(_) => write!(f, "invalid index format"),
+            AddError::Index(err) => {
+                if err.is_format_error() {
+                    write!(f, "invalid index format")
+                } else {
+                    // Io errors are reported
+                    write!(f, "{err}")
+                }
+            }
             // TODO: maybe same behavior as Index?
             AddError::Database(err) => write!(f, "{err}"),
             AddError::Workspace(err) => write!(f, "{err}"),
