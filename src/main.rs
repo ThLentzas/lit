@@ -7,9 +7,11 @@ mod repo;
 // TODO: every struct field that is called bytes changed it to inner, because it is a Vec<u8> it is obvious
 // a vec of bytes
 // TODO: scoped commits, is it possible to have a pull request command?
+// TODO: we need to test in config .lock that if our program panics the file actually gets deleted
+// TODO: on the rewrite make load() fn constructors, Config::load(path), Index::load(path) etc
 fn main() {
     // combine those to something like cli::run()?
-    let mut command = cli::parse();
+    let command = cli::parse();
     command.execute();
 }
 

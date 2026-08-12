@@ -1,16 +1,16 @@
 use crate::repo::config::{Config, ConfigError};
 use crate::repo::object::mode::Mode;
+use crate::repo::object::oid::Oid;
 use crate::repo::object::parse::ParseError;
 use crate::repo::timestamp::Timestamp;
 use std::env::{self, VarError};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
-use crate::repo::object::oid::Oid;
 
 pub(crate) mod mode;
-mod parse;
 pub(crate) mod oid;
+mod parse;
 
 pub(crate) struct Entry {
     pub(crate) mode: Mode,
@@ -60,7 +60,9 @@ impl Signature {
                     });
                 }
             }
-            .to_owned(),
+            // into_owned() for Cow<'_, str> moves out the Owned and calls to_owned() for Borrow
+            // there is no allocation
+            .into_owned(),
         };
 
         let email = match env::var("GIT_AUTHOR_EMAIL") {
@@ -80,7 +82,7 @@ impl Signature {
                     });
                 }
             }
-            .to_owned(),
+            .into_owned(),
         };
 
         Ok(Self {
@@ -108,7 +110,7 @@ impl Signature {
                     });
                 }
             }
-            .to_owned(),
+            .into_owned(),
         };
 
         let email = match env::var("GIT_COMMITTER_EMAIL") {
@@ -128,7 +130,7 @@ impl Signature {
                     });
                 }
             }
-            .to_owned(),
+            .into_owned(),
         };
 
         Ok(Self {
@@ -163,7 +165,7 @@ impl fmt::Display for ObjectType {
             // when it is a literal we can write it directly without write!(f, "{}", "blob")
             ObjectType::Blob => write!(f, "blob"),
             ObjectType::Tree => write!(f, "tree"),
-            ObjectType::Commit => write!(f, "commit")
+            ObjectType::Commit => write!(f, "commit"),
         }
     }
 }

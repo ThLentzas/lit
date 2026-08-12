@@ -1,4 +1,4 @@
-use super::LineSpan;
+use crate::repo::config::file::LineSpan;
 
 pub(super) struct LineParser<'a> {
     buf: &'a [u8],

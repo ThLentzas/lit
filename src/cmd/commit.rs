@@ -40,8 +40,7 @@ impl Commit {
         }
         // TODO: need to rethink how this load() is called because now load() is called without
         // knowing if Signature will actually read the info from config or env
-        let mut cfg = Config::new(repo.config_path());
-        cfg.load()?;
+        let cfg = Config::new(repo.config_path())?;
         let author = Signature::author(&cfg)?;
         let committer = Signature::committer(&cfg)?;
         let tree_id = Tree::from_index(index).write(&db)?;
