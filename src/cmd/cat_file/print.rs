@@ -9,8 +9,8 @@ impl Printer for CatFilePrinter {
     type T = Object;
 
     fn print(&self, value: &Self::T) -> io::Result<()> {
-        // for Tree and commit we could a buff and then call out.write_all(buf), we don't need a lock
-        // for that, but it is unnecessary
+        // for Tree and commit we could create a buff and then call out.write_all(buf) without
+        // acquiring the lock, but it is unnecessary
         let mut out = io::stdout().lock();
 
         match value {

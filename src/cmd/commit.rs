@@ -1,4 +1,4 @@
-use crate::repo::config::{Config, ConfigError};
+use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::{self, Database, DbError};
 use crate::repo::index::{Index, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
@@ -40,7 +40,7 @@ impl Commit {
         }
         // TODO: need to rethink how this load() is called because now load() is called without
         // knowing if Signature will actually read the info from config or env
-        let cfg = Config::new(repo.config_path())?;
+        let cfg = ConfigFile::new(repo.config_path())?;
         let author = Signature::author(&cfg)?;
         let committer = Signature::committer(&cfg)?;
         let tree_id = Tree::from_index(index).write(&db)?;
@@ -113,7 +113,7 @@ pub(super) enum CommitError {
     Lockfile(LockfileError),
     RefError(RefError),
     Signature(SignatureError),
-    Config(ConfigError),
+    Config(ConfigFileError),
 }
 
 impl From<DiscoverError> for CommitError {
@@ -158,8 +158,8 @@ impl From<SignatureError> for CommitError {
     }
 }
 
-impl From<ConfigError> for CommitError {
-    fn from(err: ConfigError) -> Self {
+impl From<ConfigFileError> for CommitError {
+    fn from(err: ConfigFileError) -> Self {
         CommitError::Config(err)
     }
 }

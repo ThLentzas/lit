@@ -74,6 +74,9 @@ impl Lockfile {
         }
     }
 
+    // TODO: the current impl of write creates an allocation where the caller invokes serialize()
+    //  which returns a Vec<u8> and that is passed to write(). Can we do better? Can we make Lockfile
+    //  impl Write?
     pub(crate) fn write(&mut self, content: &[u8]) -> Result<(), LockfileError> {
         // safe to call unwrap because file is None only when commit() returns
         let file = self.file.as_mut().unwrap();

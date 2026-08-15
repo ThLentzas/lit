@@ -1,7 +1,5 @@
-extern crate core;
-
-pub mod cli;
-pub mod cmd;
+mod cli;
+mod cmd;
 mod repo;
 
 // TODO: every struct field that is called bytes changed it to inner, because it is a Vec<u8> it is obvious

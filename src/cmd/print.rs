@@ -3,12 +3,14 @@ use std::io;
 
 // we could also define it as Printer<T>, it is classic associated types vs generics in traits
 pub(super) trait Printer {
-    // the type of value we need to print
+    // the type of value we need to print, it is an associated type because similar to Iterators we
+    // are only going to print one T
     type T;
     
     fn print(&self, value: &Self::T,) -> io::Result<()>;
 }
 
+// TODO: this is also C-quoted representation, should we rename?
 pub(super) fn stdout_path_bytes(path: &[u8]) -> Cow<'_, [u8]> {
     if !path.iter().any(|&b| needs_quoting(b)) {
         // this is safe, all characters that needs special handling are in the is_ascii_control()

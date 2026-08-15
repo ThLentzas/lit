@@ -1,4 +1,4 @@
-use crate::repo::config::{Config, ConfigError};
+use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::parse::ParseError;
@@ -42,7 +42,7 @@ pub(crate) struct Signature {
 }
 
 impl Signature {
-    pub(crate) fn author(cfg: &Config) -> Result<Self, SignatureError> {
+    pub(crate) fn author(cfg: &ConfigFile) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_AUTHOR_NAME") {
             Ok(name) => name,
             Err(err) => match err {
@@ -92,7 +92,7 @@ impl Signature {
         })
     }
 
-    pub(crate) fn committer(cfg: &Config) -> Result<Self, SignatureError> {
+    pub(crate) fn committer(cfg: &ConfigFile) -> Result<Self, SignatureError> {
         let name = match env::var("GIT_COMMITTER_NAME") {
             Ok(name) => name,
             Err(err) => match err {
@@ -261,11 +261,11 @@ impl Object {
 pub(crate) enum SignatureError {
     NotFound(&'static str),
     EnvNotUnicode { var: &'static str, value: OsString },
-    ConfigError(ConfigError),
+    ConfigError(ConfigFileError),
 }
 
-impl From<ConfigError> for SignatureError {
-    fn from(err: ConfigError) -> Self {
+impl From<ConfigFileError> for SignatureError {
+    fn from(err: ConfigFileError) -> Self {
         SignatureError::ConfigError(err)
     }
 }

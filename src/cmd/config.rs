@@ -10,12 +10,12 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn execute(&self) {
-        // let repo = Repository::discover().unwrap();
-        // let mut config = config::Config::new(repo.config_path()).unwrap();
-        // // let mut lock  = Lockfile::acquire(&config.local).unwrap();
-        // // config.load().unwrap();
-        // // config.set(&self.name, &self.value);
-        // lock.write(&config.serialize()).unwrap();
-        // lock.commit().unwrap();
+        let repo = Repository::discover().unwrap();
+        let cfg_path = repo.config_path();
+        let mut lock  = Lockfile::acquire(&cfg_path).unwrap();
+        let cfg = config::ConfigFile::new(cfg_path).unwrap();
+        let cfg = cfg.set(&self.name, &self.value).unwrap();
+        lock.write(&cfg.serialize()).unwrap();
+        lock.commit().unwrap();
     }
 }
