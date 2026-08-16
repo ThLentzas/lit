@@ -11,6 +11,7 @@ rand = "0.10.1"
 chrono = "0.4.44"
 indexmap = "2.14.0"
 memchr = "2.8.2"
+clap = "4.6.6"
 
 [dev-dependencies]
 tempfile = "3"

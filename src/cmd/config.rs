@@ -3,6 +3,10 @@ use crate::repo::config;
 use crate::repo::lockfile::Lockfile;
 use crate::repo::Repository;
 
+struct Set {
+    
+}
+
 pub(crate) struct Config {
     pub(crate) name: OsString,
     pub(crate) value: OsString,

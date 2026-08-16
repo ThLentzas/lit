@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
+use std::iter::{self, Chain, Once};
 use std::path::{Path, PathBuf};
+use std::slice::Iter;
+use std::vec::IntoIter;
 
 // As of now there are two times that we try to index into lines using a VariablePos. By construction
 // VariablePos is an index that points to a Variable in lines, but Variable is a kind of Line which
@@ -44,7 +47,7 @@ where
     T: Copy,
 {
     head: T,
-    inner: Vec<T>,
+    rest: Vec<T>,
 }
 
 impl<T> NonEmpty<T>
@@ -54,24 +57,86 @@ where
     fn new(head: T) -> Self {
         Self {
             head,
-            inner: Vec::new(),
+            rest: Vec::new(),
         }
     }
 
     fn push(&mut self, val: T) {
-        self.inner.push(val);
+        self.rest.push(val);
     }
 
     pub(super) fn first(&self) -> T {
         self.head
     }
+    pub(super) fn len(&self) -> usize {
+        1 + self.rest.len()
+    }
 
     fn last(&self) -> T {
-        self.inner.last().copied().unwrap_or(self.first())
+        self.rest.last().copied().unwrap_or(self.first())
     }
 
     pub(super) fn single(&self) -> bool {
-        self.inner.is_empty()
+        self.rest.is_empty()
+    }
+}
+
+// If we wrote our own type then IntoIter would look like this:
+//
+// struct NonEmptyIter<T> {
+//  // store `head` until it is returned by the first next() call
+//  first: Option<T>
+//  // iterate over the remaining
+//  rest: IntoIter<T>
+// }
+//
+// impl<T> IntoIterator for NonEmpty<T>
+//  type Item = T
+//  type IntoIter = NonEmptyIter<T>
+//
+//  fn into_iter(self) -> Self::IntoIter {
+//      NonEmptyIter {
+//          first: Some(self.head)
+//          rest: self.rest.into_iter()
+//      }
+//  }
+//
+// impl<T> Iterator for NonEmptyIter<T> {
+//  type Item = T
+//
+//  fn next(&mut self) -> Option<T> {
+//      // returns first once and then delegates to the vector iterator
+//      self.first.take().or_else(|| self.rest.next())
+//  }
+// }
+//
+// We can avoid all that by using a type from std called Chain.
+// once(self.head) creates an iterator Once<T> whose next() returns T once and then None
+// chain(..) creates a Chain<Once<T>, Vec::IntoIter<T>> whose next() reads from Once<T> until
+// exhausted then reads from the vector iterator.
+impl<T> IntoIterator for NonEmpty<T>
+where
+    T: Copy,
+{
+    type Item = T;
+    type IntoIter = Chain<Once<T>, IntoIter<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        iter::once(self.head).chain(self.rest.into_iter())
+    }
+}
+
+impl<'a, T> IntoIterator for &'a NonEmpty<T>
+where
+    T: Copy,
+{
+    type Item = &'a T;
+    // https://doc.rust-lang.org/beta/std/iter/struct.Chain.html
+    // https://doc.rust-lang.org/std/iter/fn.once.html
+    type IntoIter = Chain<Once<&'a T>, Iter<'a, T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        iter::once(&self.head).chain(self.rest.iter())
     }
 }
 
