@@ -28,7 +28,7 @@ enum Format {
     Long,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub(crate) struct Status {}
 
 impl Status {

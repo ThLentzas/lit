@@ -11,6 +11,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::io;
 
+#[derive(Debug)]
 pub(crate) struct CatFile {
     pub(crate) obj_type: OsString,
     pub(crate) oid: OsString,

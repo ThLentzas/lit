@@ -187,6 +187,7 @@ impl fmt::Display for PathspecError {
 
 #[cfg(test)]
 mod tests {
+    // TODO: uncomment this
     // use std::ffi::OsString;
     // use super::*;
     //

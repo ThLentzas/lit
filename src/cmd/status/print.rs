@@ -72,9 +72,9 @@ pub(super) struct StatusPrinter {
 
 // TODO: nothing to commit, working tree clean
 impl Printer for StatusPrinter {
-    type T = Report;
+    type T<'a> = Report;
 
-    fn print(&self, value: &Self::T) -> io::Result<()> {
+    fn print(&self, value: &Report) -> io::Result<()> {
         match self.format {
             Format::Short => print_short(value),
             Format::Long => print_long(value),

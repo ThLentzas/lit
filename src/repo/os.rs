@@ -179,6 +179,11 @@ pub(super) fn os_str_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
 pub(super) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, OsError> {
     match str::from_utf8(bytes) {
         // FromIterator pushes each component with native separators
+        // when invoked with RepoPath bytes like in the workspace::to_absolute() make sure that the
+        // absolute path has the same separator for all the components
+        // TODO: improve this comment
+        // split() will return the components of the repo path, and then we join them with Window's
+        // native separator
         Ok(utf8) => Ok(utf8.split('/').collect()),
         Err(_) => Err(OsError::NotUnicode {
             bytes: bytes.to_vec(),
@@ -202,7 +207,7 @@ fn file_kind(meta: &Metadata) -> FileKind {
 }
 
 #[derive(Debug)]
-pub(crate) enum OsError {
+pub(super) enum OsError {
     #[cfg(windows)]
     NotUnicode {
         bytes: Vec<u8>,

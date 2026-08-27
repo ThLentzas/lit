@@ -13,6 +13,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::{fmt, io};
 
+#[derive(Debug)]
 pub(crate) struct Add {
     // user provided path
     pub(crate) paths: Vec<PathBuf>,

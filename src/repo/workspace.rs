@@ -28,7 +28,7 @@ impl Workspace {
     // if cwd is root then prefix is ""
     pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
         let cwd =
-            env::current_dir().map_err(|err| WorkspaceError::CurrentDirUnavailable { err })?;
+            env::current_dir().map_err(WorkspaceError::CurrentDirUnavailable)?;
 
         cwd.strip_prefix(&self.root)
             .map(Path::to_path_buf)
@@ -141,7 +141,7 @@ impl Workspace {
 
 #[derive(Debug)]
 pub(crate) enum WorkspaceError {
-    CurrentDirUnavailable { err: io::Error },
+    CurrentDirUnavailable(io::Error),
     Io { path: PathBuf, source: io::Error },
     OutsideRepository { path: PathBuf },
     Os(OsError),
@@ -152,7 +152,7 @@ impl Error for WorkspaceError {}
 impl fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WorkspaceError::CurrentDirUnavailable { err } => {
+            WorkspaceError::CurrentDirUnavailable(err) => {
                 write!(f, "could not determine current directory: {err}")
             }
             WorkspaceError::Io { path, source } => {

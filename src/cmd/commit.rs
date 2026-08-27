@@ -9,6 +9,7 @@ use crate::repo::tree::Tree;
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use crate::repo::{DiscoverError, Repository};
 
+#[derive(Debug)]
 pub(crate) struct Commit;
 
 impl Commit {
@@ -40,7 +41,7 @@ impl Commit {
         }
         // TODO: need to rethink how this load() is called because now load() is called without
         // knowing if Signature will actually read the info from config or env
-        let cfg = ConfigFile::new(repo.config_path())?;
+        let cfg = ConfigFile::new(&repo.config_path())?;
         let author = Signature::author(&cfg)?;
         let committer = Signature::committer(&cfg)?;
         let tree_id = Tree::from_index(index).write(&db)?;

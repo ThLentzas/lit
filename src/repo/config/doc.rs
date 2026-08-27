@@ -1,7 +1,9 @@
 use crate::repo::config::parse::{Header, LineKind, LineParser, ParseError, Variable};
 use crate::repo::os;
+use core::fmt;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
@@ -270,13 +272,13 @@ impl Line {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SectionKey {
+pub(super) struct SectionKey {
     name: String,
     subsection: Option<Vec<u8>>,
 }
 
 impl SectionKey {
-    unsafe fn new_unchecked(name: &[u8], subsection: Option<&[u8]>) -> Self {
+    pub(super) unsafe fn new_unchecked(name: &[u8], subsection: Option<&[u8]>) -> Self {
         // SAFETY: header name can contain only alphanumeric, or '-' and it is guaranteed by the parser
         let name = unsafe { String::from_utf8_unchecked(downcase(name)) };
         let subsection = subsection.map(Vec::from);
@@ -493,6 +495,11 @@ impl DocIndex {
     fn last_block(&self, section: &SectionKey) -> Option<SectionBlock> {
         self.sections.get(section).map(|block| block.last())
     }
+
+    // returns the last section block which determines where a new variable should be inserted
+    fn section_exists(&self, section: &SectionKey) -> bool {
+        self.sections.get(section).is_some()
+    }
 }
 
 // CST + lookup
@@ -602,6 +609,10 @@ impl ConfigDoc {
         content.push(b'\n');
 
         self.lines[pos.0].content = LineContent::Owned(content);
+    }
+
+    pub(super) fn section_exists(&self, key: &SectionKey) -> bool {
+        self.index.section_exists(key)
     }
 
     // when we want to insert the new line we have 1 edge case to consider
@@ -841,7 +852,20 @@ fn encode_value(value: &[u8]) -> Cow<'_, [u8]> {
 #[derive(Debug)]
 pub(crate) enum ConfigDocError {
     Io { path: PathBuf, source: io::Error },
-    // TODO: display the unexpected byte value as hex, git shows bad config line 1. We can provide
-    // TODO: a message with more information such as the actual reason and the offset within the line
     InvalidFormat { line: usize, source: ParseError },
+}
+
+impl Error for ConfigDocError {}
+
+impl fmt::Display for ConfigDocError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ConfigDocError::Io { path, source } => {
+                write!(f, "{}: {}", path.display(), source)
+            }
+            ConfigDocError::InvalidFormat { line, source } => {
+                write!(f, "bad config line {}: {}", line, source)
+            }
+        }
+    }
 }

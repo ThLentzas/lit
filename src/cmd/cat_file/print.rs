@@ -3,12 +3,12 @@ use crate::cmd::print::{self, Printer};
 use crate::repo::object::{Object, Signature};
 use crate::repo::object::mode::Mode;
 
-pub(super) struct CatFilePrinter {}
+pub(super) struct CatFilePrinter;
 
 impl Printer for CatFilePrinter {
-    type T = Object;
+    type T<'a> = Object;
 
-    fn print(&self, value: &Self::T) -> io::Result<()> {
+    fn print(&self, value: &Object) -> io::Result<()> {
         // for Tree and commit we could create a buff and then call out.write_all(buf) without
         // acquiring the lock, but it is unnecessary
         let mut out = io::stdout().lock();

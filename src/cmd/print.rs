@@ -1,13 +1,45 @@
 use std::borrow::Cow;
-use std::io;
+use std::{fmt, io};
+
+pub(crate) struct ReadableByte(pub(crate) u8);
+
+impl fmt::Display for ReadableByte {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // space is not considered graphic in this case, because unexpected byte  looks ambiguous
+        if self.0.is_ascii_graphic() {
+            write!(f, "{}", self.0 as char)
+        } else {
+            write!(f, "0x{:02x}", self.0)
+        }
+    }
+}
+
 
 // we could also define it as Printer<T>, it is classic associated types vs generics in traits
 pub(super) trait Printer {
     // the type of value we need to print, it is an associated type because similar to Iterators we
     // are only going to print one T
-    type T;
+    //
+    // I think associated type is still the right choice, because semantically a StatusPrinter prints
+    // a Report, a ConfigPrinter prints ConfigEntries, a CatFilePrinter prints an Object. Only one
+    // T at each case. If we go the generic way, nothing stops us from implementing ConfigPrinter
+    // for more than one T.
+    //
+    // The lifetime here is needed because in some cases T can hold a reference. Such case is a
+    // ConfigEntry that its value holds Cow<'_, [u8]>. If the value needs no special handling
+    // the value can borrow directly from the file buffer avoiding unnecessary allocations.
+    // For owned types doing type T<'a> = Report means that no matter the lifetime T does not change.
+    // It is not affected at all. The only downside is syntactic because every printer impl must
+    // declare T<'a> even when it does not need 'a.
+    //
+    // <'short> = Report,
+    // <'long> = Report,
+    // <'static> = Report,
+    //
+    // type T: 'a means that T does not contain any reference that expires before a
+    type T<'a>;
     
-    fn print(&self, value: &Self::T,) -> io::Result<()>;
+    fn print<'a>(&self, value: &Self::T<'a>,) -> io::Result<()>;
 }
 
 // TODO: this is also C-quoted representation, should we rename?

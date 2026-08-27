@@ -1,3 +1,6 @@
+use std::error::Error;
+use std::fmt;
+use crate::cmd::print::ReadableByte;
 use crate::repo::config::doc::LineSpan;
 
 pub(super) struct LineParser<'a> {
@@ -379,6 +382,15 @@ impl<'a> LineParser<'a> {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ParseErrorKind {
+    UnexpectedByte(u8),
+    UnterminatedQuote,
+    // this is the equivalent of UnexpectedEof, but we are parsing a line oriented grammar so this
+    // name is better?
+    UnexpectedEol,
+}
+
 // all the parse methods that we use to parse a LineKind like parse_section or parse_variable
 // do not return LineKind but the information of the kind they are parsing. We have seen this with
 // jolt and parse_array(). We did not return Value but Vec<Value> it is correct semmanticly. By
@@ -389,14 +401,22 @@ pub(crate) struct ParseError {
     pub pos: usize, // line-relative offset
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ParseErrorKind {
-    // TODO: make it expected, got, it is hard to narrow the got value
-    UnexpectedByte(u8),
-    UnterminatedQuote,
-    // this is the equivalent of UnexpectedEof, but we are parsing a line oriented grammar so this
-    // name is better?
-    UnexpectedEol,
+impl Error for ParseError {}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.kind {
+            ParseErrorKind::UnexpectedByte(byte) => {
+                write!(f, "unexpected byte: '{}' at offset: {}", ReadableByte(*byte), self.pos)
+            }
+            ParseErrorKind::UnterminatedQuote => {
+                write!(f, "unterminated quote at offset: {}", self.pos)
+            }
+            ParseErrorKind::UnexpectedEol => {
+                write!(f, "unexpected end of line at offset: {}", self.pos)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
