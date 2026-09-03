@@ -3,14 +3,21 @@ use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
 
 pub(crate) struct Refs {
-    pub(crate) path: PathBuf,
+    refs: PathBuf,
+    head: PathBuf,
 }
 
 impl Refs {
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            refs: root.join("refs"),
+            head: root.join("HEAD"),
+        }
+    }
     // We can't use the same approach to update the head as we did to write objects. In the writing
     // object case, we don't care about competing writes. The object path is derived from its content. If
     // both processes are writing the same object, they should be writing the same bytes. So the main
@@ -78,8 +85,7 @@ impl Refs {
         // quite a lot.
         F: FnOnce(Vec<Oid>) -> Result<Oid, DbError>,
     {
-        let head_path = self.path.join("HEAD");
-        let mut lockfile = Lockfile::acquire(&head_path)?;
+        let mut lockfile = Lockfile::acquire(&self.head)?;
         let parent = self.read_head()?;
         let parent = parent
             .into_iter()
@@ -95,20 +101,94 @@ impl Refs {
     }
 
     pub(super) fn read_head(&self) -> Result<Option<String>, RefError> {
-        let head_path = self.path.join("HEAD");
         // HEAD contains the id as a 40-character hex string already (plain text 903a71ad300d5aa1ba0c0495ce9341f42e3fcd7c)
         // we know it is valid utf8 so we can call read_to_string()
-        match fs::read_to_string(&head_path) {
+        match fs::read_to_string(&self.head) {
             Ok(s) => Ok(Some(s)),
             // no HEAD yet (first commit)
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             // something actually went wrong (permissions, corrupt data, etc.)
             Err(err) => Err(RefError::Io {
-                path: head_path.to_path_buf(),
+                path: self.head.clone(),
                 source: err,
             }),
         }
     }
+
+    pub(super) fn new_unborn_branch(&self) -> Result<(), RefError> {
+        let mut head_lock = Lockfile::acquire(&self.head)?;
+        // TODO: this should change to main in the future
+        head_lock.write(b"ref: refs/heads/master\n")?;
+        head_lock.commit()?;
+
+        Ok(())
+    }
+
+    // symrefs: a reference that points to another reference.
+    // refs/heads/ contains one copy per local branch, refs/heads/<name> is a branch reference.
+    // Each branch ref contains the object ID of that branch's current latest commit.
+    // .git/HEAD is a symref, it points to the current branch
+    // when we create a new commit, the current content of the branch ref becomes the commit's parent
+    // OID and the new ID replaces it. HEAD is never moved.
+    //
+    // symrefs solve the following problem. If both HEAD and the branch ref hold the OID how does
+    // Git know which branch should move when a new commit is created. If we make a new commit Git
+    // knows that HEAD should be updated but which branch? Multiple branches are allowed to point to
+    // the same commit. By making HEAD a symref, only the target branch changes. This also solves
+    // the orphan/unborn branch problem. For the first commit, there is no commit ID that HEAD could
+    // contain. However HEAD, can already express the intended branch. The first commit then creates
+    // the /refs/heads/master entry.
+    //
+    // DETACHED HEAD
+    //
+    // when we checkout a specific commit, HEAD points directly to a commit instead of symbolically
+    // referring to a branch.
+    // It is no longer attached to any branch(it is DETACHED)
+    //
+    // We can make commits while detached. HEAD will point to the new commit
+    //       X <- HEAD
+    //      /
+    // A <- B <- C <- main
+    //
+    // The new commit is valid and stored in the object database. The important difference is that no
+    // branch moves to point to it, because HEAD does not name a branch.
+    //
+    // If we switch back to main the state becomes:
+    //
+    //        X
+    //      /
+    // A <- B <- C <- main <- HEAD
+    //
+    // Now no branch points to X. It has not necessarily been deleted, it can usually still be found
+    // through the reflog, but it may eventually become unreachable and be garbage-collected.
+    //
+    // To keep the detached work we need to create the branch at the current commit.
+    //
+    //       X <- experiment <- HEAD
+    //      /
+    // A <- B <- C <- main
+    //
+    // Attached: HEAD -> branch -> commit
+    // Detached: HEAD -----------> commit
+    //
+    // workspace and index must reflect that move
+    //
+    // https://stackoverflow.com/questions/10228760/how-do-i-fix-a-git-detached-head
+    //
+    // If we simply want to inspect a specific commit, no changes need to be preserved, no new history
+    // was created, we can move back to our branch by git checkout main. Internally, Git writes HEAD
+    // as a symref from an OID.
+    //
+    // if we call commit without creating a new branch while we have a DETACHED HEAD Git allows it.
+    // Git creates a new commit whose parent is the checked-out commit then updates DETACHED HEAD
+    // directly. No branch is updated.
+    //
+    //        X <- Y <- HEAD
+    //      /
+    // A <- B <- C <- main
+    //
+    // Now we are in the same situation as before in order to have a way to reference to the new
+    // line of development we need to create a branch, otherwise we have no way of referncing Y.
 }
 
 #[derive(Debug)]

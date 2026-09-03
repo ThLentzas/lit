@@ -11,6 +11,8 @@ use std::iter::{self, Chain, Once};
 use std::path::{Path, PathBuf};
 use std::slice::Iter;
 use std::vec::IntoIter;
+use crate::repo::config::VariableEntry;
+use super::Value;
 
 // As of now there are two times that we try to index into lines using a VariablePos. By construction
 // VariablePos is an index that points to a Variable in lines, but Variable is a kind of Line which
@@ -70,17 +72,23 @@ where
     pub(super) fn first(&self) -> T {
         self.head
     }
+
     pub(super) fn len(&self) -> usize {
         1 + self.rest.len()
+    }
+
+    pub(super) fn single(&self) -> bool {
+        self.rest.is_empty()
     }
 
     fn last(&self) -> T {
         self.rest.last().copied().unwrap_or(self.first())
     }
 
-    pub(super) fn single(&self) -> bool {
-        self.rest.is_empty()
+    fn iter(&self) -> Chain<Once<&T>, Iter<'_, T>>{
+        self.into_iter()
     }
+
 }
 
 // If we wrote our own type then IntoIter would look like this:
@@ -278,12 +286,32 @@ pub(super) struct SectionKey {
 }
 
 impl SectionKey {
-    pub(super) unsafe fn new_unchecked(name: &[u8], subsection: Option<&[u8]>) -> Self {
+    unsafe fn new_unchecked(name: &[u8], subsection: Option<&[u8]>) -> Self {
         // SAFETY: header name can contain only alphanumeric, or '-' and it is guaranteed by the parser
         let name = unsafe { String::from_utf8_unchecked(downcase(name)) };
         let subsection = subsection.map(Vec::from);
 
         Self { name, subsection }
+    }
+
+    pub(super) fn new(header: &[u8]) -> Option<Self> {
+        let (section, subsection): (&[u8], Option<&[u8]>) =
+            match header.iter().position(|&b| b == b'.') {
+                Some(i) => {
+                    let section = &header[..i];
+                    let subsection = &header[i + 1..];
+                    if section.is_empty() || subsection.is_empty() {
+                        return None;
+                    }
+                    (section, Some(subsection))
+                }
+                None => (header, None),
+            };
+        Some(Self {
+            // SAFETY: will only return Some if section contains alphanumeric or '-'
+            name: unsafe { String::from_utf8_unchecked(try_downcase(section)?) },
+            subsection: subsection.map(|slice| slice.to_vec()),
+        })
     }
 }
 
@@ -333,31 +361,12 @@ impl ConfigKey {
         if header.is_empty() || name.is_empty() {
             return None;
         }
-
-        let (section, subsection): (&[u8], Option<&[u8]>) =
-            match header.iter().position(|&b| b == b'.') {
-                Some(i) => {
-                    let section = &header[..i];
-                    let subsection = &header[i + 1..];
-                    if section.is_empty() || subsection.is_empty() {
-                        return None;
-                    }
-                    (section, Some(subsection))
-                }
-                None => (header, None),
-            };
         if !name[0].is_ascii_alphabetic() {
             return None;
         }
 
-        let section = SectionKey {
-            // SAFETY: will only return Some if section contains alphanumeric or '-'
-            name: unsafe { String::from_utf8_unchecked(try_downcase(section)?.to_vec()) },
-            subsection: subsection.map(|slice| slice.to_vec()),
-        };
-
         Some(ConfigKey {
-            section,
+            section: SectionKey::new(header)?,
             // SAFETY: `try_downcase` returns `Some` only when `name` contains alphanumeric, or '-'
             name: unsafe { String::from_utf8_unchecked(try_downcase(name)?) },
         })
@@ -379,13 +388,6 @@ fn try_downcase(buf: &[u8]) -> Option<Vec<u8>> {
 
 fn downcase(buf: &[u8]) -> Vec<u8> {
     buf.iter().map(|&byte| byte.to_ascii_lowercase()).collect()
-}
-
-pub(crate) enum Value<'a> {
-    // valueless
-    // not just boolean, because boolean can also mean false
-    ImplicitlyTrue,
-    Bytes(Cow<'a, [u8]>),
 }
 
 struct DocIndex {
@@ -496,9 +498,12 @@ impl DocIndex {
         self.sections.get(section).map(|block| block.last())
     }
 
-    // returns the last section block which determines where a new variable should be inserted
     fn section_exists(&self, section: &SectionKey) -> bool {
         self.sections.get(section).is_some()
+    }
+
+    fn section_blocks(&self, section: &SectionKey) -> Option<&NonEmpty<SectionBlock>> {
+        self.sections.get(section)
     }
 }
 
@@ -542,14 +547,7 @@ impl ConfigDoc {
     }
 
     pub(super) fn value_at(&self, pos: VariablePos) -> Value<'_> {
-        let LineKind::Variable(variable) = &self.lines[pos.0].kind else {
-            unreachable!("position only point at variable lines");
-        };
-        match variable.value {
-            // valueless boolean, always true
-            None => Value::ImplicitlyTrue,
-            Some(span) => Value::Bytes(interpret_value(self.lines[pos.0].slice(&self.buf, &span))),
-        }
+        self.section_entry_at(pos).into_value()
     }
 
     // returns the indices of all lines that define `key`
@@ -609,6 +607,38 @@ impl ConfigDoc {
         content.push(b'\n');
 
         self.lines[pos.0].content = LineContent::Owned(content);
+    }
+
+    fn section_entry_at(&self, pos: VariablePos) -> VariableEntry<'_> {
+        let line = &self.lines[pos.0];
+        let LineKind::Variable(var) = &line.kind else {
+            unreachable!("position only point at variable lines");
+        };
+        let name = line.slice(&self.buf, &var.name);
+        let value = match var.value {
+            // valueless boolean, always true
+            None => Value::ImplicitlyTrue,
+            Some(span) => Value::Bytes(interpret_value(self.lines[pos.0].slice(&self.buf, &span))),
+        };
+
+        VariableEntry {
+            name,
+            value
+        }
+    }
+
+    pub(super) fn section_entries(&self, section: &SectionKey) -> Option<Vec<VariableEntry<'_>>> {
+        let mut entries = Vec::new();
+        let blocks = self.index.section_blocks(&section)?;
+
+        for block in blocks {
+            for index in block.start..block.end {
+                if matches!(self.lines[index].kind, LineKind::Variable(_)) {
+                    entries.push(self.section_entry_at(VariablePos(index)));
+                }
+            }
+        }
+        Some(entries)
     }
 
     pub(super) fn section_exists(&self, key: &SectionKey) -> bool {

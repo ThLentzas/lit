@@ -6,6 +6,7 @@ use std::fs::{self, File, FileType, OpenOptions};
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::{env, fmt};
+use crate::repo::config::{ConfigFile, ConfigFileError};
 
 enum MetadataPlacement {
     // metadata dir is used directly
@@ -16,8 +17,8 @@ enum MetadataPlacement {
     Separate { link: PathBuf },
 }
 
-struct InitLayout {
-    // directory containing the repository metadata (HEAD, config, objecets, ..)
+struct Layout {
+    // directory containing the repository metadata (HEAD, config, objecets, ...)
     metadata: PathBuf,
     // root of the working tree for non-bare
     // None for bare
@@ -26,7 +27,7 @@ struct InitLayout {
     placement: MetadataPlacement,
 }
 
-impl InitLayout {
+impl Layout {
     // we don't need to do any conversion here or any path validation, we follow the same logic as
     // we did before we will make the fs call and handle the error for a bad path
     //
@@ -51,6 +52,7 @@ impl InitLayout {
     //      - bare: no worktree, so LIT_WORK_TREE is invalid
     //  - LIT_WORK_TREE without LIT_DIR is invalid
     //  - With no explicit location, non-bare init uses cwd/.lit and bare init uses cwd directly
+    /// Determines the repository layout
     fn resolve(
         path: Option<&Path>,
         bare: bool,
@@ -73,6 +75,7 @@ impl InitLayout {
             //  name the metadata dir
             return Ok(Self {
                 metadata: cwd.join(dir_path),
+                // the parent identifies the worktree even though the metadata is elsewhere
                 worktree: Some(root.clone()),
                 placement: MetadataPlacement::Separate {
                     link: root.join(".lit"),
@@ -184,29 +187,74 @@ pub(crate) struct Init {
 
 impl Init {
     // the method that does all the setup for init https://github.com/git/git/blob/master/setup.c
-    // https://github.com/git/git/blob/18e66859d87fb4b76599f73460b54f0848c76b16/builtin/init-db.c
+    // https://github.com/git/git/blob/18e66859d87fb4b76599f73460b54f0848c76b16/builtin/init-db.c#L72
+    // TODO: For init, Git does not decide based merely on whether .git exist. It resolves the
+    //  Git directory, then it considers the operation a reinit when HEAD:
+    //      - exists and is readable
+    //      - is a symlink, including a dangling link
+    //  Even an invalid config will trigger the reinit message based on the above rules
     pub(super) fn execute(&self) -> Result<(), InitError> {
-        // TODO: For init, Git does not decide based merely on whether .git exist. It resolves the
-        //  Git directory, then it considers the operation a reinit when HEAD:
-        //      - exists and is readable
-        //      - is a symlink, including a dangling link
-        //  Even an invalid config will trigger the reinit message based on the above rules
-        // self.path.as_ref().map(PathBuf::as_ref)
-        let layout = InitLayout::resolve(
+        // 1. We need to resolve arguments and env vars for the location of the metadata dir.
+        // resolve() sets rules for a deterministic layout.
+        let layout = Layout::resolve(
+            // self.path.as_ref().map(PathBuf::as_ref)
             self.path.as_deref(),
             self.bare,
             self.separate_lit_dir.as_deref(),
         )?;
 
+        // 2. Create the positional/root directory
         fs::create_dir_all(layout.root())
             .map_err(|err| InitError::from_io_error(layout.root(), err))?;
 
+        // 3. If separate-lit-dir flag is set, we create the pointer file and also migrate an
+        // existing repo if it is a reinitialization
         if let MetadataPlacement::Separate { link } = &layout.placement {
             try_migrate_metadata(link, &layout.metadata)?;
         }
-        // TODO: we should set core.worktree only
-        //
 
+        let cfg_path = layout.metadata.join("config");
+        let cfg = match ConfigFile::new(&cfg_path) {
+            Ok(cfg) => Some(cfg),
+            Err(err)
+            if err
+                .io_error_kind()
+                .is_some_and(|kind| kind == io::ErrorKind::NotFound) => None,
+            Err(err) => return Err(InitError::Config { path: cfg_path, source: err }),
+        };
+        
+        
+        // https://github.com/git/git/blob/master/setup.c#L751
+        // TODO: 4. the next step should be about repository format validation
+        //
+        //  format is a compatibility contract fot the repository as a whole. git needs to know that
+        //  it can safely read/write in this repository. this is different from index versions or
+        //  pack-index version. The 0 which is the most common one means SHA-1 object ids, loose refs
+        //  + packed refs, common Git directory layout
+        //
+        // repairing config(reinit):
+        //
+        // [core]
+        // 	repositoryformatversion = 0
+        // 	filemode = true
+        // 	bare = false
+        // 	logallrefupdates = true
+        //
+        // if filemode is missing git appends to [core] filemode = true
+        // if filemode is wrong git rewrites it
+        // same for bare, if a normal repo has bare = true, git changes back to false,
+        // safe for formatversion
+        // TODO: we need to test the behavior of logalrefupdates
+        //
+        // Migration vs Reinit
+        //  The requirements are different. Reinit needs to know if there is existing repository state
+        //  that initialization preserve, while migration needs to know that if it is a metadata
+        //  directory that lit can work on. Reinit must be more conservative.
+        //      if .lit/HEAD exists, but /objects and /refs are missing, it might be a damaged repo,
+        //      a repo that something went wrong in the previous init call. We have to preserve the
+        //      current state, and try to repair the missing structure. A stricter requirement would
+        //      not allow us to repair anything, which is the main goal for reinit.
+        //
         // The code below is a naive wrong impl for detecting an existing lit repo. create_dir() will
         // fail when another entry exists with the same name, not necessarily a directory, could be
         // a symlink, regular file etc. Printing the reinit message in such case is misleading. Only
@@ -245,17 +293,17 @@ impl Init {
         // }
         // let config = layout.metadata.join("config");
         // ensure_file(&config)?;
-        // TODO: At this point we need to some setup for template files one such case is to create
-        //  the config file with the core section
         // if reinit {
         //     println!("Reinitialized existing Lit repository in {}", lit.display());
         // } else {
         //     println!("Initialized empty Lit repository in {}", lit.display());
         // }
+        // TODO: when we write the values to config we need to see the behavior of calling reinit
+        //  on a non bare repo and vice versa to determine the core.bare value
         Ok(())
     }
 
-    fn create_dirs(&self, layout: &InitLayout) -> Result<(), InitError> {
+    fn create_dirs(&self, layout: &Layout) -> Result<(), InitError> {
         let objects = layout.metadata.join("objects");
         let refs = layout.metadata.join("refs");
         ensure_dir(&objects)?;
@@ -265,6 +313,8 @@ impl Init {
 
 // https://github.com/git/git/blob/1a3e64c6c4a623626ff0687008732a8e007e2a1c/setup.c#L2675-L2695
 // we convert an embedded repo layout into a separate one
+// TODO: explain rename and file descriptors and the unavoidable TOCTOU race conditions when working
+//  with paths.
 fn try_migrate_metadata(
     lit_entry_path: &Path,
     destination_metadata_dir: &Path,
@@ -354,6 +404,29 @@ fn try_migrate_metadata(
     Ok(())
 }
 
+// decide if we have to set core.worktree in config
+fn needs_worktree_config(layout: &Layout) -> bool {
+    let Some(worktree) = &layout.worktree else {
+        return false;
+    };
+
+    // core.worktree is ambiguous when LIT_DIR is used which is in the direct case
+    // LIT_DIR is /foo/metadata
+    // LIT_WORK_TREE is /bar
+    // then we can't use the rule that worktree is the parent of metadata, we have to check
+    // if worktree.join(.lit) is our metadata dir
+    //
+    // there is also the case where LIT_DIR is an absolute path, LIT_WORK_TREE is not set and worktree
+    // ends up being the cwd, this is needs to be resolved in the same way
+    match layout.placement {
+        MetadataPlacement::Direct => layout.metadata != worktree.join(".lit"),
+        // <worktree>/.lit is metadata, parent is worktree
+        MetadataPlacement::Embedded => false,
+        // pointer file, its parent identifies the worktree even the metadata is elsewhere
+        MetadataPlacement::Separate { .. } => false,
+    }
+}
+
 fn ensure_dir(path: &Path) -> Result<(), InitError> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
@@ -414,6 +487,7 @@ pub(super) enum InitError {
     LitFile { path: PathBuf, err: LitFileError },
     Layout(LayoutError),
     MetadataDir(MetadataDirError),
+    Config { path: PathBuf, source: ConfigFileError },
 }
 
 impl InitError {
@@ -447,8 +521,9 @@ impl fmt::Display for InitError {
             InitError::LitFile { path, err } => {
                 write!(f, "{}: {}", path.display(), err)
             }
-            InitError::MetadataDir(err) => write!(f, "{}", err),
-            InitError::Layout(err) => write!(f, "{}", err),
+            InitError::MetadataDir(err) => write!(f, "{err}"),
+            InitError::Layout(err) => write!(f, "{err}"),
+            InitError::Config { path, source } => write!(f, "{}: {}", path.display(), source),
         }
     }
 }

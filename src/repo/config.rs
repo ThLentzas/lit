@@ -1,18 +1,62 @@
-use crate::repo::config::doc::{ConfigDoc, ConfigDocError, ConfigKey, Value};
+use crate::repo::config::doc::{ConfigDoc, ConfigDocError, ConfigKey, SectionKey};
 use crate::repo::os;
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::fmt;
 use std::path::Path;
+use std::{fmt, io};
 
 mod doc;
 pub(super) mod parse;
+
+// could also be named: SectionEntry
+pub(crate) struct VariableEntry<'file> {
+    name: &'file [u8],
+    value: Value<'file>,
+}
+
+impl<'file> VariableEntry<'file> {
+    pub(crate) fn name(&self) -> &[u8] {
+        self.name
+    }
+
+    pub(crate) fn value(&self) -> &Value<'_> {
+        &self.value
+    }
+
+    fn into_value(self) -> Value<'file> {
+        self.value
+    }
+}
 
 pub(crate) struct ConfigEntry<'file> {
     // in the output we need the whole key, not just the name of the variable.
     key: ConfigKey,
     value: Value<'file>,
+}
+
+pub(crate) enum Value<'a> {
+    // valueless
+    // not just boolean, because boolean can also mean false
+    ImplicitlyTrue,
+    Bytes(Cow<'a, [u8]>),
+}
+
+impl<'a> Value<'a> {
+    pub(crate) fn to_bool(&self) -> Option<bool> {
+        match self {
+            Value::ImplicitlyTrue => Some(true),
+            Value::Bytes(bytes) => {
+                if bytes.as_ref() == b"true" {
+                    Some(true)
+                } else if bytes.as_ref() == b"false" {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 
 // the .gitconfig which the global file Git looks for any configuration is created lazily on first
@@ -25,6 +69,7 @@ pub(crate) struct ConfigFile {
 
 impl ConfigFile {
     pub(crate) fn new(path: &Path) -> Result<Self, ConfigFileError> {
+        // TODO: This should take the root and call join for local
         let doc = ConfigDoc::load(path)?;
         Ok(Self { doc })
     }
@@ -59,6 +104,7 @@ impl ConfigFile {
         Ok(entry)
     }
 
+    // multivalue key, not all variables of a section
     pub(crate) fn get_all(&self, name: &OsStr) -> Result<Vec<Value<'_>>, ConfigFileError> {
         let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
         let positions = self
@@ -90,7 +136,7 @@ impl ConfigFile {
                 .map_err(|_| ConfigFileError::IncompatibleType {
                     key: name.to_os_string(),
                     value: bytes.to_vec(),
-                    actual_type: "string"
+                    actual_type: "string",
                 }),
             // we can't call str::from_utf8 in the owned case because we will have a reference to
             // a local variable(bytes) that gets dropped when get_str() returns and also this is not
@@ -102,7 +148,7 @@ impl ConfigFile {
                     // returns back the bytes that attempted to parse and failed so we can avoid
                     // the clone call
                     value: err.into_bytes(),
-                    actual_type: "string"
+                    actual_type: "string",
                 }),
         }
     }
@@ -137,6 +183,8 @@ impl ConfigFile {
                         });
                     }
 
+                    // git supports certain suffixes like k = 1024, m = 1048576(1024 * 1024),
+                    // g = 1073741824(1024 * 1024 * 1024) we don't
                     let Some(next) = val
                         .checked_mul(10)
                         .and_then(|n| n.checked_add(digit as u64))
@@ -167,9 +215,9 @@ impl ConfigFile {
         name: &OsStr,
         value: &OsStr,
     ) -> Result<ModifiedConfigFile, ConfigFileError> {
+        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
         let value = os::os_str_as_bytes(value)
             .map_err(|_| ConfigFileError::BadValue(value.to_os_string()))?;
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
 
         match self.doc.key_positions(&key) {
             Some(positions) if positions.single() => {
@@ -234,6 +282,15 @@ impl ConfigFile {
         }
         Ok(ModifiedConfigFile { doc: self.doc })
     }
+
+    pub(crate) fn section_entries(
+        &self,
+        section: &str,
+    ) -> Result<Option<Vec<VariableEntry<'_>>>, ConfigFileError> {
+        let section = SectionKey::new(section.as_bytes())
+            .ok_or(ConfigFileError::BadSectionName(section.to_owned()))?;
+        Ok(self.doc.section_entries(&section))
+    }
 }
 
 // Returned after any mutation because inserting, replacing or removing lines invalidates the indexes
@@ -253,11 +310,14 @@ impl ModifiedConfigFile {
     }
 }
 
+// TODO: should config file error include the path itself where things went wrong because the caller
+//  might not know from where exactly we tried to read?
 #[derive(Debug)]
 pub(crate) enum ConfigFileError {
     Doc(ConfigDocError),
     BadKey(OsString),
     BadValue(OsString),
+    BadSectionName(String),
     MultipleValues(OsString),
     NotFound(OsString),
     MissingValue(OsString),
@@ -266,6 +326,17 @@ pub(crate) enum ConfigFileError {
         value: Vec<u8>,
         actual_type: &'static str,
     },
+}
+
+impl ConfigFileError {
+    // TODO: for now the only variant of io::ErrorKind we care is NotFound so maybe we need this
+    //  to be a boolean since the caller only cares if it is NotFound or not?
+    pub(crate) fn io_error_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Self::Doc(ConfigDocError::Io { source, .. }) => Some(source.kind()),
+            _ => None,
+        }
+    }
 }
 
 impl From<ConfigDocError> for ConfigFileError {
@@ -289,6 +360,13 @@ impl fmt::Display for ConfigFileError {
             }
             ConfigFileError::BadValue(value) => {
                 write!(f, "bad value: {}", value.to_string_lossy())
+            }
+            ConfigFileError::BadSectionName(value) => {
+                write!(
+                    f,
+                    "bad section name: {}. Must be alphanumeric and/or '-'",
+                    value
+                )
             }
             ConfigFileError::MultipleValues(key) => {
                 write!(f, "key: {} has multiple values", key.to_string_lossy())

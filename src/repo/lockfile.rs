@@ -38,7 +38,7 @@ impl Lockfile {
     // which is a use case of Lockfile.
     //
     // We need to acquire the file handle by calling create_new() instead. create_new() will return the
-    // a file handler atomically. If someone tries to get a handler for the same file it will fail. Now
+    // file handle atomically. If someone tries to get a handle for the same file it will fail. Now
     // we can write to that tmp file without getting interupted. It creates the file exclusively meaning
     // once a process holds the lock for the specific file any other process would fail to acquire it
     //

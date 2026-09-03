@@ -78,9 +78,7 @@ impl Report {
         let workspace = Workspace {
             root: repo.root.clone(),
         };
-        let refs = Refs {
-            path: repo.refs_path(),
-        };
+        let refs = Refs::new(&repo.root);
         report.load_head_entries(&refs, &db)?;
         report.scan_workspace(&workspace, index, &RepoPath::new())?;
         report.check_index_against(index, &workspace)?;

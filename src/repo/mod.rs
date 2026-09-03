@@ -1,5 +1,6 @@
 pub(super) mod config;
 pub(super) mod db;
+mod format;
 pub(super) mod index;
 pub(super) mod litfile;
 pub(super) mod lockfile;
@@ -14,6 +15,7 @@ pub(super) mod tree;
 pub(super) mod workspace;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
+use crate::repo::format::{RepositoryFormat, RepositoryFormatError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use std::error::Error;
@@ -29,10 +31,10 @@ use std::{env, fmt, fs, io};
 // The conditions that must hold true are:
 //  - accessible dir pointed by path(r/w)
 //  - valid HEAD, a proper "ref:", or a regular file HEAD that has a properly formatted sha1 object
-//  name.
+//  name
 //  - accessible objects dir or LIT_OBJECT_DIRECTORY env var
 //  - accessible refs dir
-//  - has a valid core.formatversion value
+//  - has a valid repository format version
 //
 // This is the structure a valid Lit repo guarantees
 pub(super) fn validate_metadata_dir(path: &Path) -> Result<(), MetadataDirError> {
@@ -40,13 +42,35 @@ pub(super) fn validate_metadata_dir(path: &Path) -> Result<(), MetadataDirError>
     validate_head(&path.join("HEAD"))?;
     let objects_dir = match env::var_os("LIT_OBJECT_DIRECTORY") {
         None => path.join("objects"),
+        // TODO: do we need path resolution? Do we keep as is or try to convert it to absolute based
+        //  on the cwd? Test it.
         Some(dir) => PathBuf::from(dir),
     };
     require_accessible_dir(&objects_dir)?;
     require_accessible_dir(&path.join("refs"))?;
-    validate_format_version(path)?;
+    validate_metadata_dir(path)
+}
 
-    Ok(())
+fn validate_format_version(path: &Path) -> Result<(), MetadataDirError> {
+    let cfg_path = path.join("config");
+
+    match ConfigFile::new(&cfg_path) {
+        Ok(cfg) => {
+            let _ = RepositoryFormat::from_config(&cfg)?;
+            Ok(())
+        }
+        Err(err)
+        if err
+            .io_error_kind()
+            .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
+            {
+                Ok(())
+            }
+        Err(err) => Err(MetadataDirError::Config {
+            path: cfg_path,
+            source: err,
+        }),
+    }
 }
 
 fn require_accessible_dir(path: &Path) -> Result<(), MetadataDirError> {
@@ -73,6 +97,7 @@ fn validate_head(path: &Path) -> Result<(), MetadataDirError> {
         .or_else(|| bytes.strip_suffix(b"\n"))
         .unwrap_or(&bytes);
 
+    // DETACHED HEAD
     match Oid::from_hex_bytes(bytes) {
         Ok(_) => Ok(()),
         Err(err) => Err(MetadataDirError::HeadBadOid {
@@ -82,37 +107,9 @@ fn validate_head(path: &Path) -> Result<(), MetadataDirError> {
     }
 }
 
-// https://git-scm.com/docs/gitrepository-layout
-fn validate_format_version(path: &Path) -> Result<(), MetadataDirError> {
-    let cfg_path = path.join("config");
-    let cfg = ConfigFile::new(&cfg_path).map_err(|err| MetadataDirError::Config {
-        path: cfg_path,
-        source: err,
-    })?;
-    let version = match cfg.get_int("core.repositoryformatversion".as_ref()) {
-        Ok(Some(val)) => val,
-        // not found default's to 0
-        Ok(None) => 0,
-        Err(err) => {
-            return Err(MetadataDirError::Config {
-                path: path.to_path_buf(),
-                source: err,
-            });
-        }
-    };
-
-    match version {
-        0 => Ok(()),
-        _ => Err(MetadataDirError::UnrecognizedVersion {
-            path: path.to_path_buf(),
-        }),
-    }
-}
-
 // TODO: if repo never calls anything from cmd we good in terms of design it is clear separation
 
-// Repository knows the paths to files like .lit/objects, .lit/config etc, path layout
-// unlike the user provided paths that have to go through Workspace, these paths are known
+// TODO: https://stackoverflow.com/questions/65499497/how-does-git-know-its-in-a-git-repo
 //
 // The idea is for each component to know exactly the path it anchors
 pub(super) struct Repository {
@@ -177,9 +174,7 @@ pub(super) enum MetadataDirError {
         path: PathBuf,
         source: OidError,
     },
-    UnrecognizedVersion {
-        path: PathBuf,
-    },
+    Format(RepositoryFormatError),
     Config {
         path: PathBuf,
         source: ConfigFileError,
@@ -197,13 +192,17 @@ impl fmt::Display for MetadataDirError {
             MetadataDirError::HeadBadOid { path, source } => {
                 write!(f, "invalid HEAD in {}: {}", path.display(), source)
             }
-            MetadataDirError::UnrecognizedVersion { path } => {
-                write!(f, "unsupported format version in: {}", path.display())
-            }
+            MetadataDirError::Format(err) => write!(f, "{err}"),
             MetadataDirError::Config { path, source } => {
                 write!(f, "{}: {}", path.display(), source)
             }
         }
+    }
+}
+
+impl From<RepositoryFormatError> for MetadataDirError {
+    fn from(err: RepositoryFormatError) -> Self {
+        Self::Format(err)
     }
 }
 

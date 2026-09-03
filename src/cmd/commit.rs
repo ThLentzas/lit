@@ -23,9 +23,7 @@ impl Commit {
         let workspace = Workspace {
             root: repo.root.clone(),
         };
-        let refs = Refs {
-            path: repo.refs_path(),
-        };
+        let refs = Refs::new(&repo.root);
         let mut index = Index::new(repo.index_path());
         // this is the same optimistic approach Git follows with status. For a tracked file by index
         // in the workspace if any metadata have changed, it updates the corresponding index entry.

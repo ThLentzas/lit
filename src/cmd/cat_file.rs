@@ -47,7 +47,7 @@ impl CatFile {
                 if expected != actual {
                     return Err(CatFileError::TypeMismatch { expected, actual });
                 }
-                let printer = CatFilePrinter {};
+                let printer = CatFilePrinter;
                 printer.print(&object)?;
             }
             None => return Err(CatFileError::NotFound(oid)),

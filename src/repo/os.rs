@@ -141,11 +141,13 @@ fn file_kind(meta: &Metadata) -> FileKind {
     }
 }
 
+// TODO: this needs to change to check for a non-zero byte, OsStr does not have this guarantee
 #[cfg(unix)]
 pub(super) fn os_str_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
     Ok(name.as_bytes().to_vec())
 }
 
+// TODO: this needs to change to check for a non-zero byte, OsStr does not have this guarantee
 #[cfg(unix)]
 pub(super) fn bytes_to_path(bytes: &[u8]) -> Result<PathBuf, OsError> {
     Ok(PathBuf::from(OsStr::from_bytes(bytes)))
