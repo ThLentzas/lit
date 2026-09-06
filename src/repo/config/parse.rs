@@ -3,6 +3,7 @@ use std::fmt;
 use crate::cmd::print::ReadableByte;
 use crate::repo::config::doc::LineSpan;
 
+/// Note: use ascii_alphanumeric() not alphanumeric()
 pub(super) struct LineParser<'a> {
     buf: &'a [u8],
     pos: usize,

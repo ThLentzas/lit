@@ -1,3 +1,7 @@
+use crate::repo::config::{ConfigFile, ConfigFileError};
+use crate::repo::format::{
+    ObjectFormatError, RefStorage, RefStorageError, RepositoryFormat, RepositoryFormatError,
+};
 use crate::repo::litfile::{self, LitFileError};
 use crate::repo::{self, MetadataDirError};
 use clap::Args;
@@ -6,7 +10,6 @@ use std::fs::{self, File, FileType, OpenOptions};
 use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::{env, fmt};
-use crate::repo::config::{ConfigFile, ConfigFileError};
 
 enum MetadataPlacement {
     // metadata dir is used directly
@@ -217,13 +220,24 @@ impl Init {
         let cfg = match ConfigFile::new(&cfg_path) {
             Ok(cfg) => Some(cfg),
             Err(err)
-            if err
-                .io_error_kind()
-                .is_some_and(|kind| kind == io::ErrorKind::NotFound) => None,
-            Err(err) => return Err(InitError::Config { path: cfg_path, source: err }),
+                if err
+                    .io_error_kind()
+                    .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
+            {
+                None
+            }
+            Err(err) => {
+                return Err(InitError::Config {
+                    path: cfg_path,
+                    source: err,
+                });
+            }
         };
-        
-        
+        // let mut format = cfg.map_or(RepositoryFormat::default(), |cfg| {
+        //     RepositoryFormat::from_config(&cfg).unwrap()
+        // });
+        // *format.ref_storage_mut() = RefStorage::default();
+
         // https://github.com/git/git/blob/master/setup.c#L751
         // TODO: 4. the next step should be about repository format validation
         //
@@ -350,7 +364,7 @@ fn try_migrate_metadata(
         });
     };
 
-    // TODO: clean up the comments and ask 5.6 Sol High if there any issues when someone
+    // TODO: clean up the comments and ask Astra if there any issues when someone
     //  tries to read Index paths on Windows, since they are just byte sequences without NUL
     match fs::metadata(&current_metadata_dir) {
         Ok(metadata) if metadata.is_dir() => {
@@ -481,13 +495,28 @@ fn ensure_file(path: &Path) -> Result<(), InitError> {
 #[derive(Debug)]
 pub(super) enum InitError {
     CurrentDirUnavailable(io::Error),
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
     // TODO: should this be UnsupportedFileType
-    BadEntry { path: PathBuf, entry: EntryType },
-    LitFile { path: PathBuf, err: LitFileError },
+    BadEntry {
+        path: PathBuf,
+        entry: EntryType,
+    },
+    LitFile {
+        path: PathBuf,
+        err: LitFileError,
+    },
     Layout(LayoutError),
     MetadataDir(MetadataDirError),
-    Config { path: PathBuf, source: ConfigFileError },
+    Config {
+        path: PathBuf,
+        source: ConfigFileError,
+    },
+    RepositoryFormat(RepositoryFormatError),
+    UnknownRefStorage(RefStorageError),
+    UnknownObjectFormat(ObjectFormatError),
 }
 
 impl InitError {
@@ -521,9 +550,12 @@ impl fmt::Display for InitError {
             InitError::LitFile { path, err } => {
                 write!(f, "{}: {}", path.display(), err)
             }
-            InitError::MetadataDir(err) => write!(f, "{err}"),
-            InitError::Layout(err) => write!(f, "{err}"),
+            InitError::MetadataDir(source) => write!(f, "{source}"),
+            InitError::Layout(source) => write!(f, "{source}"),
             InitError::Config { path, source } => write!(f, "{}: {}", path.display(), source),
+            InitError::RepositoryFormat(source) => write!(f, "{source}"),
+            InitError::UnknownRefStorage(source) => write!(f, "{source}"),
+            InitError::UnknownObjectFormat(source) => write!(f, "{source}"),
         }
     }
 }

@@ -24,7 +24,7 @@ impl<'file> VariableEntry<'file> {
         &self.value
     }
 
-    fn into_value(self) -> Value<'file> {
+    pub(crate) fn into_value(self) -> Value<'file> {
         self.value
     }
 }

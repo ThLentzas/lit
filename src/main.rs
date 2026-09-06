@@ -32,3 +32,4 @@ fn main() {
 // TODO: need to review all the info we expose via fmt::Display impls. Need to double check what we
 //  need to preserve internally for debug and what the user sees
 // TODO: should we set a global rule to use ReadableByte for everything printable in stdout/err?
+// TODO: should we do a warn!() macro?

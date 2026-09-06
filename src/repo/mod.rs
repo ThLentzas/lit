@@ -1,6 +1,6 @@
 pub(super) mod config;
 pub(super) mod db;
-mod format;
+pub(super) mod format;
 pub(super) mod index;
 pub(super) mod litfile;
 pub(super) mod lockfile;
@@ -15,7 +15,7 @@ pub(super) mod tree;
 pub(super) mod workspace;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
-use crate::repo::format::{RepositoryFormat, RepositoryFormatError};
+use crate::repo::format::{ObjectFormatError, RefStorageError, RepositoryFormat, RepositoryFormatError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use std::error::Error;
