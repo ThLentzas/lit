@@ -332,6 +332,10 @@ impl ConfigFileError {
             _ => None,
         }
     }
+    pub(crate) fn is_io_not_found(&self) -> bool {
+        self.io_error_kind()
+            .is_some_and(|kind| kind == io::ErrorKind::NotFound)
+    }
 }
 
 impl From<ConfigDocError> for ConfigFileError {

@@ -227,13 +227,7 @@ impl Init {
         // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
         let cfg = match ConfigFile::new(&cfg_path) {
             Ok(cfg) => Some(cfg),
-            Err(err)
-                if err
-                    .io_error_kind()
-                    .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
-            {
-                None
-            }
+            Err(err) if err.is_io_not_found() => None,
             Err(err) => {
                 return Err(InitError::Config {
                     path: cfg_path,
@@ -246,32 +240,36 @@ impl Init {
             Some(cfg) => RepositoryFormat::from_config(cfg)?,
             None => None,
         };
-
-
-        // https://github.com/git/git/blob/master/setup.c#L2766
-        let repo_format = match (repo_format,cfg) {
-            // repo_format is some only when cfg is some
-            (Some(mut repo_format), Some(cfg)) => {
-                let object_format = resolve_object_format(self.object_format, &cfg)?;
-                if object_format != *repo_format.object_format() {
+        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2765
+        let repo_format = match repo_format {
+            // for an existing repo don't allow the user to specify a different hash/ref format, it
+            // can lead to unexpected behavior/corruption of the repo.
+            Some(repo_format) => {
+                if self
+                    .object_format
+                    .is_some_and(|obj_format| obj_format != *repo_format.object_format())
+                {
                     return Err(InitError::HashMismatch);
                 }
-                *repo_format.object_format_mut() = object_format;
-                let ref_storage = resolve_ref_storage(self.ref_format, &cfg)?;
-                if *ref_storage.format() != *repo_format.ref_storage().format() {
+                if self
+                    .ref_format
+                    .is_some_and(|format| format != *repo_format.ref_storage().format())
+                {
                     return Err(InitError::RefStorageMisMatch);
                 }
                 repo_format
             }
-            _ => RepositoryFormat::default(),
+            None => {
+                let mut repo_format = RepositoryFormat::default();
+                *repo_format.object_format_mut() =
+                    resolve_object_format(self.object_format, cfg.as_ref())?;
+                *repo_format.ref_storage_mut() =
+                    resolve_ref_storage(self.ref_format, cfg.as_ref())?;
+                repo_format
+            }
         };
 
-        // let mut format = cfg.map_or(RepositoryFormat::default(), |cfg| {
-        //     RepositoryFormat::from_config(&cfg).unwrap()
-        // });
-        // *format.ref_storage_mut() = RefStorage::default();
-
-        // https://github.com/git/git/blob/master/setup.c#L751
+        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L751
         // TODO: 4. the next step should be about repository format validation
         //
         //  format is a compatibility contract fot the repository as a whole. git needs to know that
@@ -358,7 +356,7 @@ impl Init {
     }
 }
 
-// https://github.com/git/git/blob/1a3e64c6c4a623626ff0687008732a8e007e2a1c/setup.c#L2675-L2695
+// https://github.com/git/git/blob/1a3e64c6c4a623626ff0687008732a8e007e2a1c/setup.c#L2675-L2696
 // we convert an embedded repo layout into a separate one
 // TODO: explain rename and file descriptors and the unavoidable TOCTOU race conditions when working
 //  with paths.
@@ -451,12 +449,12 @@ fn try_migrate_metadata(
     Ok(())
 }
 
-// https://github.com/git/git/blob/master/setup.c#L2787-L2801
+// https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2787-L2801
 // precedence: flag > env var > config value(only in .litconfig or system, the local config does not
 // exist yet for a new repo)
 fn resolve_object_format(
     flag: Option<ObjectFormat>,
-    cfg: &ConfigFile,
+    cfg: Option<&ConfigFile>,
 ) -> Result<ObjectFormat, InitError> {
     if let Some(format) = flag {
         return Ok(format);
@@ -467,26 +465,40 @@ fn resolve_object_format(
         return ObjectFormat::try_from(hash).map_err(InitError::UnknownObjectFormat);
     }
 
-    match cfg.get_str("init.defaultObjectFormat".as_ref()) {
-        Ok(hash) => ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat),
-        Err(err)
-            if err
-                .io_error_kind()
-                .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
-        {
-            Ok(ObjectFormat::default())
-        }
-        Err(err) => Err(InitError::Config {
-            path: Path::new("").to_path_buf(),
-            source: err,
-        }),
+    if let Some(cfg) = cfg {
+        return match cfg.get_str("init.defaultObjectFormat".as_ref()) {
+            Ok(hash) => {
+                ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat)
+            }
+            Err(err) if err.is_io_not_found() => Ok(ObjectFormat::default()),
+            Err(err) => Err(InitError::Config {
+                path: Path::new("").to_path_buf(),
+                source: err,
+            }),
+        };
     }
+    Ok(ObjectFormat::default())
 }
 
-fn resolve_ref_storage(flag: Option<RefFormat>, cfg: &ConfigFile) -> Result<RefStorage, InitError> {
+fn resolve_ref_storage(
+    flag: Option<RefFormat>,
+    cfg: Option<&ConfigFile>,
+) -> Result<RefStorage, InitError> {
     let mut ref_storage = RefStorage::default();
 
-    // https://github.com/git/git/blob/master/setup.c#L2803-L2821
+    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2824-L2838
+    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/environment.h#L46
+    // when I wrote this, I couldn't find any reference for that env var in the docs
+    // In the src code, linked above, the branch that checks this env var is a separate one, disconnected
+    // from the above logic. It has the highest precedence, it overwrites any previously set value.
+    if let Some(ref_backend) = env::var_os("LIT_REFERENCE_BACKEND") {
+        let ref_backend = ref_backend.as_encoded_bytes();
+        ref_storage = RefStorage::try_from(ref_backend)?;
+
+        return Ok(ref_storage);
+    }
+
+    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2803-L2821
     if let Some(ref_format) = flag {
         *ref_storage.format_mut() = ref_format;
     } else if let Some(ref_format) = env::var_os("LIT_DEFAULT_REF_FORMAT") {
@@ -494,35 +506,27 @@ fn resolve_ref_storage(flag: Option<RefFormat>, cfg: &ConfigFile) -> Result<RefS
         *ref_storage.format_mut() = RefFormat::try_from(ref_format)
             .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
     } else {
-        match cfg.get_str("init.defaultRefFormat".as_ref()) {
-            Ok(ref_format) => {
-                *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_ref().as_bytes())
-                    .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
-            }
-            Err(err)
-                if err
-                    .io_error_kind()
-                    // if the config value is not set storage is already default, we don't have to perform
-                    // any action
-                    .is_some_and(|kind| kind == io::ErrorKind::NotFound) => {}
-            Err(err) => {
-                return Err(InitError::Config {
-                    path: Path::new("").to_path_buf(),
-                    source: err,
-                });
+        if let Some(cfg) = cfg {
+            match cfg.get_str("init.defaultRefFormat".as_ref()) {
+                Ok(ref_format) => {
+                    *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_ref().as_bytes())
+                        .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
+                }
+                Err(err)
+                    if err
+                        .io_error_kind()
+                        // if the config value is not set, storage is already default, we don't have to
+                        // perform any action
+                        .is_some_and(|kind| kind == io::ErrorKind::NotFound) => {}
+                Err(err) => {
+                    return Err(InitError::Config {
+                        path: Path::new("").to_path_buf(),
+                        source: err,
+                    });
+                }
             }
         }
     }
-
-    // https://github.com/git/git/blob/master/setup.c#L2824-L2838
-    // when I wrote this, I couldn't find any reference for that env var anywhere in the docs
-    // In the src code, linked above, the branch that checks this env var is separate one, disconnected
-    // from the above logic. It has the highest precedence, it overwrites any previously set value.
-    if let Some(ref_backend) = env::var_os("LIT_REFERENCE_BACKEND") {
-        let ref_backend = ref_backend.as_encoded_bytes();
-        ref_storage = RefStorage::try_from(ref_backend)?;
-    }
-
     Ok(ref_storage)
 }
 

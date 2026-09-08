@@ -85,7 +85,7 @@ impl RepoPath {
         Ok(RepoPath { inner })
     }
 
-    // we need to assert that bytes are not empty, do not contain '/' at the start or end and no NUL
+    // TODO: we need to assert that bytes are not empty, do not contain '/' at the start or end and no NUL
     // byte
     pub(super) fn join(&self, component: &[u8]) -> Self {
         let mut inner = Vec::with_capacity(self.inner.len() + 1 + component.len());
