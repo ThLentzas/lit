@@ -1,13 +1,14 @@
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::format::{
-    ObjectFormatError, RefStorage, RefStorageError, RepositoryFormat, RepositoryFormatError,
+    ObjectFormat, ObjectFormatError, RefFormat, RefStorage, RefStorageError, RepositoryFormat,
+    RepositoryFormatError,
 };
 use crate::repo::litfile::{self, LitFileError};
 use crate::repo::{self, MetadataDirError};
 use clap::Args;
 use std::error::Error;
 use std::fs::{self, File, FileType, OpenOptions};
-use std::io::{self};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::{env, fmt};
 
@@ -183,6 +184,12 @@ pub(crate) struct Init {
     // If this is a reinitialization, the repository will be moved to the specified path.
     #[arg(long, conflicts_with = "bare")]
     separate_lit_dir: Option<PathBuf>,
+    #[arg(long, value_enum)]
+    object_format: Option<ObjectFormat>,
+    // files and reftable are the only possible values for the flag
+    // the `backend://payload` syntax is config only
+    #[arg(long, value_enum)]
+    ref_format: Option<RefFormat>,
     // Directory in which to initialize the repository
     path: Option<PathBuf>,
     // TODO: add the remaining flags
@@ -217,6 +224,7 @@ impl Init {
         }
 
         let cfg_path = layout.metadata.join("config");
+        // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
         let cfg = match ConfigFile::new(&cfg_path) {
             Ok(cfg) => Some(cfg),
             Err(err)
@@ -233,6 +241,31 @@ impl Init {
                 });
             }
         };
+
+        let repo_format = match cfg.as_ref() {
+            Some(cfg) => RepositoryFormat::from_config(cfg)?,
+            None => None,
+        };
+
+
+        // https://github.com/git/git/blob/master/setup.c#L2766
+        let repo_format = match (repo_format,cfg) {
+            // repo_format is some only when cfg is some
+            (Some(mut repo_format), Some(cfg)) => {
+                let object_format = resolve_object_format(self.object_format, &cfg)?;
+                if object_format != *repo_format.object_format() {
+                    return Err(InitError::HashMismatch);
+                }
+                *repo_format.object_format_mut() = object_format;
+                let ref_storage = resolve_ref_storage(self.ref_format, &cfg)?;
+                if *ref_storage.format() != *repo_format.ref_storage().format() {
+                    return Err(InitError::RefStorageMisMatch);
+                }
+                repo_format
+            }
+            _ => RepositoryFormat::default(),
+        };
+
         // let mut format = cfg.map_or(RepositoryFormat::default(), |cfg| {
         //     RepositoryFormat::from_config(&cfg).unwrap()
         // });
@@ -418,6 +451,81 @@ fn try_migrate_metadata(
     Ok(())
 }
 
+// https://github.com/git/git/blob/master/setup.c#L2787-L2801
+// precedence: flag > env var > config value(only in .litconfig or system, the local config does not
+// exist yet for a new repo)
+fn resolve_object_format(
+    flag: Option<ObjectFormat>,
+    cfg: &ConfigFile,
+) -> Result<ObjectFormat, InitError> {
+    if let Some(format) = flag {
+        return Ok(format);
+    }
+
+    if let Some(hash) = env::var_os("LIT_DEFAULT_HASH") {
+        let hash = hash.as_encoded_bytes();
+        return ObjectFormat::try_from(hash).map_err(InitError::UnknownObjectFormat);
+    }
+
+    match cfg.get_str("init.defaultObjectFormat".as_ref()) {
+        Ok(hash) => ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat),
+        Err(err)
+            if err
+                .io_error_kind()
+                .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
+        {
+            Ok(ObjectFormat::default())
+        }
+        Err(err) => Err(InitError::Config {
+            path: Path::new("").to_path_buf(),
+            source: err,
+        }),
+    }
+}
+
+fn resolve_ref_storage(flag: Option<RefFormat>, cfg: &ConfigFile) -> Result<RefStorage, InitError> {
+    let mut ref_storage = RefStorage::default();
+
+    // https://github.com/git/git/blob/master/setup.c#L2803-L2821
+    if let Some(ref_format) = flag {
+        *ref_storage.format_mut() = ref_format;
+    } else if let Some(ref_format) = env::var_os("LIT_DEFAULT_REF_FORMAT") {
+        let ref_format = ref_format.as_encoded_bytes();
+        *ref_storage.format_mut() = RefFormat::try_from(ref_format)
+            .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
+    } else {
+        match cfg.get_str("init.defaultRefFormat".as_ref()) {
+            Ok(ref_format) => {
+                *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_ref().as_bytes())
+                    .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
+            }
+            Err(err)
+                if err
+                    .io_error_kind()
+                    // if the config value is not set storage is already default, we don't have to perform
+                    // any action
+                    .is_some_and(|kind| kind == io::ErrorKind::NotFound) => {}
+            Err(err) => {
+                return Err(InitError::Config {
+                    path: Path::new("").to_path_buf(),
+                    source: err,
+                });
+            }
+        }
+    }
+
+    // https://github.com/git/git/blob/master/setup.c#L2824-L2838
+    // when I wrote this, I couldn't find any reference for that env var anywhere in the docs
+    // In the src code, linked above, the branch that checks this env var is separate one, disconnected
+    // from the above logic. It has the highest precedence, it overwrites any previously set value.
+    if let Some(ref_backend) = env::var_os("LIT_REFERENCE_BACKEND") {
+        let ref_backend = ref_backend.as_encoded_bytes();
+        ref_storage = RefStorage::try_from(ref_backend)?;
+    }
+
+    Ok(ref_storage)
+}
+
 // decide if we have to set core.worktree in config
 fn needs_worktree_config(layout: &Layout) -> bool {
     let Some(worktree) = &layout.worktree else {
@@ -517,6 +625,8 @@ pub(super) enum InitError {
     RepositoryFormat(RepositoryFormatError),
     UnknownRefStorage(RefStorageError),
     UnknownObjectFormat(ObjectFormatError),
+    HashMismatch,
+    RefStorageMisMatch,
 }
 
 impl InitError {
@@ -556,6 +666,14 @@ impl fmt::Display for InitError {
             InitError::RepositoryFormat(source) => write!(f, "{source}"),
             InitError::UnknownRefStorage(source) => write!(f, "{source}"),
             InitError::UnknownObjectFormat(source) => write!(f, "{source}"),
+            InitError::HashMismatch => write!(
+                f,
+                "attempted to reinitialize repository with different hash"
+            ),
+            InitError::RefStorageMisMatch => write!(
+                f,
+                "attempted to reinitialize repository with different storage format"
+            ),
         }
     }
 }
@@ -569,6 +687,24 @@ impl From<LayoutError> for InitError {
 impl From<MetadataDirError> for InitError {
     fn from(err: MetadataDirError) -> Self {
         Self::MetadataDir(err)
+    }
+}
+
+impl From<RepositoryFormatError> for InitError {
+    fn from(err: RepositoryFormatError) -> Self {
+        Self::RepositoryFormat(err)
+    }
+}
+
+impl From<ObjectFormatError> for InitError {
+    fn from(err: ObjectFormatError) -> Self {
+        Self::UnknownObjectFormat(err)
+    }
+}
+
+impl From<RefStorageError> for InitError {
+    fn from(err: RefStorageError) -> Self {
+        Self::UnknownRefStorage(err)
     }
 }
 

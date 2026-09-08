@@ -46,12 +46,11 @@ impl Signature {
         let name = match env::var("GIT_AUTHOR_NAME") {
             Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => match cfg.get_str("author.name".as_ref())? {
-                    Some(name) => name,
-                    None => cfg
-                        .get_str("user.name".as_ref())?
-                        .ok_or(SignatureError::NotFound("author name"))?,
-                },
+                VarError::NotPresent => cfg
+                    .get_str("author.name".as_ref())
+                    .or_else(|_| cfg.get_str("user.name".as_ref()))
+                    .map_err(|_| SignatureError::NotFound("author name"))?
+                    .into_owned(),
                 // write!(f, "environment variable was not valid Unicode: {:?}", s)
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
@@ -59,21 +58,17 @@ impl Signature {
                         value: s,
                     });
                 }
-            }
-            // into_owned() for Cow<'_, str> moves out the Owned and calls to_owned() for Borrow
-            // there is no allocation
-            .into_owned(),
+            },
         };
 
         let email = match env::var("GIT_AUTHOR_EMAIL") {
             Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => match cfg.get_str("author.email".as_ref())? {
-                    Some(name) => name,
-                    None => cfg
-                        .get_str("user.email".as_ref())?
-                        .ok_or(SignatureError::NotFound("author email"))?,
-                },
+                VarError::NotPresent => cfg
+                    .get_str("author.email".as_ref())
+                    .or_else(|_| cfg.get_str("user.email".as_ref()))
+                    .map_err(|_| SignatureError::NotFound("author email"))?
+                    .into_owned(),
                 // write!(f, "environment variable was not valid Unicode: {:?}", s)
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
@@ -81,8 +76,7 @@ impl Signature {
                         value: s,
                     });
                 }
-            }
-            .into_owned(),
+            },
         };
 
         Ok(Self {
@@ -96,12 +90,11 @@ impl Signature {
         let name = match env::var("GIT_COMMITTER_NAME") {
             Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => match cfg.get_str("committer.name".as_ref())? {
-                    Some(name) => name,
-                    None => cfg
-                        .get_str("user.name".as_ref())?
-                        .ok_or(SignatureError::NotFound("committer name"))?,
-                },
+                VarError::NotPresent => cfg
+                    .get_str("committer.name".as_ref())
+                    .or_else(|_| cfg.get_str("user.name".as_ref()))
+                    .map_err(|_| SignatureError::NotFound("committer name"))?
+                    .into_owned(),
                 // write!(f, "environment variable was not valid Unicode: {:?}", s)
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
@@ -109,19 +102,16 @@ impl Signature {
                         value: s,
                     });
                 }
-            }
-            .into_owned(),
+            },
         };
-
         let email = match env::var("GIT_COMMITTER_EMAIL") {
             Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => match cfg.get_str("committer.email".as_ref())? {
-                    Some(name) => name,
-                    None => cfg
-                        .get_str("user.email".as_ref())?
-                        .ok_or(SignatureError::NotFound("committer email"))?,
-                },
+                VarError::NotPresent => cfg
+                    .get_str("committer.email".as_ref())
+                    .or_else(|_| cfg.get_str("user.email".as_ref()))
+                    .map_err(|_| SignatureError::NotFound("committer email"))?
+                    .into_owned(),
                 // write!(f, "environment variable was not valid Unicode: {:?}", s)
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
@@ -129,8 +119,7 @@ impl Signature {
                         value: s,
                     });
                 }
-            }
-            .into_owned(),
+            },
         };
 
         Ok(Self {

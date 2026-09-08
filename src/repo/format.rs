@@ -2,6 +2,7 @@ use std::cmp::PartialEq;
 // TODO: if repo/mod.rs ends up being not too big we could move the logic there?
 //  check the visibility of what gets exposed and where
 use crate::repo::config::{ConfigFile, ConfigFileError, Value, VariableEntry};
+use clap::{Args, ValueEnum};
 use memchr::memmem;
 use std::error::Error;
 use std::fmt;
@@ -102,14 +103,39 @@ impl TryFrom<u64> for FormatVersion {
     }
 }
 
-enum RefFormat {
+#[derive(Debug, Default, PartialEq, Eq, Copy, Clone, ValueEnum)]
+pub(crate) enum RefFormat {
+    #[default]
     Files,
     RefTable,
 }
 
+impl TryFrom<&[u8]> for RefFormat {
+    type Error = RefFormatError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        match value {
+            b"files" => Ok(Self::Files),
+            b"reftable" => Ok(Self::RefTable),
+            _ => Err(RefFormatError(value.to_vec())),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct RefStorage {
     ref_format: RefFormat,
     payload: Option<Vec<u8>>,
+}
+
+impl RefStorage {
+    pub(crate) fn format(&self) -> &RefFormat {
+        & self.ref_format
+    }
+
+    pub(crate) fn format_mut(&mut self) -> &mut RefFormat {
+        &mut self.ref_format
+    }
 }
 
 impl Default for RefStorage {
@@ -139,11 +165,7 @@ impl TryFrom<&[u8]> for RefStorage {
             }
             None => (value, None),
         };
-        let ref_format = match backend {
-            b"files" => RefFormat::Files,
-            b"reftable" => RefFormat::RefTable,
-            _ => return Err(RefStorageError(backend.to_vec())),
-        };
+        let ref_format = RefFormat::try_from(backend).map_err(|err| RefStorageError(err))?;
         Ok(Self {
             ref_format,
             payload: payload.map(|p| p.to_vec()),
@@ -151,7 +173,8 @@ impl TryFrom<&[u8]> for RefStorage {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Default, Copy, Clone)]
+// https://docs.rs/clap/latest/clap/trait.ValueEnum.html
+#[derive(Debug, PartialEq, Eq, Default, Copy, Clone, ValueEnum)]
 pub(crate) enum ObjectFormat {
     #[default]
     Sha1,
@@ -193,16 +216,16 @@ pub(crate) struct RepositoryFormat {
 }
 
 impl RepositoryFormat {
-    // Determines the repo format based on config. If no such file exists or no `core.repositoryformatversion`
-    // is set we default to v0. from_config() guarantees:
+    // Determines the repo format based on config. If no `core.repositoryformatversion` is set we
+    // let the caller handle it but the extension entries are not read.
+    // from_config() guarantees:
     //  1. any unknown v1 extensions are rejected
     //  2. unrecognizable values for known extensions are rejected
-    //  3. if compatObjectFormat is set it never clashes with object format(primary hash is always
+    //  3. if compatObjectFormat is set, it never clashes with object format(primary hash is always
     //  different from compatibility hash).
-    pub(crate) fn from_config(cfg: &ConfigFile) -> Result<Self, RepositoryFormatError> {
+    pub(crate) fn from_config(cfg: &ConfigFile) -> Result<Option<Self>, RepositoryFormatError> {
         let version = match cfg.get_int("core.repositoryformatversion".as_ref()) {
-            // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
-            Ok(None) => FormatVersion::V0,
+            Ok(None) => return Ok(None),
             Ok(Some(version)) => FormatVersion::try_from(version)?,
             Err(err) => return Err(RepositoryFormatError::Config(err)),
         };
@@ -225,15 +248,22 @@ impl RepositoryFormat {
             }
         }
 
-        Ok(format)
+        Ok(Some(format))
     }
-    
+
     pub(crate) fn object_format_mut(&mut self) -> &mut ObjectFormat {
         &mut self.object_format
     }
 
+    pub(crate) fn object_format(&self) -> &ObjectFormat {
+        &self.object_format
+    }
+
     pub(crate) fn ref_storage_mut(&mut self) -> &mut RefStorage {
         &mut self.ref_storage
+    }
+    pub(crate) fn ref_storage(&self) -> &RefStorage {
+        &self.ref_storage
     }
 
     fn with_version(version: FormatVersion) -> Self {
@@ -395,7 +425,7 @@ impl fmt::Display for FormatVersionError {
 }
 
 #[derive(Debug)]
-pub(crate) struct ObjectFormatError(Vec<u8>);
+pub(crate) struct ObjectFormatError(pub(crate) Vec<u8>);
 
 impl Error for ObjectFormatError {}
 
@@ -409,11 +439,11 @@ impl fmt::Display for ObjectFormatError {
 
 #[derive(Debug)]
 // unknown backend
-pub(crate) struct RefStorageError(Vec<u8>);
+pub(crate) struct RefFormatError(Vec<u8>);
 
-impl Error for RefStorageError {}
+impl Error for RefFormatError {}
 
-impl fmt::Display for RefStorageError {
+impl fmt::Display for RefFormatError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // TODO: check if we need to use our ReadableByte, we probably should because config values
         //  are arbitrary byte sequences(double check cfg parser)
@@ -422,6 +452,20 @@ impl fmt::Display for RefStorageError {
             "unknown reference backend '{}', expected 'files' or 'reftable'",
             self.0.escape_ascii()
         )
+    }
+}
+
+#[derive(Debug)]
+// unknown backend
+pub(crate) struct RefStorageError(pub(crate) RefFormatError);
+
+impl Error for RefStorageError {}
+
+impl fmt::Display for RefStorageError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // TODO: check if we need to use our ReadableByte, we probably should because config values
+        //  are arbitrary byte sequences(double check cfg parser)
+        write!(f, "{}", self.0)
     }
 }
 

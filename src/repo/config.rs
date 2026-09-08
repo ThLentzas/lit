@@ -120,19 +120,14 @@ impl ConfigFile {
         Ok(values)
     }
 
-    pub(crate) fn get_str(&self, name: &OsStr) -> Result<Option<Cow<'_, str>>, ConfigFileError> {
+    pub(crate) fn get_str(&self, name: &OsStr) -> Result<Cow<'_, str>, ConfigFileError> {
         // TODO: verify against Git if not found is an err,
-        // valid key not found, delegate to caller to determine what to do
-        let entry = match self.get(name) {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
-        };
-
+        let entry = self.get(name)?;
         match entry.value {
             // valueless boolean is type mismatch
             Value::ImplicitlyTrue => Err(ConfigFileError::MissingValue(name.to_os_string())),
             Value::Bytes(Cow::Borrowed(bytes)) => str::from_utf8(bytes)
-                .map(|s| Some(Cow::Borrowed(s)))
+                .map(|s| Cow::Borrowed(s))
                 .map_err(|_| ConfigFileError::IncompatibleType {
                     key: name.to_os_string(),
                     value: bytes.to_vec(),
@@ -142,7 +137,7 @@ impl ConfigFile {
             // a local variable(bytes) that gets dropped when get_str() returns and also this is not
             // what we want for the Owned case of Cow.
             Value::Bytes(Cow::Owned(bytes)) => String::from_utf8(bytes)
-                .map(|s| Some(Cow::Owned(s)))
+                .map(|s| Cow::Owned(s))
                 .map_err(|err| ConfigFileError::IncompatibleType {
                     key: name.to_os_string(),
                     // returns back the bytes that attempted to parse and failed so we can avoid

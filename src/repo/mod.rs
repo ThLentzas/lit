@@ -15,7 +15,7 @@ pub(super) mod tree;
 pub(super) mod workspace;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
-use crate::repo::format::{ObjectFormatError, RefStorageError, RepositoryFormat, RepositoryFormatError};
+use crate::repo::format::{RepositoryFormat, RepositoryFormatError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use std::error::Error;
@@ -34,12 +34,13 @@ use std::{env, fmt, fs, io};
 //  name
 //  - accessible objects dir or LIT_OBJECT_DIRECTORY env var
 //  - accessible refs dir
-//  - has a valid repository format version
+//  - has a valid repository format
 //
 // This is the structure a valid Lit repo guarantees
 pub(super) fn validate_metadata_dir(path: &Path) -> Result<(), MetadataDirError> {
     require_accessible_dir(path)?;
     validate_head(&path.join("HEAD"))?;
+    // TODO: we need to look at the precedence here
     let objects_dir = match env::var_os("LIT_OBJECT_DIRECTORY") {
         None => path.join("objects"),
         // TODO: do we need path resolution? Do we keep as is or try to convert it to absolute based
@@ -48,24 +49,23 @@ pub(super) fn validate_metadata_dir(path: &Path) -> Result<(), MetadataDirError>
     };
     require_accessible_dir(&objects_dir)?;
     require_accessible_dir(&path.join("refs"))?;
-    validate_metadata_dir(path)
+    validate_format_version(path)
 }
 
 fn validate_format_version(path: &Path) -> Result<(), MetadataDirError> {
     let cfg_path = path.join("config");
 
     match ConfigFile::new(&cfg_path) {
-        Ok(cfg) => {
-            let _ = RepositoryFormat::from_config(&cfg)?;
-            Ok(())
-        }
+        Ok(cfg) => RepositoryFormat::from_config(&cfg)?
+            .ok_or(MetadataDirError::MissingFormatVersion(cfg_path))
+            .map(|_format| ()),
         Err(err)
-        if err
-            .io_error_kind()
-            .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
-            {
-                Ok(())
-            }
+            if err
+                .io_error_kind()
+                .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
+        {
+            Err(MetadataDirError::MissingConfigFile(path.to_path_buf()))
+        }
         Err(err) => Err(MetadataDirError::Config {
             path: cfg_path,
             source: err,
@@ -179,6 +179,9 @@ pub(super) enum MetadataDirError {
         path: PathBuf,
         source: ConfigFileError,
     },
+    // path to config
+    MissingFormatVersion(PathBuf),
+    MissingConfigFile(PathBuf),
 }
 
 impl Error for MetadataDirError {}
@@ -195,6 +198,16 @@ impl fmt::Display for MetadataDirError {
             MetadataDirError::Format(err) => write!(f, "{err}"),
             MetadataDirError::Config { path, source } => {
                 write!(f, "{}: {}", path.display(), source)
+            }
+            MetadataDirError::MissingFormatVersion(path) => {
+                write!(
+                    f,
+                    "missing 'core.repositoryformatversion' in {}",
+                    path.display()
+                )
+            }
+            MetadataDirError::MissingConfigFile(path) => {
+                write!(f, "missing config file in {}", path.display())
             }
         }
     }

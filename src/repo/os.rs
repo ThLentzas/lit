@@ -142,6 +142,7 @@ fn file_kind(meta: &Metadata) -> FileKind {
 }
 
 // TODO: this needs to change to check for a non-zero byte, OsStr does not have this guarantee
+//  we need to have different methods for paths and OsStr not every OsStr is a path
 #[cfg(unix)]
 pub(super) fn os_str_as_bytes(name: &OsStr) -> Result<Vec<u8>, OsError> {
     Ok(name.as_bytes().to_vec())
