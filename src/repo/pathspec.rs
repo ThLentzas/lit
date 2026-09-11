@@ -1,9 +1,9 @@
-use crate::repo::os;
-use crate::repo::path::RepoPath;
+use crate::repo::os::{OsPath, OsPathError};
+use crate::repo::repo_path::RepoPath;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 // TODO: add magic support, what is known as glob
 // the set of paths certain commands should operate on
@@ -29,134 +29,64 @@ impl Pathspec {
     // In either case, `pattern` is a normalized repo relative path. Note that even when new() returns
     // we don't know if the path actually exists or not we never touched the fs, we just express it
     // relative to root
-    pub(crate) fn new(arg: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
-        let normalized = if Path::new(arg).is_absolute() {
-            let absolute = normalize_absolute(arg.as_ref())?;
-            absolute
-                .strip_prefix(root)
-                .map(Path::to_path_buf)
-                .map_err(|_| PathspecError::OutsideRepository {
-                    path: PathBuf::from(arg),
-                })?
+    pub(crate) fn new(arg_path: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
+        let cli_path = OsPath::new(arg_path)?;
+        let resolved = if cli_path.is_absolute() {
+            // have to clone here because we need to keep cli_path intact for reporting errors
+            cli_path.clone()
         } else {
-            normalize_relative(arg.as_ref(), prefix)?
+            // the join() creates the root relative path
+            // prefix is the relative path from root to cwd and path is the relative path from cwd
+            // to the resource the user wants to add
+            OsPath::new_unchecked(prefix.join(&cli_path))
+        };
+
+        let normalized = resolved.normalize_lexically();
+        let path = if normalized.is_absolute() {
+            normalized.strip_prefix(root)?
+        } else {
+            normalized.as_path()
         };
 
         let mut pattern = RepoPath::new();
-        // normalized was a created from a components() iterator, and it can not have empty components
-        // a//b was normalized to a/b
-        for component in normalized.components() {
-            // can't call map_err() inside the loop because it thinks that we try to move Err at
-            // each iteration after it has already being moved despite using ? at the end.
-            let name = match os::os_str_as_bytes(component.as_os_str()) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    // we pass the user provided path not the normalized version
-                    return Err(PathspecError::NotUnicode {
-                        path: PathBuf::from(arg),
-                    });
+        for component in path.components() {
+            match component {
+                // path must be relative
+                Component::Prefix(_) | Component::RootDir => {
+                    return Err(PathspecError::OutsideRepository { path: cli_path });
                 }
-            };
-            if memchr::memchr(0, &name).is_some() {
-                return Err(PathspecError::ContainsNul {
-                    path: PathBuf::from(arg),
-                });
+                Component::CurDir => continue,
+                Component::ParentDir => {
+                    // after normalization if path still contains '..' it means we never encountered
+                    // left neighbors to pop them so the path actually lies outside the repo
+                    // ../ means parent of root -> path lies outside repo
+                    return Err(PathspecError::OutsideRepository { path: cli_path });
+                }
+                Component::Normal(name) => {
+                    if name == ".lit" {
+                        return Err(PathspecError::ReservedComponent {
+                            path: cli_path,
+                            component: name.to_os_string(),
+                        });
+                    }
+                    pattern = pattern.join_unchecked(name);
+                }
             }
-            pattern = pattern.join(&name);
         }
 
         Ok(Self {
-            original: arg.to_os_string(),
+            original: arg_path.to_os_string(),
             pattern,
         })
     }
 }
 
-// we do lexical normalization we never interact with fs, we never call canonicalize()
-//
-// For absolute paths, failing to pop is not an error. It just means we are already at the filesystem
-// root.
-// /../.. normalizes to /
-// C:\..\.. normalizes to C:\
-fn normalize_absolute(absolute: &Path) -> Result<PathBuf, PathspecError> {
-    let mut path = PathBuf::new();
-
-    for component in absolute.components() {
-        match component {
-            // A Windows path prefix, e.g., C: C:\, or \\server\share.
-            // large variety of prefix types, check docs
-            // does not occur on Unix.
-            //
-            // for absolute, we keep it as is
-            Component::Prefix(prefix) => path.push(prefix.as_os_str()),
-            // Unix: "/"
-            // Windows: the "\" after a prefix like "C:\"
-            Component::RootDir => path.push(component.as_os_str()),
-            // we don't push or pop any component we stay where we are which is the point of `.`
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = path.pop();
-            }
-            Component::Normal(name) => {
-                if name == ".lit" {
-                    return Err(PathspecError::ReservedComponent {
-                        path: absolute.to_path_buf(),
-                        component: name.to_os_string(),
-                    });
-                }
-                path.push(name);
-            }
-        }
-    }
-    Ok(path)
-}
-
-// we do lexical normalization we never interact with fs, we never call canonicalize()
-fn normalize_relative(relative: &Path, prefix: &Path) -> Result<PathBuf, PathspecError> {
-    let mut path = prefix.to_path_buf();
-
-    for component in Path::new(relative).components() {
-        match component {
-            // can't happen since there is check if the path is absolute that triggers normalize_absolute()
-            // this method gets called only if the above check failed
-            // RootDir and Prefix can only appear in an absolute path
-            Component::RootDir | Component::Prefix(_) => {
-                unreachable!("normalize_relative() was called with absolute path")
-            }
-            // we don't push or pop any component we stay where we are which is the point of `.`
-            // this should never occur because components() does some normalization
-            // according to their docs: a/./b, a/b/, a/b/. and a/b all have a and b as components
-            Component::CurDir => {}
-            Component::ParentDir => {
-                // Case: cwd = repo root, prefix = "" and the path is ../
-                // this falls outside the repository
-                if !path.pop() {
-                    return Err(PathspecError::OutsideRepository {
-                        path: PathBuf::from(relative),
-                    });
-                }
-            }
-            Component::Normal(name) => {
-                if name == ".lit" {
-                    return Err(PathspecError::ReservedComponent {
-                        path: relative.to_path_buf(),
-                        component: name.to_os_string(),
-                    });
-                }
-                path.push(name);
-            }
-        }
-    }
-    Ok(path)
-}
-
 // we could do a struct with path, kind but too few variants
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PathspecError {
-    OutsideRepository { path: PathBuf },
-    ReservedComponent { path: PathBuf, component: OsString },
-    NotUnicode { path: PathBuf },
-    ContainsNul { path: PathBuf },
+    OutsideRepository { path: OsPath },
+    ReservedComponent { path: OsPath, component: OsString },
+    OsPath(OsPathError),
 }
 
 impl Error for PathspecError {}
@@ -175,13 +105,14 @@ impl fmt::Display for PathspecError {
                     component.to_string_lossy()
                 )
             }
-            PathspecError::NotUnicode { path } => {
-                write!(f, "path '{}' is not valid Unicode", path.display())
-            }
-            PathspecError::ContainsNul { path } => {
-                write!(f, "path '{}' contains a NUL byte", path.display())
-            }
+            PathspecError::OsPath(err) => write!(f, "{err}"),
         }
+    }
+}
+
+impl From<OsPathError> for PathspecError {
+    fn from(err: OsPathError) -> Self {
+        Self::OsPath(err)
     }
 }
 

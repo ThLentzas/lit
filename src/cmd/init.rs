@@ -268,10 +268,9 @@ impl Init {
                 repo_format
             }
         };
-
-        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L751
-        // TODO: 4. the next step should be about repository format validation
-        //
+        
+        // TODO: next create the Repo with format and layout. apply_repo_format() in Git's src
+        
         //  format is a compatibility contract fot the repository as a whole. git needs to know that
         //  it can safely read/write in this repository. this is different from index versions or
         //  pack-index version. The 0 which is the most common one means SHA-1 object ids, loose refs

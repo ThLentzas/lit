@@ -262,8 +262,7 @@ fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
     // the name of the tree entry is the name as it was set by index::Tree::write()
     // it is flat and represents one object level at the current tree
     if matches!(name, b"." | b".." | b".lit")
-        || name.contains(&0)
-        || name.contains(&b'/')
+        || memchr::memchr2(0, b'/', name).is_some()
         || name.is_empty()
     {
         return Err(TreeEntryError::new(

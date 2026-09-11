@@ -3,7 +3,7 @@ use crate::repo::index;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::FileStat;
-use crate::repo::path::RepoPath;
+use crate::repo::repo_path::RepoPath;
 
 pub(super) struct Parser<'a> {
     buf: &'a [u8],

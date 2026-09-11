@@ -211,8 +211,7 @@ impl ConfigFile {
         value: &OsStr,
     ) -> Result<ModifiedConfigFile, ConfigFileError> {
         let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
-        let value = os::os_str_as_bytes(value)
-            .map_err(|_| ConfigFileError::BadValue(value.to_os_string()))?;
+        let value = value.as_encoded_bytes();
 
         match self.doc.key_positions(&key) {
             Some(positions) if positions.single() => {
@@ -239,8 +238,7 @@ impl ConfigFile {
         name: &OsStr,
         value: &OsStr,
     ) -> Result<ModifiedConfigFile, ConfigFileError> {
-        let value = os::os_str_as_bytes(value)
-            .map_err(|_| ConfigFileError::BadValue(value.to_os_string()))?;
+        let value = value.as_encoded_bytes();
         let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
 
         // The code below won't work because key_positions() returns &NonEmpty<VariablePos> which ties
@@ -311,7 +309,6 @@ impl ModifiedConfigFile {
 pub(crate) enum ConfigFileError {
     Doc(ConfigDocError),
     BadKey(OsString),
-    BadValue(OsString),
     BadSectionName(String),
     MultipleValues(OsString),
     NotFound(OsString),
@@ -356,9 +353,6 @@ impl fmt::Display for ConfigFileError {
                     "key does not contain a section: {}",
                     key.to_string_lossy()
                 )
-            }
-            ConfigFileError::BadValue(value) => {
-                write!(f, "bad value: {}", value.to_string_lossy())
             }
             ConfigFileError::BadSectionName(value) => {
                 write!(

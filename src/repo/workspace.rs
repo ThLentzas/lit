@@ -1,6 +1,6 @@
 use crate::repo::os;
-use crate::repo::os::{FileKind, OsError, StatNode};
-use crate::repo::path::RepoPath;
+use crate::repo::os::{FileKind, OsError, OsPath, StatNode};
+use crate::repo::repo_path::RepoPath;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs, io};
@@ -25,11 +25,13 @@ impl Workspace {
     // prefix = src
     //
     // we need the prefix to later compute repo relative paths
-    // if cwd is root then prefix is ""
+    // if cwd is root then prefix is an empty path
     pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
         let cwd =
             env::current_dir().map_err(WorkspaceError::CurrentDirUnavailable)?;
 
+        let cwd = OsPath::new_unchecked(cwd);
+        // can't return &Path because cwd is local
         cwd.strip_prefix(&self.root)
             .map(Path::to_path_buf)
             .map_err(|_| WorkspaceError::OutsideRepository { path: cwd })
@@ -43,7 +45,7 @@ impl Workspace {
             source: err,
         })?;
 
-        Ok(os::os_str_as_bytes(path.as_os_str())?)
+        Ok(path.as_os_str().as_encoded_bytes().to_vec())
     }
 
     pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
@@ -101,10 +103,9 @@ impl Workspace {
             if name == ".lit" || name == ".git" || name == "target" {
                 continue;
             }
-            let bytes = os::os_str_as_bytes(&name)?;
             // the root relative path of each entry is the root relative path of the parent + the
             // entry's name
-            let child = path.join(&bytes);
+            let child = path.join_unchecked(&name);
             let stat = self.stat(&child)?;
             entries.push((child, stat));
         }
@@ -143,7 +144,7 @@ impl Workspace {
 pub(crate) enum WorkspaceError {
     CurrentDirUnavailable(io::Error),
     Io { path: PathBuf, source: io::Error },
-    OutsideRepository { path: PathBuf },
+    OutsideRepository { path: OsPath },
     Os(OsError),
 }
 

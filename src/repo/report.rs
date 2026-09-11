@@ -4,7 +4,7 @@ use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Object, OidError};
 use crate::repo::os::{FileKind, StatNode};
-use crate::repo::path::RepoPath;
+use crate::repo::repo_path::RepoPath;
 use crate::repo::refs::{RefError, Refs};
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use crate::repo::{Repository, db};

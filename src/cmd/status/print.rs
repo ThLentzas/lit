@@ -1,6 +1,6 @@
 use crate::cmd::status::Format;
 use crate::repo::os::FileKind;
-use crate::repo::path::RepoPath;
+use crate::repo::repo_path::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::io::{self, IsTerminal, Write};
 use crate::cmd::print::{self, Printer};

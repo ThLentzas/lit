@@ -3,7 +3,7 @@ use crate::repo::index::Index;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Entry, Object};
-use crate::repo::path::RepoPath;
+use crate::repo::repo_path::RepoPath;
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
 

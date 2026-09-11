@@ -1,7 +1,7 @@
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
-use crate::repo::path::RepoPath;
+use crate::repo::repo_path::RepoPath;
 use rand::RngExt;
 use rand::distr::Alphanumeric;
 use sha1::{Digest, Sha1};
@@ -182,7 +182,9 @@ impl Database {
             // it is the location of each file build incrementally one level at a time. The path then
             // is compared against index paths to determine any changes. Read load_tree_files() and
             // status::Status::head_entries().
-            let path = prefix.join(&entry.name);
+            // in object.rs::parse() there is a method called `parse_tree_entry()` which verifies the
+            // entries name so join is safe. TODO: test it
+            let path = prefix.join_bytes_unchecked(&entry.name);
             if entry.mode.is_directory() {
                 // dfs
                 self.collect_tree_files(files, &path, &entry.oid)?;

@@ -6,7 +6,7 @@ pub(super) mod litfile;
 pub(super) mod lockfile;
 pub(super) mod object;
 pub(super) mod os;
-pub(super) mod path;
+pub(super) mod repo_path;
 pub(super) mod pathspec;
 pub(super) mod refs;
 pub(super) mod report;

@@ -4,7 +4,7 @@ use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
 use crate::repo::os::{FileKind, StatNode};
-use crate::repo::path::RepoPath;
+use crate::repo::repo_path::RepoPath;
 use crate::repo::pathspec::{Pathspec, PathspecError};
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use crate::repo::{DiscoverError, Repository};

@@ -6,21 +6,173 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Components, Display, Path, PathBuf, StripPrefixError};
 use std::{fmt, fs, io};
-
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub(crate) struct StatNode {
-    pub(crate) kind: FileKind,
-    pub(crate) stat: FileStat,
-}
 
 #[cfg(windows)]
 const EPOCH_DIFF: u64 = 11_644_473_000;
 
 #[cfg(windows)]
 const TICKS_PER_SECOND: u64 = 10_000_000;
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct OsPath {
+    inner: PathBuf,
+}
+
+impl OsPath {
+    #[cfg(unix)]
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Result<Self, OsPathError> {
+        let path = path.into();
+        let bytes = path.as_os_str().as_bytes();
+
+        if bytes.is_empty() {
+            return Err(OsPathError::Empty);
+        }
+        if memchr::memchr(0, bytes).is_some() {
+            return Err(OsPathError::ContainsNul(path));
+        }
+
+        Ok(Self { inner: path })
+    }
+
+    // this validation is very weak.
+    // We need stronger validation based on: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+    #[cfg(windows)]
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Result<Self, OsPathError> {
+        let path = path.into();
+        // with encode_wide() we can inspect native code units
+        // the u16 we get back is going to be the same for all ASCII characters as utf8
+        // A: 0x0041 for utf16, 0x41 for utf8,
+        // in utf16 all ASCII chars are represented with a high byte being 0x00, A: 00, 41. this
+        // tripped me off initially that doing NUL checks would return true even if the path name
+        // was just 'A' but we never look at each byte individually. In this case, we just get 41
+        // back, its binary is 00000000(0x00) 01000001(0x41)
+        let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+
+        if units.is_empty() {
+            return Err(OsPathError::Empty);
+        }
+        if units.contains(&0) {
+            return Err(OsPathError::ContainsNul(path));
+        }
+
+        Ok(Self { inner: path })
+    }
+
+    // this can be used in cases where paths are returned from syscalls like env::cwd()
+    pub(crate) fn new_unchecked(path: impl Into<PathBuf>) -> Self {
+        Self { inner: path.into() }
+    }
+
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.inner
+    }
+
+    pub(crate) fn as_os_str(&self) -> &OsStr {
+        self.inner.as_os_str()
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.as_os_str().as_encoded_bytes()
+    }
+
+    pub(crate) fn is_absolute(&self) -> bool {
+        self.inner.is_absolute()
+    }
+
+    pub(crate) fn is_relative(&self) -> bool {
+        self.inner.is_relative()
+    }
+
+    pub(crate) fn components(&self) -> Components<'_> {
+        self.inner.components()
+    }
+
+    pub(crate) fn join(&self, path: impl AsRef<Path>) -> Result<Self, OsPathError> {
+        Self::new(self.inner.join(path))
+    }
+
+    // returns a &Path because what is left can be an empty path and that would break the invariant
+    // of OsPath
+    pub(crate) fn strip_prefix(&self, base: &Path) -> Result<&Path, OsPathError> {
+        self.inner
+            .strip_prefix(base)
+            .map_err(OsPathError::StripPrefix)
+    }
+
+    pub(crate) fn display(&self) -> Display<'_> {
+        self.inner.display()
+    }
+
+    // remove redundant components: ./src/./main.rs simplifies to src/main.rs
+    // src/.. becomes .
+    //
+    // 1. if the accumulated path ends with a normal filename component, simply put if it has a left
+    // neighbor, pop it
+    // 2. if we reached root, ignore '..', otherwise we preserve it
+    //
+    // Note: when I first wrote this in pathspec.rs::normalize() I thought that the goal was to eliminate
+    // all the '.', '..' components, but I was wrong because we rewrite the path in a simplified form
+    // it is a different representation of the same path
+    //
+    // Read notes it is explained fully there with examples.
+    pub(crate) fn normalize_lexically(&self) -> OsPath {
+        let mut path = PathBuf::new();
+
+        // components() does some normalization
+        // it can not have empty components: a//b is normalized to a/b
+        for component in self.components() {
+            match component {
+                // A Windows path prefix, e.g., C: C:\, or \\server\share.
+                // large variety of prefix types, check docs
+                // does not occur on Unix.
+                //
+                // for absolute, we keep it as is, for relative we never encounter it
+                Component::Prefix(prefix) => path.push(prefix.as_os_str()),
+                // Unix: "/"
+                // Windows: the "\" after a prefix like "C:\"
+                Component::RootDir => path.push(component.as_os_str()),
+                // we don't push or pop any component we stay where we are
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    // we pop only if it has a left neighbor
+                    if matches!(path.components().next_back(), Some(Component::Normal(_))) {
+                        path.pop();
+                    // ../../ cant be simplified
+                    // if path.has_root() is true we have a /.. case where it simplifies to /
+                    } else if !path.has_root() {
+                        path.push("..")
+                    }
+                }
+                Component::Normal(name) => {
+                    path.push(name);
+                }
+            }
+        }
+        // if the path ends being empty it means current dir, but we can't return an empty path because
+        // it breaks the invariant of OsPath
+        if path.as_os_str().is_empty() {
+            path.push(".");
+        }
+        Self::new_unchecked(path)
+    }
+}
+
+impl AsRef<Path> for OsPath {
+    fn as_ref(&self) -> &Path {
+        self.as_path()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+pub(crate) struct StatNode {
+    pub(crate) kind: FileKind,
+    pub(crate) stat: FileStat,
+}
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) enum FileKind {
@@ -34,7 +186,6 @@ pub(crate) enum FileKind {
 
 // TODO: add GitLink support.
 // cheap copy only 9 bytes
-// TODO: explain why mode is not part of FileStat
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub(crate) struct FileStat {
     // change time, most recent time a file's attributes changed(owner group, perm, etc)
@@ -91,7 +242,7 @@ pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
 }
 
 // TODO: we need to check if it correctly retrieves information when a dir path does not have a trailing slash
-// TODO: a/b is a dir not a file named b inside a
+// TODO: a/b is a dir not a file named b inside a https://github.com/git-for-windows/git/blob/39c2bbe4d25b979d3e0f28c4d914d430b32e7e6a/compat/stat.c
 #[cfg(windows)]
 pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
     let meta = fs::symlink_metadata(path).map_err(|err| OsError::Io {
@@ -209,6 +360,26 @@ fn file_kind(meta: &Metadata) -> FileKind {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum OsPathError {
+    Empty,
+    ContainsNul(PathBuf),
+    StripPrefix(StripPrefixError),
+}
+
+impl Error for OsPathError {}
+
+impl fmt::Display for OsPathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OsPathError::Empty => write!(f, "path is empty"),
+            OsPathError::ContainsNul(path) => write!(f, "path {} contains NUL byte", path.display()),
+            OsPathError::StripPrefix(err) => write!(f, "{err}")
+        }
+    }
+}
+
+// TODO: when we support IoError remove this make os calls return IoError
 #[derive(Debug)]
 pub(super) enum OsError {
     #[cfg(windows)]

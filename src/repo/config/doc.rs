@@ -1,5 +1,4 @@
 use crate::repo::config::parse::{Header, LineKind, LineParser, ParseError, Variable};
-use crate::repo::os;
 use core::fmt;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -353,7 +352,7 @@ impl ConfigKey {
     // up to the first dot, the rest is the subsection. If there is only one '.', it's always
     // section-name
     pub(super) fn from_name(name: &OsStr) -> Option<Self> {
-        let bytes = os::os_str_as_bytes(name).ok()?;
+        let bytes = name.as_encoded_bytes();
         let pos = bytes.iter().rposition(|&b| b == b'.')?;
         let header = &bytes[..pos];
         let name = &bytes[pos + 1..];

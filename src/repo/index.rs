@@ -4,7 +4,7 @@ use crate::repo::index::parse::Parser;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::FileStat;
-use crate::repo::path::{PathError, RepoPath};
+use crate::repo::repo_path::{RepoPathError, RepoPath};
 use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::io;
@@ -465,7 +465,7 @@ pub(crate) enum FormatErrorKind {
     MissingNulTerminator,
     InvalidPadding,
     LongPathLenMisMatch,
-    InvalidPathSyntax(PathError),
+    InvalidPathSyntax(RepoPathError),
     TrailingData { remaining: usize },
 }
 
