@@ -6,6 +6,7 @@ use crate::repo::format::{
 };
 use crate::repo::litfile::{self, LitFileError};
 use crate::repo::os::OsPath;
+use crate::repo::refs::Refs;
 use crate::repo::{self, Layout, LayoutError, MetadataDirError, os};
 use clap::Args;
 use std::error::Error;
@@ -186,11 +187,9 @@ impl Init {
             // absence -> implicitly false
             if !is_case_sensitive_fs(layout.metadata()) {
                 cfg.set_all("core.ignorecase".as_ref(), "true".as_ref())?;
-
             }
         }
         setup_object_db(layout.metadata())?;
-
 
         // TODO: top priorities is for ConfigFileError to report the error path because it knows where
         //  it read config from and the IoError wrapper
@@ -342,6 +341,42 @@ fn setup_object_db(metadata: &OsPath) -> Result<()> {
     ensure_dir(&objects)?;
     ensure_dir(&info)?;
     ensure_dir(&pack)
+}
+
+// name: --initial-branch option value
+fn setup_ref_db(
+    metadata: &OsPath,
+    name: Option<&OsStr>,
+    cfg: &ConfigFile,
+    reinit: bool,
+) -> Result<()> {
+    let refs = metadata.join_unchecked("refs");
+    let heads = refs.join_unchecked("heads");
+    let tags = refs.join_unchecked("tags");
+
+    ensure_dir(&refs)?;
+    ensure_dir(&heads)?;
+    ensure_dir(&tags)?;
+
+    if !reinit {
+        let refs = Refs::new(metadata);
+        let name = match name {
+            // user provided branch name has the highest precedence
+            Some(name) => Some(name),
+            None => match cfg.get("init.defaultBranch".as_ref()) {
+                Ok(entry) => Some(entry.value()),
+                Err(err) if err.is_not_found() => None,
+                Err(err) => {
+                    return Err(InitError::Config {
+                        path: Path::new("").to_path_buf(),
+                        source: err,
+                    });
+                }
+            },
+        };
+        refs.new_unborn_branch(name)?;
+    }
+    Ok(())
 }
 
 // a limitation of the rust compiler on disjoint borrows

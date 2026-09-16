@@ -236,6 +236,8 @@ impl TryFrom<&[u8]> for ObjectFormat {
 //  it can safely read/write in this repository. this is different from index versions or
 //  pack-index version. The 0 which is the most common one means SHA-1 object ids, loose refs
 //  + packed refs, common Git directory layout
+// TODO: review each extension on git's config docs. Parsing does not modify them or uses any other
+//  than ref and object.
 pub(crate) struct RepositoryFormat {
     version: FormatVersion,
     ref_storage: RefStorage,
@@ -243,6 +245,7 @@ pub(crate) struct RepositoryFormat {
     compat_object_format: Option<ObjectFormat>,
     precious_objects: bool,
     partial_clone: Option<Vec<u8>>,
+    // TODO: https://git-scm.com/docs/git-config#Documentation/git-config.txt-worktreeConfig
     worktree_config: bool,
     relative_worktree: bool,
     submodule_path_config: bool,
@@ -395,13 +398,13 @@ impl RepositoryFormat {
                 self.relative_worktree = entry
                     .value()
                     .to_bool()
-                    .ok_or_else(|| RepositoryFormatError::UnknownExtensionValue(extension))?;
+                    .ok_or(RepositoryFormatError::UnknownExtensionValue(extension))?;
             }
             Extension::SubmodulePathConfig => {
                 self.submodule_path_config = entry
                     .value()
                     .to_bool()
-                    .ok_or_else(|| RepositoryFormatError::UnknownExtensionValue(extension))?;
+                    .ok_or(RepositoryFormatError::UnknownExtensionValue(extension))?;
             }
             Extension::Unknown => return Err(RepositoryFormatError::UnknownV1Extension(extension)),
         }
@@ -419,13 +422,13 @@ impl RepositoryFormat {
                 self.precious_objects = entry
                     .value()
                     .to_bool()
-                    .ok_or_else(|| RepositoryFormatError::UnknownExtensionValue(extension))?;
+                    .ok_or(RepositoryFormatError::UnknownExtensionValue(extension))?;
             }
             Extension::WorktreeConfig => {
                 self.worktree_config = entry
                     .value()
                     .to_bool()
-                    .ok_or_else(|| RepositoryFormatError::UnknownExtensionValue(extension))?;
+                    .ok_or(RepositoryFormatError::UnknownExtensionValue(extension))?;
             }
             // TODO: verify against a git version above 2.42
             //  for partial clone, git accepts any non valueless variable

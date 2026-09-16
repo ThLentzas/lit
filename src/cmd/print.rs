@@ -1,6 +1,18 @@
 use std::borrow::Cow;
 use std::{fmt, io};
 
+pub(crate) struct ReadableBytes<'a> (pub(crate) &'a [u8]);
+
+// one universal rule for printing bad output
+impl fmt::Display for ReadableBytes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        for &byte in self.0 {
+            write!(f, "{}", ReadableByte(byte))?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct ReadableByte(pub(crate) u8);
 
 impl fmt::Display for ReadableByte {

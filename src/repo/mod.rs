@@ -32,7 +32,7 @@ enum MetadataPlacement {
 }
 
 pub(super) struct Layout {
-    // directory containing the repository metadata (HEAD, config, objecets, ...)
+    // directory containing the repository metadata (HEAD, config, objects, ...)
     metadata: PathBuf,
     // root of the working tree for non-bare
     // None for bare

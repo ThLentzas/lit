@@ -33,6 +33,16 @@ pub(crate) struct ConfigEntry<'file> {
     value: Value<'file>,
 }
 
+impl<'file> ConfigEntry<'file> {
+    pub(crate) fn key(&self) -> &ConfigKey {
+        &self.key
+    }
+    pub(crate) fn value(&self) -> &Value<'_> {
+        &self.value
+    }
+}
+
+// read doc.rs::interpret_value() on why we use Cow
 pub(crate) enum Value<'a> {
     // valueless
     // not just boolean, because boolean can also mean false

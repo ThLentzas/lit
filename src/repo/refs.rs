@@ -1,24 +1,35 @@
+use crate::cmd::print::ReadableBytes;
 use crate::repo::db::DbError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
-use std::ffi::{OsStr, OsString};
+use crate::repo::os::OsPath;
 
-const DEFAULT_BRANCH_NAME: &str = "master";
+const DEFAULT_BRANCH_NAME: &[u8] = b"master";
 
 pub(crate) struct Refs {
-    refs: PathBuf,
-    head: PathBuf,
+    refs: OsPath,
+    head: OsPath,
+    heads: OsPath,
+    tags: OsPath,
 }
 
 impl Refs {
-    pub(crate) fn new(root: &Path) -> Self {
+    pub(crate) fn new(root: &OsPath) -> Self {
+        let refs = root.join_unchecked("refs");
+        let heads = refs.join_unchecked("heads");
+        let tags = refs.join_unchecked("tags");
+
         Self {
-            refs: root.join("refs"),
-            head: root.join("HEAD"),
+            refs,
+            head: root.join_unchecked("HEAD"),
+            heads,
+            tags
         }
     }
     // We can't use the same approach to update the head as we did to write objects. In the writing
@@ -118,10 +129,22 @@ impl Refs {
         }
     }
 
-    pub(super) fn new_unborn_branch(&self, name: &OsStr) -> Result<(), RefError> {
+    pub(crate) fn new_unborn_branch(&self, name: Option<&[u8]>) -> Result<(), RefError> {
+        // can't use map_or() because check_branch_name() can fail
+        // the None branch would be an infallible default but Some branch is fallible
+        // we could write let name = name.unwrap_or(DEFAULT_BRANCH_NAME) but then we could call
+        // check_branch_name on default
+        let name = match name {
+            Some(name) => {
+                check_branch_name(name)?;
+                name
+            }
+            None => DEFAULT_BRANCH_NAME,
+        };
         let mut head_lock = Lockfile::acquire(&self.head)?;
-        // TODO: this should change to main in the future
-        head_lock.write(b"ref: refs/heads/master\n")?;
+        head_lock.write(b"ref: refs/heads/")?;
+        head_lock.write(name)?;
+        head_lock.write(b"\n")?;
         head_lock.commit()?;
 
         Ok(())
@@ -194,21 +217,140 @@ impl Refs {
     // line of development we need to create a branch, otherwise we have no way of referencing Y.
 }
 
-fn check_branch_name(name: &OsStr) -> Result<(), RefError> {
-    let bytes = name.as_encoded_bytes();
-    if bytes.is_empty() {
-
-    }
-    
-    if bytes.ends_with(b".lock") {
-
-    }
-    if bytes.ends_with(b".") {
-
+fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
+    if name.is_empty() {
+        return Err(BranchNameError {
+            name: Vec::new(),
+            kind: BranchNameErrorKind::Empty,
+        });
     }
 
+    let mut start = 0;
+    for component in bytes.split(|&b| b == b'/') {
+        let end = start + component.len();
+        // consecutive slashes
+        if component.is_empty() {
+            return Err(BranchNameError {
+                name: bytes.to_vec(),
+                kind: BranchNameErrorKind::EmptyComponent { pos: start },
+            });
+        }
+        if component.ends_with(b".lock") {
+            return Err(BranchNameError {
+                name: bytes.to_vec(),
+                kind: BranchNameErrorKind::EndsWithDotLock {
+                    component: start..end,
+                },
+            });
+        }
+        if component.starts_with(b".") {
+            return Err(BranchNameError {
+                name: bytes.to_vec(),
+                kind: BranchNameErrorKind::StartsWithDot {
+                    component: start..end,
+                },
+            });
+        }
+        if component.ends_with(b".") {
+            return Err(BranchNameError {
+                name: bytes.to_vec(),
+                kind: BranchNameErrorKind::EndsWithDot {
+                    component: start..end,
+                },
+            });
+        }
+        if component.starts_with(b"/") {
+            return Err(BranchNameError {
+                name: bytes.to_vec(),
+                kind: BranchNameErrorKind::StartsWithForwardSlash {
+                    component: start..end,
+                },
+            });
+        }
+        if component.ends_with(b"/") {
+            return Err(BranchNameError {
+                name: bytes.to_vec(),
+                kind: BranchNameErrorKind::EndsWithForwardSlash {
+                    component: start..end,
+                },
+            });
+        }
 
+        for (i, &byte) in component.iter().enumerate() {
+            let pos = start + i; // absolute
+            if byte.is_ascii_control()
+                || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+            {
+                let name = bytes.to_vec();
+                let char = name[pos];
+                return Err(BranchNameError {
+                    name,
+                    kind: BranchNameErrorKind::DisallowedCharacter { pos, char },
+                });
+            }
+            match byte {
+                b'@' if component.len() == 1 => {
+                    return Err(BranchNameError {
+                        name: bytes.to_vec(),
+                        kind: BranchNameErrorKind::SingleAt { pos },
+                    });
+                }
+                b'@' if let Some(b'{') = component.get(i + 1) => {
+                    return Err(BranchNameError {
+                        name: bytes.to_vec(),
+                        kind: BranchNameErrorKind::AtBrace { pos },
+                    });
+                }
+                _ => {}
+            }
+            // cannot have two consecutive dots anywhere
+            if byte == b'.' && component.get(i + 1) == Some(&b'.') {
+                return Err(BranchNameError {
+                    name: bytes.to_vec(),
+                    kind: BranchNameErrorKind::ConsecutiveDots { pos },
+                });
+            }
+        }
+        start = end + 1; // skips /
+    }
     Ok(())
+}
+
+#[derive(Debug)]
+pub(crate) struct BranchNameError {
+    pub(crate) name: Vec<u8>,
+    // kind is kept private for diagnostics and debugging
+    kind: BranchNameErrorKind,
+}
+
+// ranges are slices in name, pos is absolute to name, not relative to component
+#[derive(Debug)]
+enum BranchNameErrorKind {
+    Empty,
+    EmptyComponent { pos: usize },
+    EndsWithDotLock { component: Range<usize> },
+    StartsWithDot { component: Range<usize> },
+    EndsWithDot { component: Range<usize> },
+    StartsWithForwardSlash { component: Range<usize> },
+    EndsWithForwardSlash { component: Range<usize> },
+    // includes control
+    DisallowedCharacter { pos: usize, char: u8 },
+    SingleAt { pos: usize },
+    AtBrace { pos: usize },
+    ConsecutiveDots { pos: usize },
+}
+
+impl Error for BranchNameError {}
+
+impl fmt::Display for BranchNameError {
+    // Git does not provide any more info in the error message
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} is not a valid branch name",
+            ReadableBytes(&self.name)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -217,7 +359,7 @@ pub(crate) enum RefError {
     Lockfile(LockfileError),
     Database(DbError),
     Oid(OidError),
-    BadBranchName(OsString)
+    BadBranchName(BranchNameError),
 }
 
 impl Error for RefError {}
@@ -231,6 +373,7 @@ impl fmt::Display for RefError {
             RefError::Lockfile(err) => write!(f, "{err}"),
             RefError::Database(err) => write!(f, "{err}"),
             RefError::Oid(err) => write!(f, "{err}"),
+            RefError::BadBranchName(err) => write!(f, "{err}"),
         }
     }
 }
@@ -250,5 +393,11 @@ impl From<DbError> for RefError {
 impl From<OidError> for RefError {
     fn from(err: OidError) -> Self {
         RefError::Oid(err)
+    }
+}
+
+impl From<BranchNameError> for RefError {
+    fn from(err: BranchNameError) -> Self {
+        RefError::BadBranchName(err)
     }
 }
