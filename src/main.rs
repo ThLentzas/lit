@@ -32,6 +32,7 @@ fn main() {
 // TODO: need to review all the info we expose via fmt::Display impls. Need to double check what we
 //  need to preserve internally for debug and what the user sees
 // TODO: should we set a global rule to use ReadableByte for everything printable in stdout/err?
+// TODO: run git help --config to see what we have to support
 // TODO: should we do a warn!() macro?
 // TODO: No1 priority is to fix the os_str to bytes conversions, look at resolve_object_format()
 //  in init.rs::execute() and the signature logic

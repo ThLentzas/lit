@@ -1,5 +1,4 @@
 use crate::repo::config::doc::{ConfigDoc, ConfigDocError, ConfigKey, SectionKey};
-use crate::repo::os;
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -9,7 +8,6 @@ use std::{fmt, io};
 mod doc;
 pub(super) mod parse;
 
-// could also be named: SectionEntry
 pub(crate) struct VariableEntry<'file> {
     name: &'file [u8],
     value: Value<'file>,
@@ -63,11 +61,29 @@ impl<'a> Value<'a> {
 // write, unlike .git/config which is created when we call init
 // TODO: global, system, Read Chapter 25.2.3 and 25.3
 // TODO: --list silently ignores sections that have no variables
+// TODO: should the name/values just be anything that impl AsRef<OsStr> instead of the caller having
+//  to invoke as_ref() for every argument?
 pub(crate) struct ConfigFile {
     doc: ConfigDoc,
 }
 
+// TODO:
+//  From docs:
+//      This command(config) will fail with non-zero status upon error. Some exit codes are:
+//          The section or key is invalid (ret=1),
+//          no section or name was provided (ret=2),
+//          the config file is invalid (ret=3),
+//          the config file cannot be written (ret=4),
+//          you try to unset an option which does not exist (ret=5),
+//          you try to unset/set an option for which multiple lines match (ret=5), or
+//          you try to use an invalid regexp (ret=6).
 impl ConfigFile {
+    // creates an in-memory empty ConfigFile, the actual file might not exist
+    pub(crate) fn empty() -> Self {
+        Self {
+            doc: ConfigDoc::empty()
+        }
+    }
     pub(crate) fn new(path: &Path) -> Result<Self, ConfigFileError> {
         // TODO: This should take the root and call join for local
         let doc = ConfigDoc::load(path)?;
@@ -197,19 +213,25 @@ impl ConfigFile {
         }
     }
 
-    // TODO: fix
-    //  as of now section_exists() is only invoked internally when trying to migrate a lit repo
-    //  and the value is always [extensions] so for now str is fine but we need to change it to OsStr
-    // pub(crate) fn section_exists(&self, section: &str) -> bool {
-    //     let key = unsafe { SectionKey::new_unchecked(section.as_bytes(), None) };
-    //     self.doc.section_exists(&key)
-    // }
+    // Git reports something like: bad boolean config value 'foo' for 'core.logallrefupdates'
+    pub(crate) fn get_bool(&self, name: &OsStr) -> Result<bool, ConfigFileError> {
+        // TODO: verify against Git if not found is an err,
+        let entry = self.get(name)?;
+        match entry.value {
+            Value::ImplicitlyTrue => Ok(true),
+            Value::Bytes(bytes) => match bytes.as_ref() {
+                b"true" => Ok(true),
+                b"false" => Ok(false),
+                bytes => Err(ConfigFileError::IncompatibleType {
+                    key: name.to_os_string(),
+                    value: bytes.to_vec(),
+                    actual_type: "bool",
+                }),
+            },
+        }
+    }
 
-    pub(crate) fn set(
-        mut self,
-        name: &OsStr,
-        value: &OsStr,
-    ) -> Result<ModifiedConfigFile, ConfigFileError> {
+    pub(crate) fn set(&mut self, name: &OsStr, value: &OsStr) -> Result<(), ConfigFileError> {
         let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
         let value = value.as_encoded_bytes();
 
@@ -226,18 +248,14 @@ impl ConfigFile {
                 self.doc.insert_variable(&key, &value);
             }
         }
-        Ok(ModifiedConfigFile { doc: self.doc })
+        Ok(())
     }
 
     // logic is identical to set()
     //  - no occurrences: insert one new variable
     //  - one occurrence: replace it,
     //  - multiple: replace them all with the new value
-    pub(crate) fn set_all(
-        mut self,
-        name: &OsStr,
-        value: &OsStr,
-    ) -> Result<ModifiedConfigFile, ConfigFileError> {
+    pub(crate) fn set_all(&mut self, name: &OsStr, value: &OsStr) -> Result<(), ConfigFileError> {
         let value = value.as_encoded_bytes();
         let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
 
@@ -273,31 +291,53 @@ impl ConfigFile {
                 self.doc.insert_variable(&key, &value);
             }
         }
-        Ok(ModifiedConfigFile { doc: self.doc })
+        Ok(())
+    }
+
+    pub(crate) fn unset(&mut self, name: &OsStr) -> Result<(), ConfigFileError> {
+        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+        match self.doc.key_positions(&key) {
+            Some(positions) if positions.single() => {
+                self.doc.remove_line(positions.first());
+            }
+            Some(_) => return Err(ConfigFileError::MultipleValues(name.to_os_string())),
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn unset_all(&mut self, name: &OsStr) -> Result<(), ConfigFileError> {
+        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+        let positions = self
+            .doc
+            .key_positions(&key)
+            .map(|positions| positions.into_iter().copied().collect::<Vec<_>>());
+        if let Some(positions) = positions {
+            for position in positions {
+                self.doc.remove_line(position)
+            }
+        }
+
+        Ok(())
+    }
+
+    // removes all occurrences of the section
+    pub(crate) fn remove_section(&mut self, section: &OsStr) -> Result<(), ConfigFileError> {
+        let section = SectionKey::new(section.as_encoded_bytes())
+            .ok_or(ConfigFileError::BadSectionName(section.to_os_string()))?;
+        Ok(self.doc.remove_section(&section))
     }
 
     pub(crate) fn section_entries(
         &self,
-        section: &str,
+        section: &OsStr,
     ) -> Result<Option<Vec<VariableEntry<'_>>>, ConfigFileError> {
-        let section = SectionKey::new(section.as_bytes())
-            .ok_or(ConfigFileError::BadSectionName(section.to_owned()))?;
+        let section = SectionKey::new(section.as_encoded_bytes())
+            .ok_or(ConfigFileError::BadSectionName(section.to_os_string()))?;
         Ok(self.doc.section_entries(&section))
     }
-}
 
-// Returned after any mutation because inserting, replacing or removing lines invalidates the indexes
-// built from the original line positions and spans. For example inserting a new line make the lines
-// after stale because the indexes now are off. ModifiedConfig holds the new state that needs to be
-// serialized and written back to disk, this is why all mutations take mut self, because we can't use
-// the original config after. We could also have a reindex() method where it writes back to the file
-// and reads the new version? But in theory no method should invoke two consecutive mutation on the
-// same config
-pub(crate) struct ModifiedConfigFile {
-    doc: ConfigDoc,
-}
-
-impl ModifiedConfigFile {
     pub(crate) fn serialize(&self) -> Vec<u8> {
         self.doc.serialize()
     }
@@ -309,7 +349,7 @@ impl ModifiedConfigFile {
 pub(crate) enum ConfigFileError {
     Doc(ConfigDocError),
     BadKey(OsString),
-    BadSectionName(String),
+    BadSectionName(OsString),
     MultipleValues(OsString),
     NotFound(OsString),
     MissingValue(OsString),
@@ -329,9 +369,14 @@ impl ConfigFileError {
             _ => None,
         }
     }
+
     pub(crate) fn is_io_not_found(&self) -> bool {
         self.io_error_kind()
             .is_some_and(|kind| kind == io::ErrorKind::NotFound)
+    }
+
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(self, ConfigFileError::NotFound(_))
     }
 }
 
@@ -358,7 +403,7 @@ impl fmt::Display for ConfigFileError {
                 write!(
                     f,
                     "bad section name: {}. Must be alphanumeric and/or '-'",
-                    value
+                    value.to_string_lossy()
                 )
             }
             ConfigFileError::MultipleValues(key) => {

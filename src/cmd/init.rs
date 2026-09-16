@@ -1,172 +1,20 @@
+use crate::cli;
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::format::{
-    ObjectFormat, ObjectFormatError, RefFormat, RefStorage, RefStorageError, RepositoryFormat,
-    RepositoryFormatError,
+    FormatVersion, ObjectFormat, ObjectFormatError, RefFormat, RefStorage, RefStorageError,
+    RepositoryFormat, RepositoryFormatError,
 };
 use crate::repo::litfile::{self, LitFileError};
-use crate::repo::{self, MetadataDirError};
+use crate::repo::os::OsPath;
+use crate::repo::{self, Layout, LayoutError, MetadataDirError, os};
 use clap::Args;
 use std::error::Error;
-use std::fs::{self, File, FileType, OpenOptions};
-use std::io;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, FileType};
 use std::path::{Path, PathBuf};
 use std::{env, fmt};
-
-enum MetadataPlacement {
-    // metadata dir is used directly
-    Direct,
-    // Ordinary `<worktree>/.lit` dir
-    Embedded,
-    // `<worktree>/.lit` is a pointer file to metadata
-    Separate { link: PathBuf },
-}
-
-struct Layout {
-    // directory containing the repository metadata (HEAD, config, objecets, ...)
-    metadata: PathBuf,
-    // root of the working tree for non-bare
-    // None for bare
-    worktree: Option<PathBuf>,
-    // describes how the metadata is connected to the worktree
-    placement: MetadataPlacement,
-}
-
-impl Layout {
-    // we don't need to do any conversion here or any path validation, we follow the same logic as
-    // we did before we will make the fs call and handle the error for a bad path
-    //
-    // There are 4 factors that determine the location of .lit dir when initializing a repo.
-    // --bare, --separate_lit_dir, path and the LIT_DIR/LIT_WORK_TREE env var.
-    // TODO: We need to set LIT_DIR after resolving the path
-    //
-    //  Resolves the metadata and worktree locations without touching the fs
-    //
-    //  Git's init impl will try to "guess" whether a repo should be bare from the value of GIT_DIR
-    //  https://github.com/git/git/blob/18e66859d87fb4b76599f73460b54f0848c76b16/builtin/init-db.c#L17
-    //  We avoid this behavior and set the following rules:
-    //  - A repository is bare only when --bare is provided.
-    //  - LIT_DIR has the same meaning as GIT_DIR. It names the metadata directory itself, not the
-    //  directory in which an embedded `.lit` directory should be created, this is what the path
-    //  positional arg refers to.
-    //  - A positional path names the repository location and has precedence over LIT_DIR:
-    //      - non-bare: <path> is the worktree and metadata is stored in <path>.lit
-    //      - bare: <path> is the metadata directory and there is no worktree
-    //  - If there is no positional path or --separate-lit-dir, LIT_DIR selects the metadata directory:
-    //      - non-bare: LIT_WORK_TREE selects the worktree, falling back to cwd when unset
-    //      - bare: no worktree, so LIT_WORK_TREE is invalid
-    //  - LIT_WORK_TREE without LIT_DIR is invalid
-    //  - With no explicit location, non-bare init uses cwd/.lit and bare init uses cwd directly
-    /// Determines the repository layout
-    fn resolve(
-        path: Option<&Path>,
-        bare: bool,
-        separate_lit_dir: Option<&Path>,
-    ) -> Result<Self, LayoutError> {
-        // highest precedence, reject early
-        if path.is_some_and(|p| p.as_os_str().is_empty()) {
-            return Err(LayoutError::EmptyPath("<directory>"));
-        }
-
-        let cwd = env::current_dir().map_err(LayoutError::CurrentDirUnavailable)?;
-        let root = path.map_or(cwd.clone(), |path| cwd.join(path));
-
-        if let Some(dir_path) = separate_lit_dir {
-            if dir_path.as_os_str().is_empty() {
-                return Err(LayoutError::EmptyPath("--separate-lit-dir"));
-            }
-            // TODO: should this be a notification to the user that LIT_DIR is actually ignored
-            //  because the flag has higher precedence. This is a conflict because both try to
-            //  name the metadata dir
-            return Ok(Self {
-                metadata: cwd.join(dir_path),
-                // the parent identifies the worktree even though the metadata is elsewhere
-                worktree: Some(root.clone()),
-                placement: MetadataPlacement::Separate {
-                    link: root.join(".lit"),
-                },
-            });
-        }
-
-        // explicit positional path wins over LIT_DIR
-        if path.is_some() {
-            return if bare {
-                Ok(Self {
-                    metadata: root,
-                    worktree: None,
-                    placement: MetadataPlacement::Direct,
-                })
-            } else {
-                // lit init <path>
-                Ok(Self {
-                    metadata: root.join(".lit"), // <worktree>.lit
-                    worktree: Some(root),
-                    placement: MetadataPlacement::Embedded,
-                })
-            };
-        }
-
-        let env_dir = env::var_os("LIT_DIR");
-        if let Some(env_dir) = env_dir {
-            if env_dir.is_empty() {
-                return Err(LayoutError::EmptyPath("LIT_DIR"));
-            }
-
-            let dir = cwd.join(env_dir);
-            // LIT_WORK_TREE makes sense only in conjunction with LIT_DIR without --bare. In any
-            // other case it is ignored.
-            let worktree = env::var_os("LIT_WORK_TREE");
-            if worktree.as_ref().is_some_and(|tree| tree.is_empty()) {
-                return Err(LayoutError::EmptyPath("LIT_WORK_TREE"));
-            }
-            // bare repos have no worktree
-            if bare && worktree.is_some() {
-                return Err(LayoutError::LitWorkTreeWithBare);
-            }
-
-            return if bare {
-                Ok(Self {
-                    metadata: dir,
-                    worktree: None,
-                    placement: MetadataPlacement::Direct,
-                })
-            } else {
-                // if no WORK_TREE found we fall back to cwd
-                let worktree = worktree.map_or(cwd.clone(), |path| cwd.join(path));
-                Ok(Self {
-                    metadata: dir,
-                    worktree: Some(worktree),
-                    placement: MetadataPlacement::Direct,
-                })
-            };
-        }
-
-        // Note: LIT_WORK_TREE is considered only when LIT_DIR is set. This branch is reached when
-        // LIT_DIR is unset, so even if LIT_WORK_TREE is set, it is ignored. bare does not error,
-        // non-bare uses cwd
-        if bare {
-            Ok(Self {
-                metadata: cwd,
-                worktree: None,
-                placement: MetadataPlacement::Direct,
-            })
-        } else {
-            Ok(Self {
-                metadata: cwd.join(".lit"),
-                worktree: Some(cwd),
-                placement: MetadataPlacement::Embedded,
-            })
-        }
-    }
-
-    // the worktree root for non-bare or the metadata directory for bare
-    fn root(&self) -> &Path {
-        self.worktree.as_deref().unwrap_or(&self.metadata)
-    }
-
-    fn is_bare(&self) -> bool {
-        self.worktree.is_none()
-    }
-}
+use std::{io, result};
+use tempfile::{NamedTempFile, TempDir};
 
 #[derive(Debug, Args)]
 pub(crate) struct Init {
@@ -196,14 +44,9 @@ pub(crate) struct Init {
 }
 
 impl Init {
-    // the method that does all the setup for init https://github.com/git/git/blob/master/setup.c
-    // https://github.com/git/git/blob/18e66859d87fb4b76599f73460b54f0848c76b16/builtin/init-db.c#L72
-    // TODO: For init, Git does not decide based merely on whether .git exist. It resolves the
-    //  Git directory, then it considers the operation a reinit when HEAD:
-    //      - exists and is readable
-    //      - is a symlink, including a dangling link
-    //  Even an invalid config will trigger the reinit message based on the above rules
-    pub(super) fn execute(&self) -> Result<(), InitError> {
+    // https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2841-L2945
+    // TODO: we need to see if init sets GIT_DIR env var
+    pub(super) fn execute(&self) -> Result<()> {
         // 1. We need to resolve arguments and env vars for the location of the metadata dir.
         // resolve() sets rules for a deterministic layout.
         let layout = Layout::resolve(
@@ -219,13 +62,13 @@ impl Init {
 
         // 3. If separate-lit-dir flag is set, we create the pointer file and also migrate an
         // existing repo if it is a reinitialization
-        if let MetadataPlacement::Separate { link } = &layout.placement {
-            try_migrate_metadata(link, &layout.metadata)?;
+        if let Some(link) = layout.separate_link() {
+            try_migrate_metadata(link, &layout.metadata())?;
         }
 
-        let cfg_path = layout.metadata.join("config");
+        let cfg_path = layout.metadata().join("config");
         // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
-        let cfg = match ConfigFile::new(&cfg_path) {
+        let mut cfg = match ConfigFile::new(&cfg_path) {
             Ok(cfg) => Some(cfg),
             Err(err) if err.is_io_not_found() => None,
             Err(err) => {
@@ -268,101 +111,320 @@ impl Init {
                 repo_format
             }
         };
-        
-        // TODO: next create the Repo with format and layout. apply_repo_format() in Git's src
-        
-        //  format is a compatibility contract fot the repository as a whole. git needs to know that
-        //  it can safely read/write in this repository. this is different from index versions or
-        //  pack-index version. The 0 which is the most common one means SHA-1 object ids, loose refs
-        //  + packed refs, common Git directory layout
+        let mut cfg = cfg.unwrap_or_else(ConfigFile::empty);
+
+        // TODO: next is apply_repository_format()
+        //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2884
+        //  apply_repo_format() checks at this point for GIT_SHALLOW_FILE, need to revisit when we
+        //  support shallow repositories(contains truncated history)
+        ensure_dir(layout.metadata())?;
+        //  TODO: next is to copy any templates
+        //   https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2587
+        let reinit = is_reinit(layout.metadata())?;
+        // When a tracked entry's mode differs from what is recorded, Git must distinguish if the
+        // change was actually made by the user, or it is a false positive because the environment
+        // does not support Unix permissions(Windows, a fs mounted without permissions)
+        let trust_filemode = trust_filemode(layout.metadata(), reinit)?;
+        if trust_filemode {
+            cfg.set_all("core.filemode".as_ref(), "true".as_ref())?;
+        } else {
+            cfg.set_all("core.filemode".as_ref(), "false".as_ref())?;
+        }
+        // -`lit init project` and then `lit init --bare project` there is no confusion on what
+        // happens. Different metadata directories. For non-bare the metadata entries are created in
+        // project/.lit, then directly inside project, so project/HEAD, project/config etc.
+        // -`LIT_DIR = repo/meta` and then `lit init` with or without --bare results metadata entries
+        // end up in the same directory with different worktree state.
         //
-        // repairing config(reinit):
-        //
-        // [core]
-        // 	repositoryformatversion = 0
-        // 	filemode = true
-        // 	bare = false
-        // 	logallrefupdates = true
-        //
-        // if filemode is missing git appends to [core] filemode = true
-        // if filemode is wrong git rewrites it
-        // same for bare, if a normal repo has bare = true, git changes back to false,
-        // safe for formatversion
-        // TODO: we need to test the behavior of logalrefupdates
-        //
+        // we honor the invariant that we set in resolve() that explicit --bare flag wins. Calling
+        // --bare on an existing repo will set the `core.bare = true` and delete all `core.worktree`
+        // instances.
+        if layout.is_bare() {
+            cfg.unset_all("core.worktree".as_ref())?;
+            cfg.set_all("core.bare".as_ref(), "true".as_ref())?;
+        } else {
+            cfg.set_all("core.bare".as_ref(), "false".as_ref())?;
+            // https://git-scm.com/docs/git-config#Documentation/git-config.txt-corelogAllRefUpdates
+            // From the docs: `This value is true by default in a repository that has a working
+            //  directory associated with it, and false by default in a bare repository.`
+            // The term `working directory` translates to Layout's worktree, not the cwd.
+            //
+            // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2628-L2641
+            // Did some manual testing against Git and if the repo is bare it ignores the value if
+            // present, if absent also performs no action, absence = implicit false`. As seen from
+            // the code too, it completes ignores it for bare repos.
+            // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2636-L2637
+            // as of 2.55 Git rejects a bad boolean value, respects one if present and defaults to
+            // true if absent
+            match cfg.get_bool("core.logallrefupdates".as_ref()) {
+                Ok(_) => {}
+                Err(err) if err.is_not_found() => {
+                    cfg.set("core.logallrefupdates".as_ref(), "true".as_ref())?;
+                }
+                Err(err) => {
+                    return Err(InitError::Config {
+                        path: cfg_path,
+                        source: err,
+                    });
+                }
+            }
+            if layout.needs_worktree_config() {
+                cfg.set_all("core.worktree".as_ref(), "false".as_ref())?;
+            }
+        }
+
+        // I couldn't understand why those 2 cfg settings are checked only for new repos and left
+        // unchecked for existing ones.
+        // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2643-L2660
+        if !reinit {
+            // absence -> implicitly true
+            // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2646-L2653
+            // only writes false in the else block
+            if !support_symlinks(layout.metadata()) {
+                cfg.set_all("core.symlinks".as_ref(), "false".as_ref())?;
+            }
+            // absence -> implicitly false
+            if !is_case_sensitive_fs(layout.metadata()) {
+                cfg.set_all("core.ignorecase".as_ref(), "true".as_ref())?;
+
+            }
+        }
+        setup_object_db(layout.metadata())?;
+
+
+        // TODO: top priorities is for ConfigFileError to report the error path because it knows where
+        //  it read config from and the IoError wrapper
         // Migration vs Reinit
         //  The requirements are different. Reinit needs to know if there is existing repository state
         //  that initialization preserve, while migration needs to know that if it is a metadata
-        //  directory that lit can work on. Reinit must be more conservative.
+        //  directory that is safe to relocate and lit can work on. Reinit must be more conservative.
         //      if .lit/HEAD exists, but /objects and /refs are missing, it might be a damaged repo,
         //      a repo that something went wrong in the previous init call. We have to preserve the
         //      current state, and try to repair the missing structure. A stricter requirement would
         //      not allow us to repair anything, which is the main goal for reinit.
-        //
-        // The code below is a naive wrong impl for detecting an existing lit repo. create_dir() will
-        // fail when another entry exists with the same name, not necessarily a directory, could be
-        // a symlink, regular file etc. Printing the reinit message in such case is misleading. Only
-        // if the existing entry is a directory we can return true for reinit. This is what ensure_dir()
-        // handles.
-        //
-        // let reinit = match fs::create_dir(&lit_dir) {
-        //     Ok(_) => false,
-        //     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => true,
-        //     Err(err) => return Err(InitError::from_io_error(&lit_dir, err)),
-        // };
-        //
-        // If .lit exists as a directory we always print the reinit message without checking if it
-        // contains of the expected entries. It could just be an empty where everything was deleted,
-        // or just deleted the .lit related entries. It does not matter in either case.
-        // let reinit = match fs::create_dir(&layout.metadata) {
-        //     Ok(_) => false,
-        //     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-        //         ensure_dir(&layout.metadata).map(|_| true)?
-        //     }
-        //     Err(err) => return Err(InitError::from_io_error(&layout.metadata, err)),
-        // };
-
-        // on why a naive File::create() does not work read Lockfile::acquire() exactly the same case
-        // File::create(&config).map_err(|err| ....)?;
-        //
-        // same case for creating ensure_dir() but for files, read comment above.
-        // match OpenOptions::new()
-        //     .write(true)
-        //     .create_new(true)
-        //     .open(&config)
-        // {
-        //     Ok(_) => {}
-        //     Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-        //     Err(err) => return Err(InitError::from_io_error(&config, err)),
-        // }
-        // let config = layout.metadata.join("config");
-        // ensure_file(&config)?;
-        // if reinit {
-        //     println!("Reinitialized existing Lit repository in {}", lit.display());
-        // } else {
-        //     println!("Initialized empty Lit repository in {}", lit.display());
-        // }
-        // TODO: when we write the values to config we need to see the behavior of calling reinit
-        //  on a non bare repo and vice versa to determine the core.bare value
         Ok(())
     }
+}
 
-    fn create_dirs(&self, layout: &Layout) -> Result<(), InitError> {
-        let objects = layout.metadata.join("objects");
-        let refs = layout.metadata.join("refs");
-        ensure_dir(&objects)?;
-        ensure_dir(&refs)
+// https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2515-L2525
+// git checks if HEAD is accessible or a symlink(dangling is fine)
+// we never check if the head_path points to an actual HEAD file, all we care about at this point is
+// if something exists at that path, because overwriting can be destructive and lead to unexpected
+// behavior.
+fn is_reinit(path: &Path) -> Result<bool> {
+    let head = path.join("HEAD");
+    match fs::symlink_metadata(&head) {
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(InitError::Io {
+            path: path.to_path_buf(),
+            source: err,
+        }),
     }
+}
+
+fn update_config(cfg: &mut ConfigFile, format: &mut RepositoryFormat) -> Result<()> {
+    finalize_format_version(cfg, format)?;
+    // there are 2 cases that we still need to check:
+    //  - v0 with v1 extensions
+    //  - v1 with unknown extensions
+    //
+    // if the version was absent execute() set it to v0, the default, and finalize updated to v1 if
+    // object format was sha256, ref format was reftable or had a payload. In the initial from_confg()
+    // call we never look for extensions if the version is absent, so after finalizing the version
+    // we can now safely check for version-extensions compatibility.
+    let _ = RepositoryFormat::from_config(cfg)?.unwrap();
+    Ok(())
+}
+
+// Git probes the filesystem because it needs to know whether a reported executable-bit difference
+// represents a real change or merely a limitation of the filesystem interface.
+// From the docs:
+//  `Some filesystems lose the executable bit when a file that is marked as executable is
+//   checked out, or checks out a non-executable file with executable bit on. git probe the
+//   filesystem to see if it handles the executable bit correctly and this variable is
+//   automatically set as necessary.`
+//
+// Example:
+//  We commit a script with mode 100755. We check out that repo in an environment that does not
+//  preserve the Unix executable bit and its metadata now reports the script as non-executable,
+//  even though we changed nothing. If Git trusted that result, it would record the change into
+//  a commit. With core.fileMode = false, Git ignores the working-tree executable-bit difference
+//  while continuing to keep track of the file.
+//
+// Git's docs about filemode mention filesystem and cross-environment situations that can cause
+// this. https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefileMode
+fn trust_filemode(probe_path: &OsPath) -> io::Result<bool> {
+    // we create a temporary file inside the metadata directory for the filemode probe. We don't try
+    // to test it against an existing file.
+    let tempfile = NamedTempFile::new_in(probe_path)?;
+    // TODO: look at the builder and we need to set permissions upon creation?
+    let path = OsPath::new_unchecked(tempfile.path());
+    // TODO: review
+    //  Git considers more to detect trust: https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2623
+    //  it maps to os::probe_filemode(&path)? && (reinit || !os::is_executable(&path)?);
+    //  I don't know what it does exactly or why it needs it, maybe because it uses the cfg file for
+    //  the test? I am not sure so I drop it for now
+    let trust = os::probe_filemode(&path)?;
+    // the explicit call to close is to report any potential errors when closing the file
+    tempfile.close()?;
+
+    Ok(trust)
+}
+
+// https://git-scm.com/docs/git-config#Documentation/git-config.txt-coresymlinks
+//
+// similar to how we probe for filemode we do the same for symlinks
+// core.symlinks control whether Git checks out tracked symbolic links as actual filesystem symlinks
+//
+// if we have a tracked symlink file like `current` that contains `releases/v1`
+// when checking out that entry, Git uses `core.symlinks` to choose how to represent that file.
+//  - true: follows the symlink and reads the content of target
+//  - false: reads the text `releases/v1`
+fn support_symlinks(path: &OsPath) -> io::Result<bool> {
+    let temp_dir = TempDir::new_in(path)?;
+    let parent = OsPath::new_unchecked(temp_dir.path());
+    let link = parent.join_unchecked("link");
+    let support = os::probe_symlink(&link)?;
+
+    temp_dir.close()?;
+
+    Ok(support)
+}
+
+// https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreignoreCase
+//
+// This setting is important when matching a working-tree path to a tracked entry and comparing paths
+// already stored in the repo.
+//
+// TODO: review this for add and status
+// If index contains src/Parser.rs but the working-tree traversal returns src/parser.rs with
+// core.ignorecase = true our lookup should recognize that entry and not try to create a new one.
+// The src/parser.rs should also not appear as untracked. HEAD to index comparisons remain exact
+// because an intentionally staged rename from Parser.rs to parser.rs is a real repo change
+//  Delete this after: core.ignorecase = true -> tracked.eq_ignore_ascii_case(observed)
+//  else tracked == observed
+fn is_case_sensitive_fs(path: &OsPath) -> io::Result<bool> {
+    let prefix = cli::generate(8);
+    let filename = format!("{prefix}_test");
+    File::create(path.join_unchecked(&filename))?;
+    let probe_filename = format!("{prefix}_TEst");
+
+    let insensitive = match fs::symlink_metadata(path.join_unchecked(probe_filename)) {
+        Ok(_) => false,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => true,
+        Err(err) => return Err(err),
+    };
+    fs::remove_file(&filename)?;
+
+    Ok(insensitive)
+}
+
+// TODO: revisit when we support packfiles and worktree
+// https://github.com/git/git/blob/f0ef1b96a076d08dc972a8d2cb0d1cfd60931eb6/setup.c#L2666-L2689
+fn setup_object_db(metadata: &OsPath) -> Result<()> {
+    // the env var has the higher precedence than the <common_directory>/objects where <common_directory>
+    // in our case is the layout.metadata(). This is until we support linked worktree
+    // Read: https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
+    //       https://git-scm.com/docs/git-init
+    // TODO: this is the same logic on validate_metadata_dir() it resolves the object dir, should be
+    //  extracted and reused?
+    let objects = match env::var_os("LIT_OBJECT_DIRECTORY") {
+        Some(var) => {
+            let cwd = env::current_dir()?;
+            let cwd = OsPath::new_unchecked(cwd);
+            cwd.join(var)?
+        }
+        None => metadata.join_unchecked("objects"),
+    };
+    let info = objects.join_unchecked("info");
+    let pack = objects.join_unchecked("pack");
+    ensure_dir(&objects)?;
+    ensure_dir(&info)?;
+    ensure_dir(&pack)
+}
+
+// a limitation of the rust compiler on disjoint borrows
+//  fn update_config(cfg: &mut ConfigFile, format: &mut RepositoryFormat) {
+//      let object_format = format.object_format(); // &ObjectFormat 1st immutable borrow
+//
+//       if *object_format == ObjectFormat::Sha256
+//          || *ref_format == RefFormat::RefTable
+//          || ref_storage.has_payload() {
+//          *format.version_mut() = FormatVersion::V1 // <- cannot borrow *format as mutable because it is also borrowed as immutable
+//      }
+//
+//      if *object_format == ObjectFormat::Sha256 {...} // 2nd immutable borrow
+//  }
+//
+// This is a case of disjoint borrows. We have an immutable borrow to object_format and a mutable
+// borrow to version, but we still get the `cannot borrow..` error. This behavior is caused by the
+// functions' signature. The distinction that those borrows are disjoint is not exposed to the caller.
+// The compiler simply can't see it. It knows that object_format() returns a reference borrowing
+// from self, and version_mut() requires exclusive access to self. It does not inspect the bodies
+// to determine which fields they access. With direct field access, the compiler can see that the
+// borrows are disjoint and allows it. Check ConfigDoc::remove_section().
+fn finalize_format_version(
+    cfg: &mut ConfigFile,
+    format: &mut RepositoryFormat,
+) -> result::Result<(), ConfigFileError> {
+    // https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2460
+    //
+    // at this point we update the format version to v1. When we parsed config if no version was found
+    // we call RepositoryFormat::default() which sets it to v0. It is the None branch in init where
+    // we also resolve object format and ref storage
+    if *format.object_format() == ObjectFormat::Sha256
+        || *format.ref_storage().format() == RefFormat::RefTable
+        || format.ref_storage().has_payload()
+    {
+        *format.version_mut() = FormatVersion::V1
+    }
+
+    let object_format = format.object_format();
+    let ref_storage = format.ref_storage();
+    let ref_format = ref_storage.format();
+
+    if *object_format == ObjectFormat::Sha256 {
+        cfg.set_all(
+            "extensions.objectformat".as_ref(),
+            object_format.name().as_ref(),
+        )?;
+    }
+    if let Some(payload) = ref_storage.payload() {
+        let payload = unsafe { OsStr::from_encoded_bytes_unchecked(payload) };
+        cfg.set_all("extensions.refstorage".as_ref(), payload)?;
+    } else if *ref_format == RefFormat::RefTable {
+        cfg.set_all("extensions.refstorage".as_ref(), ref_format.name().as_ref())?;
+    }
+
+    // sha1 is implicit, we remove any explicit object-format declaration
+    if *format.object_format() == ObjectFormat::Sha1 {
+        cfg.unset_all("extensions.objectformat".as_ref())?;
+    }
+    // same as sha1 above, payload with files format as in `files://<payload>` must be persisted
+    if *format.ref_storage().format() == RefFormat::Files && !ref_storage.has_payload() {
+        cfg.unset_all("extensions.refstorage".as_ref())?;
+    }
+
+    // TODO: https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L2500
+    //  At this point git checks for `init.defaultSubmodulePathConfig` if set, it enables the
+    //  `extensions.submodulePathConfig` extension
+    //  https://git-scm.com/docs/git-config#Documentation/git-config.txt-submodulePathConfig
+    //  It requires v1 so when we support it we need to check set the version
+
+    cfg.set(
+        "core.repositoryformatversion".as_ref(),
+        format.version().as_str().as_ref(),
+    )?;
+
+    Ok(())
 }
 
 // https://github.com/git/git/blob/1a3e64c6c4a623626ff0687008732a8e007e2a1c/setup.c#L2675-L2696
 // we convert an embedded repo layout into a separate one
 // TODO: explain rename and file descriptors and the unavoidable TOCTOU race conditions when working
 //  with paths.
-fn try_migrate_metadata(
-    lit_entry_path: &Path,
-    destination_metadata_dir: &Path,
-) -> Result<(), InitError> {
+fn try_migrate_metadata(lit_entry_path: &Path, destination_metadata_dir: &Path) -> Result<()> {
     // this is tricky
     //
     // from is the path value of the placement field that we set in Layout::resolve()
@@ -454,7 +516,7 @@ fn try_migrate_metadata(
 fn resolve_object_format(
     flag: Option<ObjectFormat>,
     cfg: Option<&ConfigFile>,
-) -> Result<ObjectFormat, InitError> {
+) -> Result<ObjectFormat> {
     if let Some(format) = flag {
         return Ok(format);
     }
@@ -465,6 +527,7 @@ fn resolve_object_format(
     }
 
     if let Some(cfg) = cfg {
+        // TODO: cfg needs to look for this in the global config not local?
         return match cfg.get_str("init.defaultObjectFormat".as_ref()) {
             Ok(hash) => {
                 ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat)
@@ -479,10 +542,7 @@ fn resolve_object_format(
     Ok(ObjectFormat::default())
 }
 
-fn resolve_ref_storage(
-    flag: Option<RefFormat>,
-    cfg: Option<&ConfigFile>,
-) -> Result<RefStorage, InitError> {
+fn resolve_ref_storage(flag: Option<RefFormat>, cfg: Option<&ConfigFile>) -> Result<RefStorage> {
     let mut ref_storage = RefStorage::default();
 
     // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2824-L2838
@@ -529,32 +589,11 @@ fn resolve_ref_storage(
     Ok(ref_storage)
 }
 
-// decide if we have to set core.worktree in config
-fn needs_worktree_config(layout: &Layout) -> bool {
-    let Some(worktree) = &layout.worktree else {
-        return false;
-    };
-
-    // core.worktree is ambiguous when LIT_DIR is used which is in the direct case
-    // LIT_DIR is /foo/metadata
-    // LIT_WORK_TREE is /bar
-    // then we can't use the rule that worktree is the parent of metadata, we have to check
-    // if worktree.join(.lit) is our metadata dir
-    //
-    // there is also the case where LIT_DIR is an absolute path, LIT_WORK_TREE is not set and worktree
-    // ends up being the cwd, this is needs to be resolved in the same way
-    match layout.placement {
-        MetadataPlacement::Direct => layout.metadata != worktree.join(".lit"),
-        // <worktree>/.lit is metadata, parent is worktree
-        MetadataPlacement::Embedded => false,
-        // pointer file, its parent identifies the worktree even the metadata is elsewhere
-        MetadataPlacement::Separate { .. } => false,
-    }
-}
-
-fn ensure_dir(path: &Path) -> Result<(), InitError> {
+fn ensure_dir(path: &OsPath) -> Result<()> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
+        // if it already exists, we need to make sure that is actually a directory and not some other
+        // entry type
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
             let metadata =
                 fs::symlink_metadata(path).map_err(|err| InitError::from_io_error(path, err))?;
@@ -584,24 +623,7 @@ fn resolve_lit_entry(path: &Path) -> io::Result<Option<PathBuf>> {
     Ok(path)
 }
 
-fn ensure_file(path: &Path) -> Result<(), InitError> {
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata =
-                fs::symlink_metadata(path).map_err(|err| InitError::from_io_error(path, err))?;
-            if metadata.file_type().is_file() {
-                Ok(())
-            } else {
-                Err(InitError::BadEntry {
-                    path: path.to_path_buf(),
-                    entry: EntryType::from(metadata.file_type()),
-                })
-            }
-        }
-        Err(err) => Err(InitError::from_io_error(path, err)),
-    }
-}
+pub(crate) type Result<T> = result::Result<T, InitError>;
 
 #[derive(Debug)]
 pub(super) enum InitError {
@@ -708,33 +730,6 @@ impl From<ObjectFormatError> for InitError {
 impl From<RefStorageError> for InitError {
     fn from(err: RefStorageError) -> Self {
         Self::UnknownRefStorage(err)
-    }
-}
-
-#[derive(Debug)]
-pub(super) enum LayoutError {
-    CurrentDirUnavailable(io::Error),
-    // initially was an enum with 4 variants: SeparateLitDir, PositionalArg, LitDir, LitWorkTree
-    // but we only constructed it, never had to match or any other action
-    EmptyPath(&'static str),
-    LitWorkTreeWithBare,
-}
-
-impl Error for LayoutError {}
-
-impl fmt::Display for LayoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LayoutError::CurrentDirUnavailable(err) => {
-                write!(f, "could not determine current directory: {err}")
-            }
-            LayoutError::EmptyPath(source) => {
-                write!(f, "the empty string is not valid path: {}", source)
-            }
-            LayoutError::LitWorkTreeWithBare => {
-                write!(f, "LIT_WORK_TREE not allowed with --bare")
-            }
-        }
     }
 }
 

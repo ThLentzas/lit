@@ -2,8 +2,10 @@
   <dictionary name="project">
     <words>
       <w>Pathspec</w>
+      <w>filemode</w>
       <w>litfile</w>
       <w>pathspec</w>
+      <w>tempfile</w>
     </words>
   </dictionary>
 </component>

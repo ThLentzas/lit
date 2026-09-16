@@ -157,7 +157,7 @@ struct BufferSpan {
     end: usize,
 }
 
-// Line relative spans used by Header for section, subesction and Variable for name and value
+// Line relative spans used by Header for section, subsection and Variable for name and value
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct LineSpan {
     pub(super) start: usize,
@@ -185,9 +185,8 @@ struct Line {
 
 impl Line {
     // it can also be just variable()
-    // canonical tells that the generated variable is in Git's canonical representation
-    fn canonical_variable(name: &str, value: &[u8]) -> Self {
-        let value = encode_value(value);
+    // canonical indicates the generated variable is in Git's canonical representation
+    fn canonical_variable(name: &[u8], value: &[u8]) -> Self {
         // starts after '\t'
         let name_start = 1;
         let name_end = name_start + name.len();
@@ -196,9 +195,9 @@ impl Line {
         let value_end = value_start + value.len();
         let mut line = Vec::with_capacity(value_end);
         line.push(b'\t');
-        line.extend_from_slice(name.as_bytes());
+        line.extend_from_slice(name);
         line.extend_from_slice(b" = ");
-        line.extend_from_slice(&value);
+        line.extend_from_slice(&encode_value(value));
         line.push(b'\n');
 
         Self {
@@ -217,7 +216,7 @@ impl Line {
     }
 
     // it can also be just header()
-    // canonical tells that the generated header is in Git's canonical representation
+    // canonical indicates that the generated header is in Git's canonical representation
     fn canonical_header(key: &SectionKey) -> Self {
         let mut line = Vec::new();
         let name_start = 1;
@@ -233,7 +232,6 @@ impl Line {
             let end = start + sub.len();
             LineSpan { start, end }
         });
-
         line.extend_from_slice(b"]\n");
 
         Self {
@@ -264,8 +262,8 @@ impl Line {
         }
     }
 
-    // a slice within the line, it is used to extract the values of name or value in a case of a
-    // variable, or section/subsection for Header
+    // a slice within the line, it is used to extract name or value in a case of a variable, or
+    // section/subsection for Header
     fn slice<'a>(&'a self, buf: &'a [u8], span: &LineSpan) -> &'a [u8] {
         &self.bytes(buf)[span.start..span.end]
     }
@@ -389,6 +387,7 @@ fn downcase(buf: &[u8]) -> Vec<u8> {
     buf.iter().map(|&byte| byte.to_ascii_lowercase()).collect()
 }
 
+#[derive(Default)]
 struct DocIndex {
     // ConfigKey refers to a variable of a section.
     // foo.bar maps to foo = section, subsection = None, bar = key. Multiple keys can exist in the
@@ -411,9 +410,9 @@ struct DocIndex {
 
 impl DocIndex {
     // after loading the file in memory and creating the Vec<Line> we create the index. The way we
-    // group lines togther is by section, and each section is positional, the most recent header
+    // group lines together is by section, and each section is positional, the most recent header
     // seen above it, current_section keeps track of that. This includes in the current section's
-    // block the blank lines.
+    // block the blank lines and comments.
     fn new(buf: &[u8], lines: &[Line]) -> Self {
         let mut keys: HashMap<ConfigKey, NonEmpty<VariablePos>> = HashMap::new();
         let mut sections: HashMap<SectionKey, NonEmpty<SectionBlock>> = HashMap::new();
@@ -507,6 +506,15 @@ impl DocIndex {
 }
 
 // CST + lookup
+//
+// staleness: When we insert a new line everything below the new line now is stale because their
+// buffer spans are no longer accurate. Functions that unset variables or insert new lines must force
+// a rebuild of the index, we don't serialize and parse again. This is because of the design of Line
+// and how we read from lines using slice(). When we call replace_value() the whole line is replaced
+// the new line does not exist on the buffer. This new line is created as LineKind::Owned() so when
+// slice() tries to access line's content for rebuilding the index it never reads from the buffer
+// it reads from the Vec LineKind::Owned holds.
+#[derive(Default)]
 pub(super) struct ConfigDoc {
     buf: Vec<u8>,
     lines: Vec<Line>,
@@ -514,6 +522,10 @@ pub(super) struct ConfigDoc {
 }
 
 impl ConfigDoc {
+    pub(super) fn empty() -> Self {
+        Self::default()
+    }
+    
     // .lit/config is just a list of sections where each section has a list of variables
     // If we try to use this as our parsing rule we lose the trivia and our CST is no more lossless.
     // We have nowhere to store the trivia. Where does a blank between two variables go? A comment
@@ -523,7 +535,7 @@ impl ConfigDoc {
     //
     // This is a zero-copy approach. The name of a variable is a sub-slice of its line, which is a
     // sub-slice of the file.
-    pub(crate) fn load(path: &Path) -> Result<Self, ConfigDocError> {
+    pub(super) fn load(path: &Path) -> Result<Self, ConfigDocError> {
         let mut buf = Vec::new();
         let lines = read_lines(&mut buf, path)?;
         let index = DocIndex::new(&buf, &lines);
@@ -531,7 +543,7 @@ impl ConfigDoc {
         Ok(Self { buf, lines, index })
     }
 
-    pub(crate) fn serialize(&self) -> Vec<u8> {
+    pub(super) fn serialize(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(self.buf.len());
 
         for line in &self.lines {
@@ -562,7 +574,7 @@ impl ConfigDoc {
     // we first check if foo.bar exists, we append, otherwise we create the whole section
     pub(super) fn insert_variable(&mut self, key: &ConfigKey, value: &[u8]) {
         let section = &key.section;
-        let variable = Line::canonical_variable(&key.name, value);
+        let variable = Line::canonical_variable(key.name.as_bytes(), value);
 
         // if the header exists and has multiple blocks the new variable is added always to the last
         // one
@@ -585,27 +597,55 @@ impl ConfigDoc {
         }
     }
 
-    pub(super) fn replace_value(&mut self, pos: VariablePos, value: &[u8]) {
-        let line = &mut self.lines[pos.0];
-        let LineContent::Slice(_) = &line.content else {
-            // already Owned from an earlier edit this session
-            unreachable!("replacing a freshly-loaded line");
-        };
+    pub(super) fn remove_line(&mut self, index: VariablePos) {
+        self.lines.remove(index.0);
+        // we don't have to call: self.index.keys.remove(key);
+        // rebuild will not include it
+        self.rebuild_index();
+    }
 
-        // Git always writes a new variable line in the form of \t<name> = <encoded_value>\n
-        // it does not matter if the variable is valueless
-        // it discards all the trivia of the old line
-        // it forces the write even if new_value = old_value
+    pub(super) fn remove_section(&mut self, section: &SectionKey) {
+        match self.index.sections.get(section) {
+            Some(blocks) => {
+                for block in blocks {
+                    for index in block.start..block.end {
+                        // don't try to call self.remove_line()!!!!
+                        // we would trigger a rebuild for every line, but the most important issue
+                        // would be a borrow checker issue because we would have an immutable borrow
+                        // to self.index from get() and also a mutable borrow from self.remove_line()
+                        // by calling self.lines.remove() directly we have disjoint borrows to self
+                        // one into self.index, one into lines
+                        self.lines.remove(index);
+                    }
+                }
+                // we don't have to try to remove all keys from self.index.keys that lived in the
+                // lines we remove. rebuild handles it.
+                self.rebuild_index();
+            }
+            None => {}
+        }
+    }
+
+    // Git always writes a new variable line in the form of \t<name> = <encoded_value>\n
+    // it does not matter if the variable is valueless
+    // it discards all the trivia of the old line
+    // it forces the write even if new_value = old_value
+    //
+    // unlike insert_variable, replace_value() does not need to rebuild the index. Replacing a value
+    // does not change the key or the position of the line. The span's now live in the Owned vec of
+    // the new line.
+    pub(super) fn replace_value(&mut self, pos: VariablePos, value: &[u8]) {
+        let line = &self.lines[pos.0];
         let variable = line.variable().unwrap();
         let name = line.slice(&self.buf, &variable.name);
-        let mut content = Vec::with_capacity(name.len() + value.len() + 5);
-        content.push(b'\t');
-        content.extend_from_slice(name);
-        content.extend_from_slice(b" = ");
-        content.extend_from_slice(&encode_value(value));
-        content.push(b'\n');
+        let line = Line::canonical_variable(name, value);
 
-        self.lines[pos.0].content = LineContent::Owned(content);
+        self.lines[pos.0] = line;
+    }
+
+    // Read staleness on ConfigDoc
+    fn rebuild_index(&mut self) {
+        self.index = DocIndex::new(&self.buf, &self.lines)
     }
 
     fn section_entry_at(&self, pos: VariablePos) -> VariableEntry<'_> {
@@ -626,6 +666,10 @@ impl ConfigDoc {
         }
     }
 
+    pub(super) fn section_blocks(&self, section: &SectionKey) -> Option<&NonEmpty<SectionBlock>> {
+        self.index.section_blocks(section)
+    }
+
     pub(super) fn section_entries(&self, section: &SectionKey) -> Option<Vec<VariableEntry<'_>>> {
         let mut entries = Vec::new();
         let blocks = self.index.section_blocks(&section)?;
@@ -638,10 +682,6 @@ impl ConfigDoc {
             }
         }
         Some(entries)
-    }
-
-    pub(super) fn section_exists(&self, key: &SectionKey) -> bool {
-        self.index.section_exists(key)
     }
 
     // when we want to insert the new line we have 1 edge case to consider
@@ -801,7 +841,7 @@ fn interpret_value(value: &[u8]) -> Cow<'_, [u8]> {
             }
             _ => {
                 let start = i;
-                while i < value.len() && matches!(value[i], b'"' | b'\\') {
+                while i < value.len() && !matches!(value[i], b'"' | b'\\') {
                     i += 1;
                 }
                 bytes.extend_from_slice(&value[start..i]);
@@ -852,7 +892,7 @@ fn encode_value(value: &[u8]) -> Cow<'_, [u8]> {
     if !needs_quotes
         && value
             .iter()
-            .any(|&b| matches!(b, b'\"' | b'\\' | b'\n' | b'\t' | 0x08))
+            .all(|&b| !matches!(b, b'\"' | b'\\' | b'\n' | b'\t' | 0x08))
     {
         return Cow::Borrowed(value);
     }

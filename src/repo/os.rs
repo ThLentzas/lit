@@ -1,12 +1,18 @@
 use std::error::Error;
 use std::ffi::OsStr;
-use std::fs::Metadata;
+use std::fs::{Metadata, Permissions};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
+use std::os::unix::fs as unix_fs;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::fs as windows_fs;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::path::{Component, Components, Display, Path, PathBuf, StripPrefixError};
@@ -25,7 +31,10 @@ pub(crate) struct OsPath {
 
 impl OsPath {
     #[cfg(unix)]
-    pub(crate) fn new(path: impl Into<PathBuf>) -> Result<Self, OsPathError> {
+    pub(crate) fn new<P>(path: P) -> Result<Self, OsPathError>
+    where
+        P: Into<PathBuf>,
+    {
         let path = path.into();
         let bytes = path.as_os_str().as_bytes();
 
@@ -42,7 +51,10 @@ impl OsPath {
     // this validation is very weak.
     // We need stronger validation based on: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
     #[cfg(windows)]
-    pub(crate) fn new(path: impl Into<PathBuf>) -> Result<Self, OsPathError> {
+    pub(crate) fn new<P>(path: P) -> Result<Self, OsPathError>
+    where
+        P: Into<PathBuf>,
+    {
         let path = path.into();
         // with encode_wide() we can inspect native code units
         // the u16 we get back is going to be the same for all ASCII characters as utf8
@@ -59,12 +71,14 @@ impl OsPath {
         if units.contains(&0) {
             return Err(OsPathError::ContainsNul(path));
         }
-
         Ok(Self { inner: path })
     }
 
     // this can be used in cases where paths are returned from syscalls like env::cwd()
-    pub(crate) fn new_unchecked(path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new_unchecked<P>(path: P) -> Self
+    where
+        P: Into<PathBuf>,
+    {
         Self { inner: path.into() }
     }
 
@@ -92,8 +106,19 @@ impl OsPath {
         self.inner.components()
     }
 
-    pub(crate) fn join(&self, path: impl AsRef<Path>) -> Result<Self, OsPathError> {
-        Self::new(self.inner.join(path))
+    pub(crate) fn join<P>(&self, path: P) -> Result<Self, OsPathError>
+    where
+        P: AsRef<Path>,
+    {
+        let path = Self::new(path.as_ref().to_path_buf())?;
+        Ok(self.join_unchecked(path))
+    }
+
+    pub(crate) fn join_unchecked<P>(&self, path: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        Self::new_unchecked(self.inner.join(path))
     }
 
     // returns a &Path because what is left can be an empty path and that would break the invariant
@@ -216,9 +241,8 @@ fn to_unix_time_nsec(filetime: u64) -> u64 {
 #[cfg(unix)]
 pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
     // Git tracks symlinks as symlinks, not as the file they point to.
-    //  fs::metadata(path) follows symlinks. If path is a symlink to target, we get metadata about
-    //  target.
-    //  fs::symlink_metadata(path) does not follow. We get metadata about the symlink itself.
+    //  fs::symlink_metadata() does not follow symlinks. We get metadata about the symlink itself
+    //  fs::metadata() follows symlinks and reports metadata about the target
     let meta = fs::symlink_metadata(path).map_err(|err| OsError::Io {
         path: path.to_path_buf(),
         source: err,
@@ -242,7 +266,9 @@ pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
 }
 
 // TODO: we need to check if it correctly retrieves information when a dir path does not have a trailing slash
-// TODO: a/b is a dir not a file named b inside a https://github.com/git-for-windows/git/blob/39c2bbe4d25b979d3e0f28c4d914d430b32e7e6a/compat/stat.c
+// TODO: a/b is a dir not a file named b inside a
+//  https://github.com/git-for-windows/git/blob/39c2bbe4d25b979d3e0f28c4d914d430b32e7e6a/compat/stat.c
+//  stat() for Windows: https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/compat/mingw.c#L1240-L1280
 #[cfg(windows)]
 pub(super) fn stat(path: &Path) -> Result<StatNode, OsError> {
     let meta = fs::symlink_metadata(path).map_err(|err| OsError::Io {
@@ -290,6 +316,75 @@ fn file_kind(meta: &Metadata) -> FileKind {
     } else {
         FileKind::Other
     }
+}
+
+// https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L2616-L2626
+// probe: a small test a program performs to discover how its environment actually behaves.
+// TODO: we need to update status and add to honor this config var
+//  when false we ignore executable-bit differences for tracked regular files and preserve their
+//  existing index mode when staging content changes
+#[cfg(unix)]
+pub(crate) fn probe_filemode(path: &OsPath) -> io::Result<bool> {
+    const OWNER_EXECUTE: u32 = 0o100;
+    let before = fs::symlink_metadata(path)?;
+    // only for files
+    if !before.is_file() {
+        return Ok(false);
+    }
+
+    let original_permissions = before.permissions();
+    let original_mode = original_permissions.mode();
+    // this is the change we want to make
+    let toggle = original_mode ^ OWNER_EXECUTE;
+    if fs::set_permissions(path, Permissions::from_mode(toggle)).is_err() {
+        return Ok(false);
+    }
+    // even if reading the modified permissions fails, we don't return, we still need to restore
+    // file's mode back to the original.
+    let after = fs::symlink_metadata(path);
+    // restore mode
+    fs::set_permissions(path, original_permissions)?;
+    let after = match after {
+        Ok(metadata) => metadata,
+        Err(_) => return Ok(false),
+    };
+
+    // XORing the original mode with the one after our attempt to set the exec-bit will always result
+    // to 0 if the change was not accepted since both numbers will be identical, otherwise 1. The next
+    // check is to isolate the exec-bit(XOR operates on the entire integer)
+    Ok((original_mode ^ after.permissions().mode()) & OWNER_EXECUTE != 0)
+}
+
+#[cfg(windows)]
+pub(crate) fn probe_filemode(_path: &OsPath) -> io::Result<bool> {
+    // For now the windows stat impl does not report executable bits
+    Ok(false)
+}
+
+// to determine if the fs supports symlinks we create a `test` path(does not need to exist, dangling
+// symlinks are fine) and we check what the filesystem reports
+pub(crate) fn probe_symlink(link: &OsPath) -> io::Result<bool> {
+    let test = OsPath::new_unchecked("test_symlink");
+    match symlink(&test, link) {
+        Ok(_) => fs::symlink_metadata(link).map(|metadata| metadata.file_type().is_symlink()),
+        Err(_) => Ok(false),
+    }
+}
+
+#[cfg(unix)]
+fn symlink(original: &OsPath, link: &OsPath) -> io::Result<()> {
+    unix_fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn symlink(original: &OsPath, link: &OsPath) -> io::Result<()> {
+    windows_fs::symlink_file(original, link)
+}
+
+// checks the owner's exec-bit, not whether the current process can actually execute the file.
+pub(crate) fn is_executable(path: &OsPath) -> io::Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    Ok(matches!(file_kind(&metadata), FileKind::Regular(true)))
 }
 
 // TODO: this needs to change to check for a non-zero byte, OsStr does not have this guarantee
@@ -373,8 +468,10 @@ impl fmt::Display for OsPathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             OsPathError::Empty => write!(f, "path is empty"),
-            OsPathError::ContainsNul(path) => write!(f, "path {} contains NUL byte", path.display()),
-            OsPathError::StripPrefix(err) => write!(f, "{err}")
+            OsPathError::ContainsNul(path) => {
+                write!(f, "path {} contains NUL byte", path.display())
+            }
+            OsPathError::StripPrefix(err) => write!(f, "{err}"),
         }
     }
 }

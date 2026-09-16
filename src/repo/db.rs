@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::{fmt, fs, io};
+use crate::cli;
 
 pub(crate) struct Database {
     pub(crate) path: PathBuf,
@@ -72,7 +73,7 @@ impl Database {
         if path.exists() {
             return Ok(oid);
         }
-        let tmp_path = parent.join(gen_tmp_name());
+        let tmp_path = parent.join(cli::with_prefix("tmp_obj"));
         // this will create only the temp file and not any of the parent dir if missing
         // .lit/objects/90/tmp_obj_gNLJvt
         // TODO: we need to change this to zlib
@@ -254,17 +255,6 @@ impl Database {
 
 pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> Oid {
     Oid::from_bytes(Sha1::digest(encode(obj_type, content)).into())
-}
-
-// there is an edge case of a collision where 2 different processes could in theory generate the same
-// tmp file name, and they will overwrite each others content, we have a case of competing writes, rare
-// but can happen, could use Lockfile, but it is highly unlikely
-// this is very similar to how tempfile generates the name
-fn gen_tmp_name() -> String {
-    let suffix: String = (0..6)
-        .map(|_| rand::rng().sample(Alphanumeric) as char)
-        .collect();
-    format!("tmp_obj_{suffix}")
 }
 
 // header: <type> <len>\0<content>

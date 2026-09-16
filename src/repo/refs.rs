@@ -5,6 +5,9 @@ use crate::repo::object::oid::Oid;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
+use std::ffi::{OsStr, OsString};
+
+const DEFAULT_BRANCH_NAME: &str = "master";
 
 pub(crate) struct Refs {
     refs: PathBuf,
@@ -115,7 +118,7 @@ impl Refs {
         }
     }
 
-    pub(super) fn new_unborn_branch(&self) -> Result<(), RefError> {
+    pub(super) fn new_unborn_branch(&self, name: &OsStr) -> Result<(), RefError> {
         let mut head_lock = Lockfile::acquire(&self.head)?;
         // TODO: this should change to main in the future
         head_lock.write(b"ref: refs/heads/master\n")?;
@@ -188,7 +191,24 @@ impl Refs {
     // A <- B <- C <- main
     //
     // Now we are in the same situation as before in order to have a way to reference to the new
-    // line of development we need to create a branch, otherwise we have no way of referncing Y.
+    // line of development we need to create a branch, otherwise we have no way of referencing Y.
+}
+
+fn check_branch_name(name: &OsStr) -> Result<(), RefError> {
+    let bytes = name.as_encoded_bytes();
+    if bytes.is_empty() {
+
+    }
+    
+    if bytes.ends_with(b".lock") {
+
+    }
+    if bytes.ends_with(b".") {
+
+    }
+
+
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -197,6 +217,7 @@ pub(crate) enum RefError {
     Lockfile(LockfileError),
     Database(DbError),
     Oid(OidError),
+    BadBranchName(OsString)
 }
 
 impl Error for RefError {}

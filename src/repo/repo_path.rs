@@ -82,8 +82,6 @@ impl RepoPath {
         &self.inner
     }
 
-    // read Index::resolve_conflicts() first
-    //
     // in order to have a conflict we need them to share the same parent directories, lib/index/main.rs
     // and src/index/main.rs are fine. We need to answer the question: Does the child start with the
     // parent path, and is the next byte a / ?
@@ -117,14 +115,14 @@ fn check_bytes(bytes: &[u8]) -> Result<(), RepoPathError> {
         });
     }
     // paths are relative to the repository root, so no leading slash.
-    if bytes[0] == b'/' {
+    if bytes.starts_with(b"/") {
         return Err(RepoPathError {
             path: bytes.to_vec(),
             kind: RepoPathErrorKind::LeadingSlash,
         });
     }
     // trailing slash is not allowed.
-    if bytes[bytes.len() - 1] == b'/' {
+    if bytes.ends_with(b"/") {
         return Err(RepoPathError {
             path: bytes.to_vec(),
             kind: RepoPathErrorKind::TrailingSlash,

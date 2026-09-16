@@ -75,6 +75,7 @@ impl Config {
                 let _entry = cfg.get(&get.name).unwrap();
             }
             Action::Set(set) => {
+                // TODO: should cfg itself acquire the lock like refs do for HEAD or not?
                 let mut lock  = Lockfile::acquire(&cfg_path).unwrap();
                 let cfg = ConfigFile::new(&cfg_path).unwrap();
                 let cfg = cfg.set(&set.name, &set.value).unwrap();

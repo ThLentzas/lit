@@ -46,7 +46,7 @@ impl Extension {
         }
     }
 
-    // https://github.com/git/git/blob/master/setup.c#L635
+    // https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L612
     fn is_v0_compatible(&self) -> bool {
         matches!(
             self,
@@ -85,10 +85,21 @@ impl From<&[u8]> for Extension {
     }
 }
 
+// v0 uses the default sha1 and files(implicit values)
+// v1 enables extensions, allowing any combination of object format and ref storage
 #[derive(Debug, PartialEq, Eq)]
-enum FormatVersion {
+pub(crate) enum FormatVersion {
     V0,
     V1,
+}
+
+impl FormatVersion {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            FormatVersion::V0 => "0",
+            FormatVersion::V1 => "1",
+        }
+    }
 }
 
 impl TryFrom<u64> for FormatVersion {
@@ -110,6 +121,15 @@ pub(crate) enum RefFormat {
     RefTable,
 }
 
+impl RefFormat {
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            RefFormat::Files => "files",
+            RefFormat::RefTable => "reftable",
+        }
+    }
+}
+
 impl TryFrom<&[u8]> for RefFormat {
     type Error = RefFormatError;
 
@@ -125,16 +145,25 @@ impl TryFrom<&[u8]> for RefFormat {
 #[derive(Debug)]
 pub(crate) struct RefStorage {
     ref_format: RefFormat,
+    // <format>://<payload> is the syntax, format is also referred to as backend
     payload: Option<Vec<u8>>,
 }
 
 impl RefStorage {
     pub(crate) fn format(&self) -> &RefFormat {
-        & self.ref_format
+        &self.ref_format
     }
 
     pub(crate) fn format_mut(&mut self) -> &mut RefFormat {
         &mut self.ref_format
+    }
+
+    pub(crate) fn payload(&self) -> Option<&Vec<u8>> {
+        self.payload.as_ref()
+    }
+
+    pub(crate) fn has_payload(&self) -> bool {
+        self.payload.is_some()
     }
 }
 
@@ -152,7 +181,7 @@ impl TryFrom<&[u8]> for RefStorage {
 
     // the URI has the form <format>://<payload>
     // https://git-scm.com/docs/git-config#Documentation/git-config.txt-refStorage
-    // https://github.com/git/git/blob/master/setup.c#L635
+    // https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L635-L648
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         let (backend, payload) = match memmem::find(value, b"://") {
             Some(pos) => {
@@ -182,7 +211,7 @@ pub(crate) enum ObjectFormat {
 }
 
 impl ObjectFormat {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             ObjectFormat::Sha1 => "sha1",
             ObjectFormat::Sha256 => "sha256",
@@ -203,6 +232,10 @@ impl TryFrom<&[u8]> for ObjectFormat {
 }
 
 // https://git-scm.com/docs/gitrepository-layout#_git_repository_format_versions
+//  format is a compatibility contract fot the repository as a whole. git needs to know that
+//  it can safely read/write in this repository. this is different from index versions or
+//  pack-index version. The 0 which is the most common one means SHA-1 object ids, loose refs
+//  + packed refs, common Git directory layout
 pub(crate) struct RepositoryFormat {
     version: FormatVersion,
     ref_storage: RefStorage,
@@ -231,10 +264,7 @@ impl RepositoryFormat {
         };
         let mut format = RepositoryFormat::with_version(version);
 
-        if let Some(entries) = cfg
-            .section_entries("extensions")
-            .map_err(RepositoryFormatError::Config)?
-        {
+        if let Some(entries) = cfg.section_entries("extensions".as_ref())? {
             for entry in entries {
                 format.apply_extension(entry)?;
             }
@@ -251,17 +281,26 @@ impl RepositoryFormat {
         Ok(Some(format))
     }
 
-    pub(crate) fn object_format_mut(&mut self) -> &mut ObjectFormat {
-        &mut self.object_format
+    pub(crate) fn version(&self) -> &FormatVersion {
+        &self.version
+    }
+
+    pub(crate) fn version_mut(&mut self) -> &mut FormatVersion {
+        &mut self.version
     }
 
     pub(crate) fn object_format(&self) -> &ObjectFormat {
         &self.object_format
     }
 
+    pub(crate) fn object_format_mut(&mut self) -> &mut ObjectFormat {
+        &mut self.object_format
+    }
+
     pub(crate) fn ref_storage_mut(&mut self) -> &mut RefStorage {
         &mut self.ref_storage
     }
+
     pub(crate) fn ref_storage(&self) -> &RefStorage {
         &self.ref_storage
     }
@@ -303,7 +342,7 @@ impl RepositoryFormat {
         self.apply_common_extension(entry)
     }
 
-    // https://github.com/git/git/blob/master/setup.c#L653
+    // https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L653-L716
     fn apply_v1_extension(
         &mut self,
         entry: VariableEntry<'_>,
@@ -340,7 +379,7 @@ impl RepositoryFormat {
                         }
                     })?);
 
-                // https://github.com/git/git/blob/master/setup.c#L681-L686
+                // https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L681-L686
                 if self.compat_object_format.is_some() {
                     return Err(RepositoryFormatError::DuplicateCompatObjectFormatExtension);
                 }
@@ -538,6 +577,12 @@ impl fmt::Display for RepositoryFormatError {
                 )
             }
         }
+    }
+}
+
+impl From<ConfigFileError> for RepositoryFormatError {
+    fn from(err: ConfigFileError) -> Self {
+        Self::Config(err)
     }
 }
 
