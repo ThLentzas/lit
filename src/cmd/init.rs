@@ -1,21 +1,21 @@
-use crate::cli;
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::format::{
     FormatVersion, ObjectFormat, ObjectFormatError, RefFormat, RefStorage, RefStorageError,
     RepositoryFormat, RepositoryFormatError,
 };
 use crate::repo::litfile::{self, LitFileError};
-use crate::repo::os::OsPath;
-use crate::repo::refs::Refs;
-use crate::repo::{self, Layout, LayoutError, MetadataDirError, os};
+use crate::repo::os::{self, IoError, IoErrorContext, OsPath, OsPathError};
+use crate::repo::refs::{RefError, Refs};
+use crate::repo::{self, Layout, LayoutError, MetadataDirError};
 use clap::Args;
+use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, FileType};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::{env, fmt};
-use std::{io, result};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::{Builder, NamedTempFile, TempDir};
 
 #[derive(Debug, Args)]
 pub(crate) struct Init {
@@ -41,13 +41,13 @@ pub(crate) struct Init {
     ref_format: Option<RefFormat>,
     // Directory in which to initialize the repository
     path: Option<PathBuf>,
-    // TODO: add the remaining flags
+    #[arg(short = 'b', long)]
+    initial_branch: Option<OsString>,
 }
 
 impl Init {
     // https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2841-L2945
-    // TODO: we need to see if init sets GIT_DIR env var
-    pub(super) fn execute(&self) -> Result<()> {
+    pub(super) fn execute(&self) -> Result<(), InitError> {
         // 1. We need to resolve arguments and env vars for the location of the metadata dir.
         // resolve() sets rules for a deterministic layout.
         let layout = Layout::resolve(
@@ -58,34 +58,32 @@ impl Init {
         )?;
 
         // 2. Create the positional/root directory
-        fs::create_dir_all(layout.root())
-            .map_err(|err| InitError::from_io_error(layout.root(), err))?;
+        fs::create_dir_all(layout.root()).with_context("mkdir", Some(layout.root()))?;
 
         // 3. If separate-lit-dir flag is set, we create the pointer file and also migrate an
         // existing repo if it is a reinitialization
         if let Some(link) = layout.separate_link() {
-            try_migrate_metadata(link, &layout.metadata())?;
+            try_migrate_metadata(link, layout.metadata())?;
         }
 
-        let cfg_path = layout.metadata().join("config");
+        let cfg_path = layout.metadata().join_unchecked("config");
         // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
-        let mut cfg = match ConfigFile::new(&cfg_path) {
+        let cfg = match ConfigFile::new(cfg_path.clone()) {
             Ok(cfg) => Some(cfg),
             Err(err) if err.is_io_not_found() => None,
             Err(err) => {
-                return Err(InitError::Config {
-                    path: cfg_path,
-                    source: err,
-                });
+                return Err(InitError::Config(err));
             }
         };
 
+        // TODO: explain why we return none and not default yet
         let repo_format = match cfg.as_ref() {
             Some(cfg) => RepositoryFormat::from_config(cfg)?,
             None => None,
         };
         // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2765
-        let repo_format = match repo_format {
+        // will be passed to setup_ref_db() when we support reftables
+        let mut repo_format = match repo_format {
             // for an existing repo don't allow the user to specify a different hash/ref format, it
             // can lead to unexpected behavior/corruption of the repo.
             Some(repo_format) => {
@@ -112,7 +110,7 @@ impl Init {
                 repo_format
             }
         };
-        let mut cfg = cfg.unwrap_or_else(ConfigFile::empty);
+        let mut cfg = cfg.unwrap_or_else(|| ConfigFile::empty(cfg_path));
 
         // TODO: next is apply_repository_format()
         //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2884
@@ -122,10 +120,11 @@ impl Init {
         //  TODO: next is to copy any templates
         //   https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2587
         let reinit = is_reinit(layout.metadata())?;
+        finalize_format_version(&mut cfg, &mut repo_format)?;
         // When a tracked entry's mode differs from what is recorded, Git must distinguish if the
         // change was actually made by the user, or it is a false positive because the environment
         // does not support Unix permissions(Windows, a fs mounted without permissions)
-        let trust_filemode = trust_filemode(layout.metadata(), reinit)?;
+        let trust_filemode = trust_filemode(layout.metadata())?;
         if trust_filemode {
             cfg.set_all("core.filemode".as_ref(), "true".as_ref())?;
         } else {
@@ -162,12 +161,7 @@ impl Init {
                 Err(err) if err.is_not_found() => {
                     cfg.set("core.logallrefupdates".as_ref(), "true".as_ref())?;
                 }
-                Err(err) => {
-                    return Err(InitError::Config {
-                        path: cfg_path,
-                        source: err,
-                    });
-                }
+                Err(err) => return Err(InitError::Config(err)),
             }
             if layout.needs_worktree_config() {
                 cfg.set_all("core.worktree".as_ref(), "false".as_ref())?;
@@ -181,18 +175,26 @@ impl Init {
             // absence -> implicitly true
             // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2646-L2653
             // only writes false in the else block
-            if !support_symlinks(layout.metadata()) {
+            if !support_symlinks(layout.metadata())? {
                 cfg.set_all("core.symlinks".as_ref(), "false".as_ref())?;
             }
             // absence -> implicitly false
-            if !is_case_sensitive_fs(layout.metadata()) {
+            if !is_case_sensitive_fs(layout.metadata())? {
                 cfg.set_all("core.ignorecase".as_ref(), "true".as_ref())?;
             }
         }
         setup_object_db(layout.metadata())?;
+        setup_ref_db(
+            layout.metadata(),
+            // as_ref() would give us Option<&OsString>
+            self.initial_branch.as_deref(),
+            &cfg,
+            reinit,
+        )?;
+        if !reinit {
+            // print
+        }
 
-        // TODO: top priorities is for ConfigFileError to report the error path because it knows where
-        //  it read config from and the IoError wrapper
         // Migration vs Reinit
         //  The requirements are different. Reinit needs to know if there is existing repository state
         //  that initialization preserve, while migration needs to know that if it is a metadata
@@ -210,30 +212,13 @@ impl Init {
 // we never check if the head_path points to an actual HEAD file, all we care about at this point is
 // if something exists at that path, because overwriting can be destructive and lead to unexpected
 // behavior.
-fn is_reinit(path: &Path) -> Result<bool> {
-    let head = path.join("HEAD");
+fn is_reinit(path: &OsPath) -> Result<bool, IoError> {
+    let head = path.join_unchecked("HEAD");
     match fs::symlink_metadata(&head) {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(InitError::Io {
-            path: path.to_path_buf(),
-            source: err,
-        }),
+        Err(err) => Err(IoError::new("lstat", Some(&head), err)),
     }
-}
-
-fn update_config(cfg: &mut ConfigFile, format: &mut RepositoryFormat) -> Result<()> {
-    finalize_format_version(cfg, format)?;
-    // there are 2 cases that we still need to check:
-    //  - v0 with v1 extensions
-    //  - v1 with unknown extensions
-    //
-    // if the version was absent execute() set it to v0, the default, and finalize updated to v1 if
-    // object format was sha256, ref format was reftable or had a payload. In the initial from_confg()
-    // call we never look for extensions if the version is absent, so after finalizing the version
-    // we can now safely check for version-extensions compatibility.
-    let _ = RepositoryFormat::from_config(cfg)?.unwrap();
-    Ok(())
 }
 
 // Git probes the filesystem because it needs to know whether a reported executable-bit difference
@@ -253,11 +238,13 @@ fn update_config(cfg: &mut ConfigFile, format: &mut RepositoryFormat) -> Result<
 //
 // Git's docs about filemode mention filesystem and cross-environment situations that can cause
 // this. https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefileMode
-fn trust_filemode(probe_path: &OsPath) -> io::Result<bool> {
+fn trust_filemode(probe_dir: &OsPath) -> Result<bool, IoError> {
     // we create a temporary file inside the metadata directory for the filemode probe. We don't try
     // to test it against an existing file.
-    let tempfile = NamedTempFile::new_in(probe_path)?;
-    // TODO: look at the builder and we need to set permissions upon creation?
+    // https://docs.rs/tempfile/latest/tempfile/struct.Builder.html#method.permissions
+    // the permissions of the new file are 600
+    let tempfile =
+        NamedTempFile::new_in(probe_dir).with_context("create temp file in", Some(probe_dir))?;
     let path = OsPath::new_unchecked(tempfile.path());
     // TODO: review
     //  Git considers more to detect trust: https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2623
@@ -266,7 +253,7 @@ fn trust_filemode(probe_path: &OsPath) -> io::Result<bool> {
     //  the test? I am not sure so I drop it for now
     let trust = os::probe_filemode(&path)?;
     // the explicit call to close is to report any potential errors when closing the file
-    tempfile.close()?;
+    tempfile.close().with_context("unlink", Some(&path))?;
 
     Ok(trust)
 }
@@ -280,13 +267,14 @@ fn trust_filemode(probe_path: &OsPath) -> io::Result<bool> {
 // when checking out that entry, Git uses `core.symlinks` to choose how to represent that file.
 //  - true: follows the symlink and reads the content of target
 //  - false: reads the text `releases/v1`
-fn support_symlinks(path: &OsPath) -> io::Result<bool> {
-    let temp_dir = TempDir::new_in(path)?;
+fn support_symlinks(probe_dir: &OsPath) -> Result<bool, IoError> {
+    let temp_dir =
+        TempDir::new_in(probe_dir).with_context("create temp file in", Some(probe_dir))?;
     let parent = OsPath::new_unchecked(temp_dir.path());
     let link = parent.join_unchecked("link");
     let support = os::probe_symlink(&link)?;
 
-    temp_dir.close()?;
+    temp_dir.close().with_context("unlink", Some(&parent))?;
 
     Ok(support)
 }
@@ -303,25 +291,26 @@ fn support_symlinks(path: &OsPath) -> io::Result<bool> {
 // because an intentionally staged rename from Parser.rs to parser.rs is a real repo change
 //  Delete this after: core.ignorecase = true -> tracked.eq_ignore_ascii_case(observed)
 //  else tracked == observed
-fn is_case_sensitive_fs(path: &OsPath) -> io::Result<bool> {
-    let prefix = cli::generate(8);
-    let filename = format!("{prefix}_test");
-    File::create(path.join_unchecked(&filename))?;
-    let probe_filename = format!("{prefix}_TEst");
+fn is_case_sensitive_fs(path: &OsPath) -> Result<bool, IoError> {
+    let tempfile = Builder::new()
+        .prefix(".lit-case-probe")
+        .suffix(".case")
+        .tempfile_in(path)
+        .with_context("create tempfile in", Some(path))?;
+    let probe_path = tempfile.path().with_extension("CASE");
 
-    let insensitive = match fs::symlink_metadata(path.join_unchecked(probe_filename)) {
+    let case_sensitive = match fs::symlink_metadata(&probe_path) {
         Ok(_) => false,
         Err(err) if err.kind() == io::ErrorKind::NotFound => true,
-        Err(err) => return Err(err),
+        Err(err) => return Err(IoError::new("lstat", Some(&probe_path), err)),
     };
-    fs::remove_file(&filename)?;
 
-    Ok(insensitive)
+    Ok(case_sensitive)
 }
 
 // TODO: revisit when we support packfiles and worktree
 // https://github.com/git/git/blob/f0ef1b96a076d08dc972a8d2cb0d1cfd60931eb6/setup.c#L2666-L2689
-fn setup_object_db(metadata: &OsPath) -> Result<()> {
+fn setup_object_db(metadata: &OsPath) -> Result<(), InitError> {
     // the env var has the higher precedence than the <common_directory>/objects where <common_directory>
     // in our case is the layout.metadata(). This is until we support linked worktree
     // Read: https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
@@ -330,7 +319,8 @@ fn setup_object_db(metadata: &OsPath) -> Result<()> {
     //  extracted and reused?
     let objects = match env::var_os("LIT_OBJECT_DIRECTORY") {
         Some(var) => {
-            let cwd = env::current_dir()?;
+            // the compiler cannot infer P when None is passed, None::<&Path> also works
+            let cwd = env::current_dir().with_context::<&Path>("getcwd", None)?;
             let cwd = OsPath::new_unchecked(cwd);
             cwd.join(var)?
         }
@@ -344,12 +334,17 @@ fn setup_object_db(metadata: &OsPath) -> Result<()> {
 }
 
 // name: --initial-branch option value
+// TODO: this is implementation is incomplete
+//  currently we create the backend as files. We never consider the ref storage itself. When we support
+//  reftables we need to rewrite it. Even this impl with files does not support files with payload
+//  refstorage.format = RefFormat::Files, payload = None,
+//  Probably need to move the logic to Refs something like create_on_disk() or something
 fn setup_ref_db(
     metadata: &OsPath,
     name: Option<&OsStr>,
     cfg: &ConfigFile,
     reinit: bool,
-) -> Result<()> {
+) -> Result<(), InitError> {
     let refs = metadata.join_unchecked("refs");
     let heads = refs.join_unchecked("heads");
     let tags = refs.join_unchecked("tags");
@@ -360,21 +355,21 @@ fn setup_ref_db(
 
     if !reinit {
         let refs = Refs::new(metadata);
-        let name = match name {
+        // we can't do let name = match name and make a single refs.new_unborn_branch(name) because
+        // when we get back the entry for cfg.get_bytes() we create an &OsStr but the entry gets
+        // dropped which makes OsStr invalid
+        match name {
             // user provided branch name has the highest precedence
-            Some(name) => Some(name),
-            None => match cfg.get("init.defaultBranch".as_ref()) {
-                Ok(entry) => Some(entry.value()),
-                Err(err) if err.is_not_found() => None,
-                Err(err) => {
-                    return Err(InitError::Config {
-                        path: Path::new("").to_path_buf(),
-                        source: err,
-                    });
+            Some(name) => refs.new_unborn_branch(Some(name))?,
+            None => match cfg.get_bytes("init.defaultBranch".as_ref()) {
+                Ok(entry) => {
+                    let name = os::os_str_from_bytes(entry.as_ref());
+                    refs.new_unborn_branch(Some(name))?
                 }
+                Err(err) if err.is_not_found() => refs.new_unborn_branch(None)?,
+                Err(err) => return Err(InitError::Config(err)),
             },
-        };
-        refs.new_unborn_branch(name)?;
+        }
     }
     Ok(())
 }
@@ -402,7 +397,7 @@ fn setup_ref_db(
 fn finalize_format_version(
     cfg: &mut ConfigFile,
     format: &mut RepositoryFormat,
-) -> result::Result<(), ConfigFileError> {
+) -> Result<(), InitError> {
     // https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2460
     //
     // at this point we update the format version to v1. When we parsed config if no version was found
@@ -452,6 +447,16 @@ fn finalize_format_version(
         format.version().as_str().as_ref(),
     )?;
 
+    // there are 2 cases that we still need to check:
+    //  - v0 with v1 extensions
+    //  - v1 with unknown extensions
+    //
+    // if the version was absent execute() set it to v0, the default, and finalize updated to v1 if
+    // object format was sha256, ref format was reftable or had a payload. In the initial from_confg()
+    // call we never look for extensions if the version is absent, so after finalizing the version
+    // we can now safely check for version-extensions compatibility.
+    let _ = RepositoryFormat::from_config(cfg)?.unwrap();
+
     Ok(())
 }
 
@@ -459,88 +464,69 @@ fn finalize_format_version(
 // we convert an embedded repo layout into a separate one
 // TODO: explain rename and file descriptors and the unavoidable TOCTOU race conditions when working
 //  with paths.
-fn try_migrate_metadata(lit_entry_path: &Path, destination_metadata_dir: &Path) -> Result<()> {
-    // this is tricky
-    //
-    // from is the path value of the placement field that we set in Layout::resolve()
-    // we don't know if this path exists yet
-    //
+// link path to project/.lit pointer file
+fn try_migrate_metadata(link: &OsPath, metadata_destination: &OsPath) -> Result<(), InitError> {
     // lit --separate-lit-dir /new/metadata project
     //
-    // if it is a fresh repo, project/.lit will be a file with a pointer to /new/metadata
-    // if it is a reinit, we have to inspect lit_link, because now we have to move the contents
-    // to the new location.
+    // if project/.lit exists as a path we need to inspect it because now we have to move the
+    // contents to the new location.
     //  - a directory means it is the existing metadata directory
-    //  - a file means we have to check if it contains an existing pointer such as: litdir: /old/metadata
+    //  - a file means we have to check if it contains an existing pointer such as: `litdir: /old/metadata`
     //  and follow the pointer to find the content we want to move
-    //
-    // Note: we can't make a naive call fs::metadata(from), we first have to resolve it. If from
-    // is a symlink, metadata() will follow it and return info based on the target BUT later when we
-    // try to rename(from, to), fs::rename() does not follow symlinks, and we will rename
-    // the symlink itself not the target path, so first we must call canonicalize() and then call
-    // metadata to the returned value.
-    let resolved_entry_path = resolve_lit_entry(lit_entry_path)
-        .map_err(|err| InitError::from_io_error(lit_entry_path, err))?;
+    //  - a symlink must be resolved first
+    let resolved_entry_path = resolve_litfile_pointer(link)?;
     let Some(current_metadata_dir) = resolved_entry_path else {
-        // nothing to migrate, create the .lit file
-        return litfile::write(lit_entry_path, destination_metadata_dir).map_err(|err| {
-            InitError::LitFile {
-                path: lit_entry_path.to_path_buf(),
-                err,
-            }
-        });
+        // if the pointer points nowhere, nothing to migrate, create the .lit file
+        return Ok(litfile::write(link, metadata_destination.as_bytes())?);
     };
 
-    // TODO: clean up the comments and ask Astra if there any issues when someone
-    //  tries to read Index paths on Windows, since they are just byte sequences without NUL
-    match fs::metadata(&current_metadata_dir) {
+    match fs::metadata(current_metadata_dir.as_ref()) {
         Ok(metadata) if metadata.is_dir() => {
             repo::validate_metadata_dir(&current_metadata_dir)?;
-            if current_metadata_dir != destination_metadata_dir {
-                fs::rename(&current_metadata_dir, destination_metadata_dir)
-                    .map_err(|err| InitError::from_io_error(&current_metadata_dir, err))?;
+            if current_metadata_dir.as_ref() != metadata_destination {
+                fs::rename(current_metadata_dir.as_ref(), metadata_destination)
+                    .with_context("rename", Some(metadata_destination))?;
             }
         }
         Ok(metadata) if metadata.is_file() => {
-            let mut file = File::open(lit_entry_path)
-                .map_err(|err| InitError::from_io_error(lit_entry_path, err))?;
+            let mut file = File::open(current_metadata_dir.as_ref())
+                .with_context("open", Some(current_metadata_dir.as_ref()))?;
             // There is TOCTOU race condition between the first fs::metadata() call and
             // File::open() which we can actually handle by calling metadata() again after
             // acquiring the file descriptor for the duration of the operation
             let metadata = file
                 .metadata()
-                .map_err(|err| InitError::from_io_error(lit_entry_path, err))?;
+                .with_context("fstat", Some(current_metadata_dir.as_ref()))?;
             if !metadata.is_file() {
                 return Err(InitError::BadEntry {
-                    path: lit_entry_path.to_path_buf(),
+                    path: current_metadata_dir.into_owned(),
                     entry: EntryType::from(metadata.file_type()),
                 });
             }
             // must be a litfile
-            let path = litfile::read(&mut file).map_err(|err| InitError::LitFile {
-                path: lit_entry_path.to_path_buf(),
-                err,
-            })?;
+            let path = litfile::read(&mut file, current_metadata_dir.as_ref())?;
             // must point to a valid lit repo
             repo::validate_metadata_dir(&path)?;
-            if path != destination_metadata_dir {
-                fs::rename(&path, destination_metadata_dir)
-                    .map_err(|err| InitError::from_io_error(&path, err))?;
+            if path != *metadata_destination {
+                fs::rename(&path, metadata_destination)
+                    .with_context("rename", Some(metadata_destination))?;
             }
         }
         Ok(metadata) => {
             return Err(InitError::BadEntry {
-                path: current_metadata_dir,
+                path: current_metadata_dir.into_owned(),
                 entry: EntryType::from(metadata.file_type()),
             });
         }
-        Err(err) => return Err(InitError::from_io_error(&current_metadata_dir, err)),
+        Err(err) => {
+            return Err(InitError::Io(IoError::new(
+                "stat",
+                Some(current_metadata_dir.as_ref()),
+                err,
+            )));
+        }
     }
-
-    litfile::write(lit_entry_path, destination_metadata_dir).map_err(|err| InitError::LitFile {
-        path: lit_entry_path.to_path_buf(),
-        err,
-    })?;
+    litfile::write(link, metadata_destination.as_bytes())?;
 
     Ok(())
 }
@@ -551,13 +537,13 @@ fn try_migrate_metadata(lit_entry_path: &Path, destination_metadata_dir: &Path) 
 fn resolve_object_format(
     flag: Option<ObjectFormat>,
     cfg: Option<&ConfigFile>,
-) -> Result<ObjectFormat> {
+) -> Result<ObjectFormat, InitError> {
     if let Some(format) = flag {
         return Ok(format);
     }
 
     if let Some(hash) = env::var_os("LIT_DEFAULT_HASH") {
-        let hash = hash.as_encoded_bytes();
+        let hash = os::os_str_as_bytes(&hash);
         return ObjectFormat::try_from(hash).map_err(InitError::UnknownObjectFormat);
     }
 
@@ -568,16 +554,16 @@ fn resolve_object_format(
                 ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat)
             }
             Err(err) if err.is_io_not_found() => Ok(ObjectFormat::default()),
-            Err(err) => Err(InitError::Config {
-                path: Path::new("").to_path_buf(),
-                source: err,
-            }),
+            Err(err) => Err(InitError::Config(err)),
         };
     }
     Ok(ObjectFormat::default())
 }
 
-fn resolve_ref_storage(flag: Option<RefFormat>, cfg: Option<&ConfigFile>) -> Result<RefStorage> {
+fn resolve_ref_storage(
+    flag: Option<RefFormat>,
+    cfg: Option<&ConfigFile>,
+) -> Result<RefStorage, InitError> {
     let mut ref_storage = RefStorage::default();
 
     // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2824-L2838
@@ -586,7 +572,7 @@ fn resolve_ref_storage(flag: Option<RefFormat>, cfg: Option<&ConfigFile>) -> Res
     // In the src code, linked above, the branch that checks this env var is a separate one, disconnected
     // from the above logic. It has the highest precedence, it overwrites any previously set value.
     if let Some(ref_backend) = env::var_os("LIT_REFERENCE_BACKEND") {
-        let ref_backend = ref_backend.as_encoded_bytes();
+        let ref_backend = os::os_str_as_bytes(ref_backend.as_os_str());
         ref_storage = RefStorage::try_from(ref_backend)?;
 
         return Ok(ref_storage);
@@ -596,92 +582,111 @@ fn resolve_ref_storage(flag: Option<RefFormat>, cfg: Option<&ConfigFile>) -> Res
     if let Some(ref_format) = flag {
         *ref_storage.format_mut() = ref_format;
     } else if let Some(ref_format) = env::var_os("LIT_DEFAULT_REF_FORMAT") {
-        let ref_format = ref_format.as_encoded_bytes();
+        let ref_format = os::os_str_as_bytes(ref_format.as_os_str());
         *ref_storage.format_mut() = RefFormat::try_from(ref_format)
             .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
     } else {
         if let Some(cfg) = cfg {
             match cfg.get_str("init.defaultRefFormat".as_ref()) {
                 Ok(ref_format) => {
-                    *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_ref().as_bytes())
+                    *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_bytes())
                         .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
                 }
-                Err(err)
-                    if err
-                        .io_error_kind()
-                        // if the config value is not set, storage is already default, we don't have to
-                        // perform any action
-                        .is_some_and(|kind| kind == io::ErrorKind::NotFound) => {}
-                Err(err) => {
-                    return Err(InitError::Config {
-                        path: Path::new("").to_path_buf(),
-                        source: err,
-                    });
-                }
+                // if the config value is not set, storage is already default, we don't have to
+                // perform any action
+                Err(err) if err.is_io_not_found() => {}
+                Err(err) => return Err(InitError::Config(err)),
             }
         }
     }
     Ok(ref_storage)
 }
 
-fn ensure_dir(path: &OsPath) -> Result<()> {
+fn ensure_dir(path: &OsPath) -> Result<(), InitError> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
         // if it already exists, we need to make sure that is actually a directory and not some other
         // entry type
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata =
-                fs::symlink_metadata(path).map_err(|err| InitError::from_io_error(path, err))?;
+            let metadata = fs::symlink_metadata(path).with_context("lstat", Some(path))?;
             // safe to call create_dir() in existing dirs, it will return without touching them
             // TODO: this is TOCTOU case
             if metadata.file_type().is_dir() {
                 Ok(())
             } else {
                 Err(InitError::BadEntry {
-                    path: path.to_path_buf(),
+                    path: path.clone(),
                     entry: EntryType::from(metadata.file_type()),
                 })
             }
         }
-        Err(err) => Err(InitError::from_io_error(path, err)),
+        Err(err) => Err(InitError::Io(IoError::new("mkdir", Some(path), err))),
     }
 }
 
-fn resolve_lit_entry(path: &Path) -> io::Result<Option<PathBuf>> {
-    let path = match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Some(fs::canonicalize(path)?),
-        Ok(_) => Some(path.to_path_buf()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err),
-    };
-
-    Ok(path)
+// Note: we can't make a naive call fs::metadata(link), we first have to resolve it. If link
+// is a symlink, metadata() will follow it and return info based on the target BUT later when we
+// try to rename, fs::rename() does not follow symlinks, and we will rename the symlink itself not
+// the target path, so first we must call canonicalize() and then call metadata on the returned value.
+fn resolve_litfile_pointer(litfile_pointer: &OsPath) -> Result<Option<Cow<'_, OsPath>>, IoError> {
+    match fs::symlink_metadata(litfile_pointer) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let resolved = fs::canonicalize(litfile_pointer)
+                .with_context("realpath", Some(litfile_pointer))?;
+            Ok(Some(Cow::Owned(OsPath::new_unchecked(resolved))))
+        }
+        Ok(_) => Ok(Some(Cow::Borrowed(litfile_pointer))),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(IoError::new("lstat", Some(litfile_pointer), err)),
+    }
 }
 
-pub(crate) type Result<T> = result::Result<T, InitError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EntryType {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+impl fmt::Display for EntryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+            Self::Symlink => "symlink",
+            Self::Other => "other",
+        };
+        f.write_str(label)
+    }
+}
+
+impl From<FileType> for EntryType {
+    fn from(file_type: FileType) -> Self {
+        if file_type.is_file() {
+            Self::File
+        } else if file_type.is_dir() {
+            Self::Directory
+        } else if file_type.is_symlink() {
+            Self::Symlink
+        } else {
+            Self::Other
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(super) enum InitError {
-    CurrentDirUnavailable(io::Error),
-    Io {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Io(IoError),
     // TODO: should this be UnsupportedFileType
-    BadEntry {
-        path: PathBuf,
-        entry: EntryType,
-    },
-    LitFile {
-        path: PathBuf,
-        err: LitFileError,
-    },
+    BadEntry { path: OsPath, entry: EntryType },
+    Refs(RefError),
+    LitFile(LitFileError),
     Layout(LayoutError),
     MetadataDir(MetadataDirError),
-    Config {
-        path: PathBuf,
-        source: ConfigFileError,
-    },
+    Config(ConfigFileError),
+    OsPath(OsPathError),
     RepositoryFormat(RepositoryFormatError),
     UnknownRefStorage(RefStorageError),
     UnknownObjectFormat(ObjectFormatError),
@@ -689,27 +694,31 @@ pub(super) enum InitError {
     RefStorageMisMatch,
 }
 
-impl InitError {
-    fn from_io_error(path: &Path, err: io::Error) -> Self {
-        InitError::Io {
-            path: path.to_path_buf(),
-            source: err,
+impl Error for InitError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(source) => Some(source),
+            Self::Refs(source) => Some(source),
+            Self::LitFile(source) => Some(source),
+            Self::Layout(source) => Some(source),
+            Self::MetadataDir(source) => Some(source),
+            Self::Config(source) => Some(source),
+            Self::OsPath(source) => Some(source),
+            Self::RepositoryFormat(source) => Some(source),
+            Self::UnknownRefStorage(source) => Some(source),
+            Self::UnknownObjectFormat(source) => Some(source),
+            _ => None,
         }
     }
 }
 
-impl Error for InitError {}
-
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            InitError::CurrentDirUnavailable(err) => {
-                write!(f, "could not determine current directory: {err}")
+            Self::Io(_) => {
+                write!(f, "fs operation failed during initialization")
             }
-            InitError::Io { path, source } => {
-                write!(f, "{}: {}", path.display(), source)
-            }
-            InitError::BadEntry { path, entry } => {
+            Self::BadEntry { path, entry } => {
                 write!(
                     f,
                     "{} already exists and is not a {}",
@@ -717,24 +726,38 @@ impl fmt::Display for InitError {
                     entry
                 )
             }
-            InitError::LitFile { path, err } => {
-                write!(f, "{}: {}", path.display(), err)
+            Self::Refs(_) => write!(f, "could not initialize repository refs"),
+            Self::LitFile(_) => {
+                write!(f, "could not process repository pointer")
             }
-            InitError::MetadataDir(source) => write!(f, "{source}"),
-            InitError::Layout(source) => write!(f, "{source}"),
-            InitError::Config { path, source } => write!(f, "{}: {}", path.display(), source),
-            InitError::RepositoryFormat(source) => write!(f, "{source}"),
-            InitError::UnknownRefStorage(source) => write!(f, "{source}"),
-            InitError::UnknownObjectFormat(source) => write!(f, "{source}"),
-            InitError::HashMismatch => write!(
+            Self::Layout(_) => write!(f, "could not resolve repository layout"),
+            Self::MetadataDir(_) => write!(f, "could not prepare metadata directory"),
+            Self::Config(_) => write!(f, "could not configure repository"),
+            Self::OsPath(_) => write!(f, "bad fs path"),
+            Self::RepositoryFormat(_) => write!(f, "could not determine repository format"),
+            Self::UnknownRefStorage(_) => write!(f, "bad reference storage selection"),
+            Self::UnknownObjectFormat(_) => write!(f, "bad object format selection"),
+            Self::HashMismatch => write!(
                 f,
                 "attempted to reinitialize repository with different hash"
             ),
-            InitError::RefStorageMisMatch => write!(
+            Self::RefStorageMisMatch => write!(
                 f,
                 "attempted to reinitialize repository with different storage format"
             ),
         }
+    }
+}
+
+impl From<IoError> for InitError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<OsPathError> for InitError {
+    fn from(err: OsPathError) -> Self {
+        Self::OsPath(err)
     }
 }
 
@@ -744,9 +767,27 @@ impl From<LayoutError> for InitError {
     }
 }
 
+impl From<LitFileError> for InitError {
+    fn from(err: LitFileError) -> Self {
+        Self::LitFile(err)
+    }
+}
+
+impl From<RefError> for InitError {
+    fn from(err: RefError) -> Self {
+        Self::Refs(err)
+    }
+}
+
 impl From<MetadataDirError> for InitError {
     fn from(err: MetadataDirError) -> Self {
         Self::MetadataDir(err)
+    }
+}
+
+impl From<ConfigFileError> for InitError {
+    fn from(err: ConfigFileError) -> Self {
+        Self::Config(err)
     }
 }
 
@@ -765,40 +806,6 @@ impl From<ObjectFormatError> for InitError {
 impl From<RefStorageError> for InitError {
     fn from(err: RefStorageError) -> Self {
         Self::UnknownRefStorage(err)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum EntryType {
-    File,
-    Directory,
-    Symlink,
-    Other,
-}
-
-impl fmt::Display for EntryType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            EntryType::File => "file",
-            EntryType::Directory => "directory",
-            EntryType::Symlink => "symlink",
-            EntryType::Other => "other",
-        };
-        f.write_str(label)
-    }
-}
-
-impl From<FileType> for EntryType {
-    fn from(file_type: FileType) -> Self {
-        if file_type.is_file() {
-            Self::File
-        } else if file_type.is_dir() {
-            Self::Directory
-        } else if file_type.is_symlink() {
-            Self::Symlink
-        } else {
-            Self::Other
-        }
     }
 }
 

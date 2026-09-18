@@ -1,7 +1,7 @@
 use std::cmp::PartialEq;
 // TODO: if repo/mod.rs ends up being not too big we could move the logic there?
 //  check the visibility of what gets exposed and where
-use crate::repo::config::{ConfigFile, ConfigFileError, Value, VariableEntry};
+use crate::repo::config::{ConfigFile, ConfigFileErrorKind, Value, VariableEntry};
 use clap::{Args, ValueEnum};
 use memchr::memmem;
 use std::error::Error;
@@ -513,7 +513,7 @@ impl fmt::Display for RefStorageError {
 
 #[derive(Debug)]
 pub(crate) enum RepositoryFormatError {
-    Config(ConfigFileError),
+    Config(ConfigFileErrorKind),
     UnsupportedVersion(FormatVersionError),
     V1ExtensionInV0(Extension),
     // a value that Git does not recognize
@@ -583,8 +583,8 @@ impl fmt::Display for RepositoryFormatError {
     }
 }
 
-impl From<ConfigFileError> for RepositoryFormatError {
-    fn from(err: ConfigFileError) -> Self {
+impl From<ConfigFileErrorKind> for RepositoryFormatError {
+    fn from(err: ConfigFileErrorKind) -> Self {
         Self::Config(err)
     }
 }

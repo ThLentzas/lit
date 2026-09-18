@@ -1,4 +1,4 @@
-use crate::repo::config::{ConfigFile, ConfigFileError};
+use crate::repo::config::{ConfigFile, ConfigFileErrorKind};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::parse::ParseError;
@@ -250,11 +250,11 @@ impl Object {
 pub(crate) enum SignatureError {
     NotFound(&'static str),
     EnvNotUnicode { var: &'static str, value: OsString },
-    ConfigError(ConfigFileError),
+    ConfigError(ConfigFileErrorKind),
 }
 
-impl From<ConfigFileError> for SignatureError {
-    fn from(err: ConfigFileError) -> Self {
+impl From<ConfigFileErrorKind> for SignatureError {
+    fn from(err: ConfigFileErrorKind) -> Self {
         SignatureError::ConfigError(err)
     }
 }

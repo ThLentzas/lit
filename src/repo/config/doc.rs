@@ -1,17 +1,16 @@
 use crate::repo::config::parse::{Header, LineKind, LineParser, ParseError, Variable};
+use crate::repo::config::{Value, VariableEntry};
+use crate::repo::os::{self, IoError, IoErrorContext, OsPath};
 use core::fmt;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io::{BufRead, BufReader};
 use std::iter::{self, Chain, Once};
-use std::path::{Path, PathBuf};
 use std::slice::Iter;
 use std::vec::IntoIter;
-use crate::repo::config::VariableEntry;
-use super::Value;
 
 // As of now there are two times that we try to index into lines using a VariablePos. By construction
 // VariablePos is an index that points to a Variable in lines, but Variable is a kind of Line which
@@ -84,10 +83,9 @@ where
         self.rest.last().copied().unwrap_or(self.first())
     }
 
-    fn iter(&self) -> Chain<Once<&T>, Iter<'_, T>>{
+    fn iter(&self) -> Chain<Once<&T>, Iter<'_, T>> {
         self.into_iter()
     }
-
 }
 
 // If we wrote our own type then IntoIter would look like this:
@@ -350,7 +348,7 @@ impl ConfigKey {
     // up to the first dot, the rest is the subsection. If there is only one '.', it's always
     // section-name
     pub(super) fn from_name(name: &OsStr) -> Option<Self> {
-        let bytes = name.as_encoded_bytes();
+        let bytes = os::os_str_as_bytes(name);
         let pos = bytes.iter().rposition(|&b| b == b'.')?;
         let header = &bytes[..pos];
         let name = &bytes[pos + 1..];
@@ -525,7 +523,7 @@ impl ConfigDoc {
     pub(super) fn empty() -> Self {
         Self::default()
     }
-    
+
     // .lit/config is just a list of sections where each section has a list of variables
     // If we try to use this as our parsing rule we lose the trivia and our CST is no more lossless.
     // We have nowhere to store the trivia. Where does a blank between two variables go? A comment
@@ -535,7 +533,7 @@ impl ConfigDoc {
     //
     // This is a zero-copy approach. The name of a variable is a sub-slice of its line, which is a
     // sub-slice of the file.
-    pub(super) fn load(path: &Path) -> Result<Self, ConfigDocError> {
+    pub(super) fn load(path: &OsPath) -> Result<Self, ConfigDocError> {
         let mut buf = Vec::new();
         let lines = read_lines(&mut buf, path)?;
         let index = DocIndex::new(&buf, &lines);
@@ -660,10 +658,7 @@ impl ConfigDoc {
             Some(span) => Value::Bytes(interpret_value(self.lines[pos.0].slice(&self.buf, &span))),
         };
 
-        VariableEntry {
-            name,
-            value
-        }
+        VariableEntry { name, value }
     }
 
     pub(super) fn section_blocks(&self, section: &SectionKey) -> Option<&NonEmpty<SectionBlock>> {
@@ -705,11 +700,8 @@ impl ConfigDoc {
     }
 }
 
-fn read_lines(buf: &mut Vec<u8>, path: &Path) -> Result<Vec<Line>, ConfigDocError> {
-    let file = File::open(path).map_err(|err| ConfigDocError::Io {
-        path: path.to_path_buf(),
-        source: err,
-    })?;
+fn read_lines(buf: &mut Vec<u8>, path: &OsPath) -> Result<Vec<Line>, ConfigDocError> {
+    let file = File::open(path).with_context("open", Some(path))?;
     let mut lines = Vec::new();
     let mut reader = BufReader::new(&file);
     let mut physical_lines = 0;
@@ -718,10 +710,7 @@ fn read_lines(buf: &mut Vec<u8>, path: &Path) -> Result<Vec<Line>, ConfigDocErro
         let start = buf.len();
         let n = reader
             .read_until(b'\n', buf)
-            .map_err(|err| ConfigDocError::Io {
-                path: path.to_path_buf(),
-                source: err,
-            })?;
+            .with_context("read", Some(path))?;
         if n == 0 {
             // EOF
             break;
@@ -738,10 +727,7 @@ fn read_lines(buf: &mut Vec<u8>, path: &Path) -> Result<Vec<Line>, ConfigDocErro
             while ends_with_continuation(buf) {
                 if reader
                     .read_until(b'\n', buf)
-                    .map_err(|err| ConfigDocError::Io {
-                        path: path.to_path_buf(),
-                        source: err,
-                    })?
+                    .with_context("read", Some(path))?
                     == 0
                 {
                     break;
@@ -883,7 +869,8 @@ fn interpret_value(value: &[u8]) -> Cow<'_, [u8]> {
 //
 // !!! The invariant that must hold true at all times: interpret_value(encode_value(value)) == value
 // It means if we take any logical value, serialize into config syntax and then paser/decode it again
-// we must get back the exact same logical bytes(the bytes the user/program provided). TODO: test this
+// we must get back the exact same logical bytes(the bytes the user/program provided).
+// TODO: test this
 fn encode_value(value: &[u8]) -> Cow<'_, [u8]> {
     let needs_quotes = matches!(value.first(), Some(b' ' | b'\t'))
         || matches!(value.last(), Some(b' ' | b'\t'))
@@ -920,21 +907,34 @@ fn encode_value(value: &[u8]) -> Cow<'_, [u8]> {
 
 #[derive(Debug)]
 pub(crate) enum ConfigDocError {
-    Io { path: PathBuf, source: io::Error },
+    Io(IoError),
     InvalidFormat { line: usize, source: ParseError },
 }
 
-impl Error for ConfigDocError {}
+impl Error for ConfigDocError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            ConfigDocError::Io(source) => Some(source),
+            ConfigDocError::InvalidFormat { source, .. } => Some(source),
+        }
+    }
+}
 
 impl fmt::Display for ConfigDocError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ConfigDocError::Io { path, source } => {
-                write!(f, "{}: {}", path.display(), source)
+            ConfigDocError::Io(_) => {
+                write!(f, "could not read config file")
             }
-            ConfigDocError::InvalidFormat { line, source } => {
-                write!(f, "bad config line {}: {}", line, source)
+            ConfigDocError::InvalidFormat { line, .. } => {
+                write!(f, "bad config line {line}")
             }
         }
+    }
+}
+
+impl From<IoError> for ConfigDocError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
     }
 }

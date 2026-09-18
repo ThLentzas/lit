@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
+use crate::repo::os;
 use crate::repo::os::OsPath;
 
 const DEFAULT_BRANCH_NAME: &[u8] = b"master";
@@ -129,13 +130,14 @@ impl Refs {
         }
     }
 
-    pub(crate) fn new_unborn_branch(&self, name: Option<&[u8]>) -> Result<(), RefError> {
+    pub(crate) fn new_unborn_branch(&self, name: Option<&OsStr>) -> Result<(), RefError> {
         // can't use map_or() because check_branch_name() can fail
         // the None branch would be an infallible default but Some branch is fallible
         // we could write let name = name.unwrap_or(DEFAULT_BRANCH_NAME) but then we could call
         // check_branch_name on default
         let name = match name {
             Some(name) => {
+                let name = os::os_str_as_bytes(name);
                 check_branch_name(name)?;
                 name
             }
@@ -226,18 +228,18 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
     }
 
     let mut start = 0;
-    for component in bytes.split(|&b| b == b'/') {
+    for component in name.split(|&b| b == b'/') {
         let end = start + component.len();
         // consecutive slashes
         if component.is_empty() {
             return Err(BranchNameError {
-                name: bytes.to_vec(),
+                name: name.to_vec(),
                 kind: BranchNameErrorKind::EmptyComponent { pos: start },
             });
         }
         if component.ends_with(b".lock") {
             return Err(BranchNameError {
-                name: bytes.to_vec(),
+                name: name.to_vec(),
                 kind: BranchNameErrorKind::EndsWithDotLock {
                     component: start..end,
                 },
@@ -245,7 +247,7 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
         }
         if component.starts_with(b".") {
             return Err(BranchNameError {
-                name: bytes.to_vec(),
+                name: name.to_vec(),
                 kind: BranchNameErrorKind::StartsWithDot {
                     component: start..end,
                 },
@@ -253,7 +255,7 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
         }
         if component.ends_with(b".") {
             return Err(BranchNameError {
-                name: bytes.to_vec(),
+                name: name.to_vec(),
                 kind: BranchNameErrorKind::EndsWithDot {
                     component: start..end,
                 },
@@ -261,7 +263,7 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
         }
         if component.starts_with(b"/") {
             return Err(BranchNameError {
-                name: bytes.to_vec(),
+                name: name.to_vec(),
                 kind: BranchNameErrorKind::StartsWithForwardSlash {
                     component: start..end,
                 },
@@ -269,7 +271,7 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
         }
         if component.ends_with(b"/") {
             return Err(BranchNameError {
-                name: bytes.to_vec(),
+                name: name.to_vec(),
                 kind: BranchNameErrorKind::EndsWithForwardSlash {
                     component: start..end,
                 },
@@ -281,7 +283,7 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
             if byte.is_ascii_control()
                 || matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
             {
-                let name = bytes.to_vec();
+                let name = name.to_vec();
                 let char = name[pos];
                 return Err(BranchNameError {
                     name,
@@ -291,13 +293,13 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
             match byte {
                 b'@' if component.len() == 1 => {
                     return Err(BranchNameError {
-                        name: bytes.to_vec(),
+                        name: name.to_vec(),
                         kind: BranchNameErrorKind::SingleAt { pos },
                     });
                 }
                 b'@' if let Some(b'{') = component.get(i + 1) => {
                     return Err(BranchNameError {
-                        name: bytes.to_vec(),
+                        name: name.to_vec(),
                         kind: BranchNameErrorKind::AtBrace { pos },
                     });
                 }
@@ -306,7 +308,7 @@ fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
             // cannot have two consecutive dots anywhere
             if byte == b'.' && component.get(i + 1) == Some(&b'.') {
                 return Err(BranchNameError {
-                    name: bytes.to_vec(),
+                    name: name.to_vec(),
                     kind: BranchNameErrorKind::ConsecutiveDots { pos },
                 });
             }

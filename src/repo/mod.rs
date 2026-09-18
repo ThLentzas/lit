@@ -13,11 +13,13 @@ pub(super) mod report;
 pub(super) mod timestamp;
 pub(super) mod tree;
 pub(super) mod workspace;
+mod diagnostic;
 
-use crate::repo::config::{ConfigFile, ConfigFileError};
+use crate::repo::config::{ConfigFile, ConfigFileErrorKind};
 use crate::repo::format::{RepositoryFormat, RepositoryFormatError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
+use crate::repo::os::{OsPath, OsPathError};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs, io};
@@ -28,26 +30,22 @@ enum MetadataPlacement {
     // Ordinary `<worktree>/.lit` dir
     Embedded,
     // `<worktree>/.lit` is a pointer file to metadata
-    Separate { link: PathBuf },
+    Separate { link: OsPath },
 }
 
 pub(super) struct Layout {
     // directory containing the repository metadata (HEAD, config, objects, ...)
-    metadata: PathBuf,
+    metadata: OsPath,
     // root of the working tree for non-bare
     // None for bare
-    worktree: Option<PathBuf>,
+    worktree: Option<OsPath>,
     // describes how the metadata is connected to the worktree
     placement: MetadataPlacement,
 }
 
 impl Layout {
-    // we don't need to do any conversion here or any path validation, we follow the same logic as
-    // we did before we will make the fs call and handle the error for a bad path
-    //
     // There are 4 factors that determine the location of .lit dir when initializing a repo.
     // --bare, --separate_lit_dir, path and the LIT_DIR/LIT_WORK_TREE env var.
-    // TODO: We need to set LIT_DIR after resolving the path
     //
     //  Resolves the metadata and worktree locations without touching the fs
     //
@@ -72,28 +70,25 @@ impl Layout {
         bare: bool,
         separate_lit_dir: Option<&Path>,
     ) -> Result<Self, LayoutError> {
-        // TODO: convert the paths if present to OsPath
         // highest precedence, reject early
-        if path.is_some_and(|p| p.as_os_str().is_empty()) {
-            return Err(LayoutError::EmptyPath("<directory>"));
-        }
+        // if we call map(OsPath::new) we get Option<Result<T, E>> but what we want is Result<Option<T>, E>
+        // that is what transpose does
+        let path = path.map(OsPath::new).transpose()?;
 
         let cwd = env::current_dir().map_err(LayoutError::CurrentDirUnavailable)?;
-        let root = path.map_or(cwd.clone(), |path| cwd.join(path));
+        let cwd = OsPath::new_unchecked(cwd);
+        let root = path.as_ref().map_or(cwd.clone(), |path| cwd.join_unchecked(path));
 
         if let Some(dir_path) = separate_lit_dir {
-            if dir_path.as_os_str().is_empty() {
-                return Err(LayoutError::EmptyPath("--separate-lit-dir"));
-            }
             // TODO: should this be a notification to the user that LIT_DIR is actually ignored
             //  because the flag has higher precedence. This is a conflict because both try to
             //  name the metadata dir
             return Ok(Self {
-                metadata: cwd.join(dir_path),
+                metadata: cwd.join(dir_path)?,
                 // the parent identifies the worktree even though the metadata is elsewhere
                 worktree: Some(root.clone()),
                 placement: MetadataPlacement::Separate {
-                    link: root.join(".lit"),
+                    link: root.join_unchecked(".lit"),
                 },
             });
         }
@@ -109,26 +104,19 @@ impl Layout {
             } else {
                 // lit init <path>
                 Ok(Self {
-                    metadata: root.join(".lit"), // <worktree>.lit
+                    metadata: root.join_unchecked(".lit"), // <worktree>.lit
                     worktree: Some(root),
                     placement: MetadataPlacement::Embedded,
                 })
             };
         }
 
-        let env_dir = env::var_os("LIT_DIR");
-        if let Some(env_dir) = env_dir {
-            if env_dir.is_empty() {
-                return Err(LayoutError::EmptyPath("LIT_DIR"));
-            }
-
-            let dir = cwd.join(env_dir);
+        if let Some(env_dir) = env::var_os("LIT_DIR") {
+            let env_dir = cwd.join(env_dir)?;
             // LIT_WORK_TREE makes sense only in conjunction with LIT_DIR without --bare. In any
             // other case it is ignored.
             let worktree = env::var_os("LIT_WORK_TREE");
-            if worktree.as_ref().is_some_and(|tree| tree.is_empty()) {
-                return Err(LayoutError::EmptyPath("LIT_WORK_TREE"));
-            }
+            let worktree = worktree.map(OsPath::new).transpose()?;
             // bare repos have no worktree
             if bare && worktree.is_some() {
                 return Err(LayoutError::LitWorkTreeWithBare);
@@ -136,15 +124,16 @@ impl Layout {
 
             return if bare {
                 Ok(Self {
-                    metadata: dir,
+                    metadata: env_dir,
                     worktree: None,
                     placement: MetadataPlacement::Direct,
                 })
             } else {
                 // if no WORK_TREE found we fall back to cwd
-                let worktree = worktree.map_or(cwd.clone(), |path| cwd.join(path));
+                let worktree =
+                    worktree.map_or(cwd.clone(), |worktree| cwd.join_unchecked(worktree));
                 Ok(Self {
-                    metadata: dir,
+                    metadata: env_dir,
                     worktree: Some(worktree),
                     placement: MetadataPlacement::Direct,
                 })
@@ -162,7 +151,7 @@ impl Layout {
             })
         } else {
             Ok(Self {
-                metadata: cwd.join(".lit"),
+                metadata: cwd.join_unchecked(".lit"),
                 worktree: Some(cwd),
                 placement: MetadataPlacement::Embedded,
             })
@@ -170,16 +159,16 @@ impl Layout {
     }
 
     // the worktree root for non-bare or the metadata directory for bare
-    pub(super) fn root(&self) -> &Path {
-        self.worktree.as_deref().unwrap_or(&self.metadata)
+    pub(super) fn root(&self) -> &OsPath {
+        self.worktree.as_ref().unwrap_or(&self.metadata)
     }
 
-    pub(super) fn metadata(&self) -> &Path {
+    pub(super) fn metadata(&self) -> &OsPath {
         &self.metadata
     }
-    
-    pub(super) fn separate_link(&self) -> Option<&Path> {
-        if let MetadataPlacement::Separate { link} = &self.placement {
+
+    pub(super) fn separate_link(&self) -> Option<&OsPath> {
+        if let MetadataPlacement::Separate { link } = &self.placement {
             return Some(link);
         }
         None
@@ -204,7 +193,7 @@ impl Layout {
         // there is also the case where LIT_DIR is an absolute path, LIT_WORK_TREE is not set and worktree
         // ends up being the cwd, this is needs to be resolved in the same way
         match self.placement {
-            MetadataPlacement::Direct => self.metadata != worktree.join(".lit"),
+            MetadataPlacement::Direct => self.metadata != worktree.join_unchecked(".lit"),
             // <worktree>/.lit is metadata, parent is worktree
             MetadataPlacement::Embedded => false,
             // pointer file, its parent identifies the worktree even the metadata is elsewhere
@@ -228,24 +217,26 @@ impl Layout {
 //  - has a valid repository format
 //
 // This is the structure a valid Lit repo guarantees
-pub(super) fn validate_metadata_dir(path: &Path) -> Result<(), MetadataDirError> {
+pub(super) fn validate_metadata_dir(path: &OsPath) -> Result<(), MetadataDirError> {
     require_accessible_dir(path)?;
-    validate_head(&path.join("HEAD"))?;
+    validate_head(&path.join_unchecked("HEAD"))?;
     // TODO: we need to look at the precedence here
     let objects_dir = match env::var_os("LIT_OBJECT_DIRECTORY") {
-        None => path.join("objects"),
-        // TODO: do we need path resolution? Do we keep as is or try to convert it to absolute based
-        //  on the cwd? Test it.
-        //  needs to be resolved with the cwd
-        Some(dir) => PathBuf::from(dir),
+        None => path.join_unchecked("objects"),
+        Some(dir) => {
+            let cwd = env::current_dir().map_err(MetadataDirError::CurrentDirUnavailable)?;
+            let cwd = OsPath::new_unchecked(cwd);
+            cwd.join(dir)?
+        },
     };
+
     require_accessible_dir(&objects_dir)?;
-    require_accessible_dir(&path.join("refs"))?;
+    require_accessible_dir(&path.join_unchecked("refs"))?;
     validate_format_version(path)
 }
 
-fn validate_format_version(path: &Path) -> Result<(), MetadataDirError> {
-    let cfg_path = path.join("config");
+fn validate_format_version(path: &OsPath) -> Result<(), MetadataDirError> {
+    let cfg_path = path.join_unchecked("config");
 
     match ConfigFile::new(&cfg_path) {
         Ok(cfg) => RepositoryFormat::from_config(&cfg)?
@@ -256,7 +247,7 @@ fn validate_format_version(path: &Path) -> Result<(), MetadataDirError> {
                 .io_error_kind()
                 .is_some_and(|kind| kind == io::ErrorKind::NotFound) =>
         {
-            Err(MetadataDirError::MissingConfigFile(path.to_path_buf()))
+            Err(MetadataDirError::MissingConfigFile(path.clone()))
         }
         Err(err) => Err(MetadataDirError::Config {
             path: cfg_path,
@@ -265,11 +256,11 @@ fn validate_format_version(path: &Path) -> Result<(), MetadataDirError> {
     }
 }
 
-fn require_accessible_dir(path: &Path) -> Result<(), MetadataDirError> {
+fn require_accessible_dir(path: &OsPath) -> Result<(), MetadataDirError> {
     match fs::read_dir(path) {
         Ok(_) => Ok(()),
         Err(err) => Err(MetadataDirError::Io {
-            path: path.to_path_buf(),
+            path: path.clone(),
             op: "opendir",
             source: err,
         }),
@@ -277,9 +268,9 @@ fn require_accessible_dir(path: &Path) -> Result<(), MetadataDirError> {
 }
 
 // TODO: when we add ref support, this need to check for ref: also
-fn validate_head(path: &Path) -> Result<(), MetadataDirError> {
+fn validate_head(path: &OsPath) -> Result<(), MetadataDirError> {
     let bytes = fs::read(path).map_err(|err| MetadataDirError::Io {
-        path: path.to_path_buf(),
+        path: path.clone(),
         op: "read",
         source: err,
     })?;
@@ -293,7 +284,7 @@ fn validate_head(path: &Path) -> Result<(), MetadataDirError> {
     match Oid::from_hex_bytes(bytes) {
         Ok(_) => Ok(()),
         Err(err) => Err(MetadataDirError::HeadBadOid {
-            path: path.to_path_buf(),
+            path: path.clone(),
             source: err,
         }),
     }
@@ -311,10 +302,7 @@ pub(super) struct Repository {
 
 impl Repository {
     pub(super) fn new(layout: Layout, format: RepositoryFormat) -> Self {
-        Self {
-            layout,
-            format,
-        }
+        Self { layout, format }
     }
     // TODO: before any decision review: https://git-scm.com/docs/gitrepository-layout
     // TODO: discovery needs to first check LIT_DIR, https://git-scm.com/book/en/v2/Git-Internals-Environment-Variables
@@ -363,21 +351,23 @@ impl Repository {
 pub(super) enum MetadataDirError {
     Io {
         op: &'static str,
-        path: PathBuf,
+        path: OsPath,
         source: io::Error,
     },
     HeadBadOid {
-        path: PathBuf,
+        path: OsPath,
         source: OidError,
     },
     Format(RepositoryFormatError),
     Config {
-        path: PathBuf,
-        source: ConfigFileError,
+        path: OsPath,
+        source: ConfigFileErrorKind,
     },
     // path to config
-    MissingFormatVersion(PathBuf),
-    MissingConfigFile(PathBuf),
+    MissingFormatVersion(OsPath),
+    MissingConfigFile(OsPath),
+    CurrentDirUnavailable(io::Error),
+    OsPath(OsPathError),
 }
 
 impl Error for MetadataDirError {}
@@ -405,6 +395,12 @@ impl fmt::Display for MetadataDirError {
             MetadataDirError::MissingConfigFile(path) => {
                 write!(f, "missing config file in {}", path.display())
             }
+            MetadataDirError::CurrentDirUnavailable(err) => {
+                write!(f, "could not determine current directory: {err}")
+            }
+            MetadataDirError::OsPath(source) => {
+                write!(f, "{source}")
+            }
         }
     }
 }
@@ -412,6 +408,12 @@ impl fmt::Display for MetadataDirError {
 impl From<RepositoryFormatError> for MetadataDirError {
     fn from(err: RepositoryFormatError) -> Self {
         Self::Format(err)
+    }
+}
+
+impl From<OsPathError> for MetadataDirError {
+    fn from(err: OsPathError) -> Self {
+        Self::OsPath(err)
     }
 }
 
@@ -447,9 +449,7 @@ impl fmt::Display for DiscoverError {
 #[derive(Debug)]
 pub(super) enum LayoutError {
     CurrentDirUnavailable(io::Error),
-    // initially was an enum with 4 variants: SeparateLitDir, PositionalArg, LitDir, LitWorkTree
-    // but we only constructed it, never had to match or any other action
-    EmptyPath(&'static str),
+    OsPath(OsPathError),
     LitWorkTreeWithBare,
 }
 
@@ -461,12 +461,18 @@ impl fmt::Display for LayoutError {
             LayoutError::CurrentDirUnavailable(err) => {
                 write!(f, "could not determine current directory: {err}")
             }
-            LayoutError::EmptyPath(source) => {
-                write!(f, "the empty string is not valid path: {}", source)
+            LayoutError::OsPath(source) => {
+                write!(f, "{source}")
             }
             LayoutError::LitWorkTreeWithBare => {
                 write!(f, "LIT_WORK_TREE not allowed with --bare")
             }
         }
+    }
+}
+
+impl From<OsPathError> for LayoutError {
+    fn from(err: OsPathError) -> Self {
+        Self::OsPath(err)
     }
 }

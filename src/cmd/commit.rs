@@ -1,4 +1,4 @@
-use crate::repo::config::{ConfigFile, ConfigFileError};
+use crate::repo::config::{ConfigFile, ConfigFileErrorKind};
 use crate::repo::db::{self, Database, DbError};
 use crate::repo::index::{Index, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
@@ -112,7 +112,7 @@ pub(super) enum CommitError {
     Lockfile(LockfileError),
     RefError(RefError),
     Signature(SignatureError),
-    Config(ConfigFileError),
+    Config(ConfigFileErrorKind),
 }
 
 impl From<DiscoverError> for CommitError {
@@ -157,8 +157,8 @@ impl From<SignatureError> for CommitError {
     }
 }
 
-impl From<ConfigFileError> for CommitError {
-    fn from(err: ConfigFileError) -> Self {
+impl From<ConfigFileErrorKind> for CommitError {
+    fn from(err: ConfigFileErrorKind) -> Self {
         CommitError::Config(err)
     }
 }

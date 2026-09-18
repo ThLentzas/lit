@@ -1,9 +1,9 @@
 use crate::repo::config::doc::{ConfigDoc, ConfigDocError, ConfigKey, SectionKey};
+use crate::repo::os::{self, OsPath};
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
-use std::{fmt, io};
+use std::fmt;
 
 mod doc;
 pub(super) mod parse;
@@ -74,6 +74,7 @@ impl<'a> Value<'a> {
 // TODO: should the name/values just be anything that impl AsRef<OsStr> instead of the caller having
 //  to invoke as_ref() for every argument?
 pub(crate) struct ConfigFile {
+    path: OsPath,
     doc: ConfigDoc,
 }
 
@@ -88,16 +89,25 @@ pub(crate) struct ConfigFile {
 //          you try to unset/set an option for which multiple lines match (ret=5), or
 //          you try to use an invalid regexp (ret=6).
 impl ConfigFile {
-    // creates an in-memory empty ConfigFile, the actual file might not exist
-    pub(crate) fn empty() -> Self {
+    // creates an in-memory empty ConfigFile, we associate that file with a path
+    pub(crate) fn empty(path: OsPath) -> Self {
         Self {
-            doc: ConfigDoc::empty()
+            path,
+            doc: ConfigDoc::empty(),
         }
     }
-    pub(crate) fn new(path: &Path) -> Result<Self, ConfigFileError> {
-        // TODO: This should take the root and call join for local
-        let doc = ConfigDoc::load(path)?;
-        Ok(Self { doc })
+
+    pub(crate) fn new(path: OsPath) -> Result<Self, ConfigFileError> {
+        let doc = match ConfigDoc::load(&path) {
+            Ok(doc) => doc,
+            Err(err) => {
+                return Err(ConfigFileError {
+                    path,
+                    kind: ConfigFileErrorKind::Doc(err),
+                });
+            }
+        };
+        Ok(Self { path, doc })
     }
 
     // The api for retrieving values is designed as follows:
@@ -115,11 +125,19 @@ impl ConfigFile {
     //  after is dropped during printing. All the bytes are printed as is, no octal, no escaping,
     //  no quoting
     pub(crate) fn get(&self, name: &OsStr) -> Result<ConfigEntry<'_>, ConfigFileError> {
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+        let key = ConfigKey::from_name(name).ok_or_else(|| ConfigFileError {
+            path: self.path.clone(),
+            kind: ConfigFileErrorKind::BadKey(name.to_os_string()),
+        })?;
         let pos = match self.doc.key_last_pos(&key) {
             Some(p) => p,
             // TODO: ExitCode error 1
-            None => return Err(ConfigFileError::NotFound(name.to_os_string())),
+            None => {
+                return Err(ConfigFileError {
+                    path: self.path.clone(),
+                    kind: ConfigFileErrorKind::NotFound(name.to_os_string()),
+                });
+            }
         };
 
         // when Value is Cow::Borrowed the lifetime is tied to self, in this case doc, and doc lives
@@ -132,11 +150,17 @@ impl ConfigFile {
 
     // multivalue key, not all variables of a section
     pub(crate) fn get_all(&self, name: &OsStr) -> Result<Vec<Value<'_>>, ConfigFileError> {
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+        let key = ConfigKey::from_name(name).ok_or_else(|| ConfigFileError {
+            path: self.path.clone(),
+            kind: ConfigFileErrorKind::BadKey(name.to_os_string()),
+        })?;
         let positions = self
             .doc
             .key_positions(&key)
-            .ok_or_else(|| ConfigFileError::NotFound(name.to_os_string()))?;
+            .ok_or_else(|| ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::NotFound(name.to_os_string()),
+            })?;
         let mut values = Vec::with_capacity(positions.len());
 
         for &position in positions {
@@ -146,43 +170,50 @@ impl ConfigFile {
         Ok(values)
     }
 
-    pub(crate) fn get_str(&self, name: &OsStr) -> Result<Cow<'_, str>, ConfigFileError> {
+    pub(crate) fn get_str(&self, name: &OsStr) -> Result<String, ConfigFileError> {
         // TODO: verify against Git if not found is an err,
         let entry = self.get(name)?;
         match entry.value {
             // valueless boolean is type mismatch
-            Value::ImplicitlyTrue => Err(ConfigFileError::MissingValue(name.to_os_string())),
-            Value::Bytes(Cow::Borrowed(bytes)) => str::from_utf8(bytes)
-                .map(|s| Cow::Borrowed(s))
-                .map_err(|_| ConfigFileError::IncompatibleType {
+            Value::ImplicitlyTrue => Err(ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::IncompatibleType {
                     key: name.to_os_string(),
-                    value: bytes.to_vec(),
-                    actual_type: "string",
-                }),
-            // we can't call str::from_utf8 in the owned case because we will have a reference to
-            // a local variable(bytes) that gets dropped when get_str() returns and also this is not
-            // what we want for the Owned case of Cow.
-            Value::Bytes(Cow::Owned(bytes)) => String::from_utf8(bytes)
-                .map(|s| Cow::Owned(s))
-                .map_err(|err| ConfigFileError::IncompatibleType {
-                    key: name.to_os_string(),
-                    // returns back the bytes that attempted to parse and failed so we can avoid
-                    // the clone call
-                    value: err.into_bytes(),
-                    actual_type: "string",
-                }),
+                    value: None,
+                    expected: "string",
+                },
+            }),
+            Value::Bytes(bytes) => {
+                String::from_utf8(bytes.to_vec()).map_err(|err| {
+                    ConfigFileError {
+                        path: self.path.clone(),
+                        kind: ConfigFileErrorKind::IncompatibleType {
+                            key: name.to_os_string(),
+                            // returns back the bytes that it attempted to parse and failed so we can avoid
+                            // the clone call
+                            value: Some(err.into_bytes()),
+                            expected: "string",
+                        },
+                    }
+                })
+            }
         }
     }
 
     // TODO: should we consider negative values?
-    pub fn get_int(&self, name: &OsStr) -> Result<Option<u64>, ConfigFileError> {
-        let entry = match self.get(name) {
-            Ok(value) => value,
-            Err(_) => return Ok(None),
-        };
+    pub fn get_int(&self, name: &OsStr) -> Result<u64, ConfigFileError> {
+        let entry = self.get(name)?;
 
         match entry.value {
-            Value::ImplicitlyTrue => Err(ConfigFileError::MissingValue(name.to_os_string())),
+            // In C, this probably returns 1
+            Value::ImplicitlyTrue => Err(ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::IncompatibleType {
+                    key: name.to_os_string(),
+                    value: None,
+                    expected: "numeric",
+                },
+            }),
             Value::Bytes(bytes) => {
                 let mut val = 0u64;
                 // atoi
@@ -197,10 +228,13 @@ impl ConfigFile {
                     if digit > 9 {
                         // to_vec() allocates and copies in both cases
                         // into_owned() moves the Vec
-                        return Err(ConfigFileError::IncompatibleType {
-                            key: name.to_os_string(),
-                            value: bytes.into_owned(),
-                            actual_type: "numeric",
+                        return Err(ConfigFileError {
+                            path: self.path.clone(),
+                            kind: ConfigFileErrorKind::IncompatibleType {
+                                key: name.to_os_string(),
+                                value: None,
+                                expected: "numeric",
+                            },
                         });
                     }
 
@@ -210,20 +244,23 @@ impl ConfigFile {
                         .checked_mul(10)
                         .and_then(|n| n.checked_add(digit as u64))
                     else {
-                        return Err(ConfigFileError::IncompatibleType {
-                            key: name.to_os_string(),
-                            value: bytes.into_owned(),
-                            actual_type: "numeric",
+                        return Err(ConfigFileError {
+                            path: self.path.clone(),
+                            kind: ConfigFileErrorKind::IncompatibleType {
+                                key: name.to_os_string(),
+                                value: None,
+                                expected: "numeric",
+                            },
                         });
                     };
                     val = next
                 }
-                Ok(Some(val))
+                Ok(val)
             }
         }
     }
 
-    // Git reports something like: bad boolean config value 'foo' for 'core.logallrefupdates'
+    // Git reports something like: <path> bad boolean config value 'foo' for 'core.logallrefupdates'
     pub(crate) fn get_bool(&self, name: &OsStr) -> Result<bool, ConfigFileError> {
         // TODO: verify against Git if not found is an err,
         let entry = self.get(name)?;
@@ -232,18 +269,43 @@ impl ConfigFile {
             Value::Bytes(bytes) => match bytes.as_ref() {
                 b"true" => Ok(true),
                 b"false" => Ok(false),
-                bytes => Err(ConfigFileError::IncompatibleType {
-                    key: name.to_os_string(),
-                    value: bytes.to_vec(),
-                    actual_type: "bool",
+                bytes => Err(ConfigFileError {
+                    path: self.path.clone(),
+                    kind: ConfigFileErrorKind::IncompatibleType {
+                        key: name.to_os_string(),
+                        value: Some(bytes.to_vec()),
+                        expected: "bool",
+                    },
                 }),
             },
         }
     }
 
+    // Result<&[u8], ..> won't work because we call bytes.as_ref() and we would return a reference to
+    // the owned variant of Cow which is lives in entry that gets dropped when get_bytes() return
+    // Result<Cow<'_, [u8], ..> moves out Cow from entry(this confused me at the start) it does not
+    // borrow anything, the caller gets ownership and can call as_ref()
+    pub(crate) fn get_bytes(&self, name: &OsStr) -> Result<Cow<'_, [u8]>, ConfigFileError> {
+        let entry = self.get(name)?;
+        match entry.value {
+            Value::ImplicitlyTrue => Err(ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::IncompatibleType {
+                    key: name.to_os_string(),
+                    value: None,
+                    expected: "any byte",
+                },
+            }),
+            Value::Bytes(bytes) => Ok(bytes),
+        }
+    }
+
     pub(crate) fn set(&mut self, name: &OsStr, value: &OsStr) -> Result<(), ConfigFileError> {
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
-        let value = value.as_encoded_bytes();
+        let key = ConfigKey::from_name(name).ok_or_else(|| ConfigFileError {
+            path: self.path.clone(),
+            kind: ConfigFileErrorKind::BadKey(name.to_os_string()),
+        })?;
+        let value = os::os_str_as_bytes(value);
 
         match self.doc.key_positions(&key) {
             Some(positions) if positions.single() => {
@@ -253,7 +315,12 @@ impl ConfigFile {
             // it does not matter if they are on the same block or separate
             // two [core] blocks each with editor or 1 [core] block with multiple editor keys, both
             // will be rejected with a message:  cannot overwrite multiple values with a single value
-            Some(_) => return Err(ConfigFileError::MultipleValues(name.to_os_string())),
+            Some(_) => {
+                return Err(ConfigFileError {
+                    path: self.path.clone(),
+                    kind: ConfigFileErrorKind::MultipleValues(name.to_os_string()),
+                });
+            }
             None => {
                 self.doc.insert_variable(&key, &value);
             }
@@ -266,8 +333,11 @@ impl ConfigFile {
     //  - one occurrence: replace it,
     //  - multiple: replace them all with the new value
     pub(crate) fn set_all(&mut self, name: &OsStr, value: &OsStr) -> Result<(), ConfigFileError> {
-        let value = value.as_encoded_bytes();
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+        let value = os::os_str_as_bytes(value);
+        let key = ConfigKey::from_name(name).ok_or_else(|| ConfigFileError {
+            path: self.path.clone(),
+            kind: ConfigFileErrorKind::BadKey(name.to_os_string()),
+        })?;
 
         // The code below won't work because key_positions() returns &NonEmpty<VariablePos> which ties
         // the lifetime of the return ref to self, in this case we have an active immutable borrow
@@ -304,13 +374,14 @@ impl ConfigFile {
         Ok(())
     }
 
-    pub(crate) fn unset(&mut self, name: &OsStr) -> Result<(), ConfigFileError> {
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+    pub(crate) fn unset(&mut self, name: &OsStr) -> Result<(), ConfigFileErrorKind> {
+        let key =
+            ConfigKey::from_name(name).ok_or(ConfigFileErrorKind::BadKey(name.to_os_string()))?;
         match self.doc.key_positions(&key) {
             Some(positions) if positions.single() => {
                 self.doc.remove_line(positions.first());
             }
-            Some(_) => return Err(ConfigFileError::MultipleValues(name.to_os_string())),
+            Some(_) => return Err(ConfigFileErrorKind::MultipleValues(name.to_os_string())),
             None => {}
         }
 
@@ -318,7 +389,10 @@ impl ConfigFile {
     }
 
     pub(crate) fn unset_all(&mut self, name: &OsStr) -> Result<(), ConfigFileError> {
-        let key = ConfigKey::from_name(name).ok_or(ConfigFileError::BadKey(name.to_os_string()))?;
+        let key = ConfigKey::from_name(name).ok_or_else(|| ConfigFileError {
+            path: self.path.clone(),
+            kind: ConfigFileErrorKind::BadKey(name.to_os_string()),
+        })?;
         let positions = self
             .doc
             .key_positions(&key)
@@ -334,8 +408,11 @@ impl ConfigFile {
 
     // removes all occurrences of the section
     pub(crate) fn remove_section(&mut self, section: &OsStr) -> Result<(), ConfigFileError> {
-        let section = SectionKey::new(section.as_encoded_bytes())
-            .ok_or(ConfigFileError::BadSectionName(section.to_os_string()))?;
+        let section =
+            SectionKey::new(os::os_str_as_bytes(section)).ok_or_else(|| ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::BadSectionName(section.to_os_string()),
+            })?;
         Ok(self.doc.remove_section(&section))
     }
 
@@ -343,8 +420,11 @@ impl ConfigFile {
         &self,
         section: &OsStr,
     ) -> Result<Option<Vec<VariableEntry<'_>>>, ConfigFileError> {
-        let section = SectionKey::new(section.as_encoded_bytes())
-            .ok_or(ConfigFileError::BadSectionName(section.to_os_string()))?;
+        let section =
+            SectionKey::new(os::os_str_as_bytes(section)).ok_or_else(|| ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::BadSectionName(section.to_os_string()),
+            })?;
         Ok(self.doc.section_entries(&section))
     }
 
@@ -352,90 +432,93 @@ impl ConfigFile {
         self.doc.serialize()
     }
 }
-
-// TODO: should config file error include the path itself where things went wrong because the caller
-//  might not know from where exactly we tried to read?
 #[derive(Debug)]
-pub(crate) enum ConfigFileError {
+pub(crate) struct ConfigFileError {
+    path: OsPath,
+    kind: ConfigFileErrorKind,
+}
+
+impl ConfigFileError {
+    pub(crate) fn is_io_not_found(&self) -> bool {
+        match &self.kind {
+            ConfigFileErrorKind::Doc(ConfigDocError::Io(err)) if err.is_not_found() => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_not_found(&self) -> bool {
+        matches!(&self.kind, ConfigFileErrorKind::NotFound(_))
+    }
+}
+
+impl Error for ConfigFileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.kind {
+            ConfigFileErrorKind::Doc(err) => Some(err),
+            // No other nested errors
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ConfigFileError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.kind)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ConfigFileErrorKind {
     Doc(ConfigDocError),
     BadKey(OsString),
     BadSectionName(OsString),
     MultipleValues(OsString),
     NotFound(OsString),
-    MissingValue(OsString),
     IncompatibleType {
         key: OsString,
-        value: Vec<u8>,
-        actual_type: &'static str,
+        // mismatch on a valueless boolean does not have a value to return
+        value: Option<Vec<u8>>,
+        // Don't try to add an actual_type field because a bad value does not necessarily have an
+        // actual type
+        expected: &'static str,
     },
 }
 
-impl ConfigFileError {
-    // TODO: for now the only variant of io::ErrorKind we care is NotFound so maybe we need this
-    //  to be a boolean since the caller only cares if it is NotFound or not?
-    pub(crate) fn io_error_kind(&self) -> Option<io::ErrorKind> {
-        match self {
-            Self::Doc(ConfigDocError::Io { source, .. }) => Some(source.kind()),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn is_io_not_found(&self) -> bool {
-        self.io_error_kind()
-            .is_some_and(|kind| kind == io::ErrorKind::NotFound)
-    }
-
-    pub(crate) fn is_not_found(&self) -> bool {
-        matches!(self, ConfigFileError::NotFound(_))
-    }
-}
-
-impl From<ConfigDocError> for ConfigFileError {
-    fn from(err: ConfigDocError) -> Self {
-        Self::Doc(err)
-    }
-}
-
-impl Error for ConfigFileError {}
-
-impl fmt::Display for ConfigFileError {
+impl fmt::Display for ConfigFileErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ConfigFileError::Doc(doc) => write!(f, "{}", doc),
-            ConfigFileError::BadKey(key) => {
+            ConfigFileErrorKind::Doc(_) => write!(f, "could not load config"),
+            ConfigFileErrorKind::BadKey(key) => {
                 write!(
                     f,
                     "key does not contain a section: {}",
                     key.to_string_lossy()
                 )
             }
-            ConfigFileError::BadSectionName(value) => {
+            ConfigFileErrorKind::BadSectionName(value) => {
                 write!(
                     f,
                     "bad section name: {}. Must be alphanumeric and/or '-'",
                     value.to_string_lossy()
                 )
             }
-            ConfigFileError::MultipleValues(key) => {
+            ConfigFileErrorKind::MultipleValues(key) => {
                 write!(f, "key: {} has multiple values", key.to_string_lossy())
             }
-            ConfigFileError::NotFound(key) => {
+            ConfigFileErrorKind::NotFound(key) => {
                 write!(f, "key: {} not found", key.to_string_lossy())
             }
-            ConfigFileError::MissingValue(key) => {
-                write!(f, "missing value for: {}", key.to_string_lossy())
-            }
-            ConfigFileError::IncompatibleType {
+            ConfigFileErrorKind::IncompatibleType {
                 key,
                 value,
-                actual_type,
+                expected,
             } => {
                 write!(
                     f,
                     "bad {} config value '{}' for '{}'",
-                    actual_type,
+                    expected,
                     // TODO: do we need to iterate and call ReadableByte?
-                    String::from_utf8_lossy(&value),
+                    String::from_utf8_lossy(&Vec::new()),
                     key.to_string_lossy()
                 )
             }

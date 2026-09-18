@@ -3,6 +3,7 @@
     <words>
       <w>Pathspec</w>
       <w>filemode</w>
+      <w>litdir</w>
       <w>litfile</w>
       <w>pathspec</w>
       <w>tempfile</w>
