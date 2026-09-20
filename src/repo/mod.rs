@@ -1,5 +1,6 @@
 pub(super) mod config;
 pub(super) mod db;
+mod diagnostic;
 pub(super) mod format;
 pub(super) mod index;
 pub(super) mod litfile;
@@ -13,13 +14,12 @@ pub(super) mod report;
 pub(super) mod timestamp;
 pub(super) mod tree;
 pub(super) mod workspace;
-mod diagnostic;
 
 use crate::repo::config::{ConfigFile, ConfigFileErrorKind};
 use crate::repo::format::{RepositoryFormat, RepositoryFormatError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
-use crate::repo::os::{OsPath, OsPathError};
+use crate::repo::os::{IoError, IoErrorContext, OsPath, OsPathError};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs, io};
@@ -44,8 +44,8 @@ pub(super) struct Layout {
 }
 
 impl Layout {
-    // There are 4 factors that determine the location of .lit dir when initializing a repo.
-    // --bare, --separate_lit_dir, path and the LIT_DIR/LIT_WORK_TREE env var.
+    // There are 4 factors that determine the location of metadata dir when initializing a repo.
+    // --bare, --separate_lit_dir, path and the LIT_DIR/LIT_WORK_TREE env vars.
     //
     //  Resolves the metadata and worktree locations without touching the fs
     //
@@ -75,9 +75,11 @@ impl Layout {
         // that is what transpose does
         let path = path.map(OsPath::new).transpose()?;
 
-        let cwd = env::current_dir().map_err(LayoutError::CurrentDirUnavailable)?;
+        let cwd = env::current_dir().with_context::<&OsPath>("getcwd", None)?;
         let cwd = OsPath::new_unchecked(cwd);
-        let root = path.as_ref().map_or(cwd.clone(), |path| cwd.join_unchecked(path));
+        let root = path
+            .as_ref()
+            .map_or(cwd.clone(), |path| cwd.join_unchecked(path));
 
         if let Some(dir_path) = separate_lit_dir {
             // TODO: should this be a notification to the user that LIT_DIR is actually ignored
@@ -205,8 +207,8 @@ impl Layout {
 // validate that the directory pointed by path is a valid Lit repository before migration for the
 // separate-lit-dir flag
 // If `path` already points to a dir it moves it, if it points to a regular file then it must be a
-// litfile, so it reads it first before moving. https://github.com/git/git/blob/master/setup.c#L2674
-// https://github.com/git/git/blob/master/setup.c#L413
+// litfile, so it reads it first before moving.
+// https://github.com/git/git/blob/d38352cd43ab9745686d697872408bc3249a153f/setup.c#L413-L451
 //
 // The conditions that must hold true are:
 //  - accessible dir pointed by path(r/w)
@@ -227,7 +229,7 @@ pub(super) fn validate_metadata_dir(path: &OsPath) -> Result<(), MetadataDirErro
             let cwd = env::current_dir().map_err(MetadataDirError::CurrentDirUnavailable)?;
             let cwd = OsPath::new_unchecked(cwd);
             cwd.join(dir)?
-        },
+        }
     };
 
     require_accessible_dir(&objects_dir)?;
@@ -448,26 +450,36 @@ impl fmt::Display for DiscoverError {
 
 #[derive(Debug)]
 pub(super) enum LayoutError {
-    CurrentDirUnavailable(io::Error),
+    Io(IoError),
     OsPath(OsPathError),
     LitWorkTreeWithBare,
 }
 
-impl Error for LayoutError {}
+impl Error for LayoutError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(source) => Some(source),
+            Self::OsPath(source) => Some(source),
+            Self::LitWorkTreeWithBare => None,
+        }
+    }
+}
 
 impl fmt::Display for LayoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LayoutError::CurrentDirUnavailable(err) => {
-                write!(f, "could not determine current directory: {err}")
-            }
-            LayoutError::OsPath(source) => {
-                write!(f, "{source}")
-            }
-            LayoutError::LitWorkTreeWithBare => {
-                write!(f, "LIT_WORK_TREE not allowed with --bare")
+            Self::Io(_) => write!(f, "layout resolution I/O failed"),
+            Self::OsPath(_) => write!(f, "bad path"),
+            Self::LitWorkTreeWithBare => {
+                write!(f, "LIT_WORK_TREE not allowed with --bare option")
             }
         }
+    }
+}
+
+impl From<IoError> for LayoutError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
     }
 }
 

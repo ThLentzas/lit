@@ -1,23 +1,22 @@
+use crate::repo::format::ObjectFormat;
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
+use crate::repo::os::{self, IoError, OsPath};
 use crate::repo::repo_path::RepoPath;
-use rand::RngExt;
-use rand::distr::Alphanumeric;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::PathBuf;
-use std::{fmt, fs, io};
-use crate::cli;
+use std::{fmt, fs, io, result};
 
 pub(crate) struct Database {
-    pub(crate) path: PathBuf,
+    path: OsPath,
+    object_format: ObjectFormat,
 }
 
 // TODO: info and packs files
 impl Database {
-    pub(crate) fn store(&self, object: Object) -> Result<Oid, DbError> {
+    pub(crate) fn store(&self, object: Object) -> Result<Oid> {
         let obj_type = object.obj_type().to_string();
         let content = object.serialize();
         let bytes = encode(obj_type.as_bytes(), &content);
@@ -36,28 +35,14 @@ impl Database {
         // the two character split is just to avoid having of thousands of files in one directory,
         // which would slow down file systems
         let hex = oid.to_hex();
-        let parent = self.path.join(&hex[..2]);
+        let parent = self.path.join_unchecked(&hex[..2]);
         // if the parent dir does not exist, create parent first .lit/objects/90/ before trying to
         // write tmp
         match fs::create_dir(&parent) {
             Ok(_) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                if !parent.is_dir() {
-                    let err = io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        "object directory path exists but is not a directory",
-                    );
-                    return Err(DbError::Io {
-                        path: parent,
-                        source: err,
-                    });
-                }
-            }
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => {
-                return Err(DbError::Io {
-                    path: parent,
-                    source: err,
-                });
+                return Err(DbError::Io(IoError::new("mkdir", Some(&parent), err)));
             }
         }
 
@@ -67,31 +52,16 @@ impl Database {
         // checking the object type, object size, the uncompressed content.
         // If any of those differ we need to return a collision error.
         // Read Notes for Sha1 collision attacks,
-        // TODO: eventually on the rewrite move to 256
-        let path = parent.join(&hex[2..]);
-        // TODO: can this exists() call be a TOCTOU issue?
-        if path.exists() {
-            return Ok(oid);
-        }
-        let tmp_path = parent.join(cli::with_prefix("tmp_obj"));
-        // this will create only the temp file and not any of the parent dir if missing
-        // .lit/objects/90/tmp_obj_gNLJvt
-        // TODO: we need to change this to zlib
-        let compressed = deflate::deflate_bytes(&bytes);
-        fs::write(&tmp_path, compressed).map_err(|err| DbError::Io {
-            path: parent.to_path_buf(),
-            source: err,
-        })?;
+        // TODO: this does no guarantee anything it can be a directory with the same name
+        //  if path.exists() {
+        //     return Ok(oid);
+        //  }
+        //  need to detect corruption or hash collisions at this, we must call load() and handle the
+        //  not_found error.
+        let path = parent.join_unchecked(&hex[2..]);
+        let compressed = deflate::deflate_bytes_zlib(&bytes);
+        os::atomic_write(&parent, &compressed, &path)?;
 
-        // we return the rename error even if remove_file() fails because that was the main reason
-        if let Err(err) = fs::rename(&tmp_path, &path) {
-            // Try to clean up the temp file before returning the error
-            let _ = fs::remove_file(&tmp_path);
-            return Err(DbError::Io {
-                path: tmp_path,
-                source: err,
-            });
-        }
         Ok(oid)
     }
 
@@ -101,11 +71,11 @@ impl Database {
     // make a tree point at it, this will also get caught because of the Merkle's tree nature. we
     // will hash the contents of the tree, and it will fail because the hash of the tree is generated
     // by the hash of its children.
-    pub(crate) fn load(&self, oid: &Oid) -> Result<Option<Object>, DbError> {
+    pub(crate) fn load(&self, oid: &Oid) -> Result<Object> {
         let hex = oid.to_hex();
         // always safe to index since hex is a valid 40 character long hex string
         let (parent, child) = hex.split_at(2);
-        let path = self.path.join(parent).join(child);
+        let path = self.path.join_unchecked(parent).join_unchecked(child);
         let content = match fs::read(&path) {
             Ok(content) => content,
             Err(err)
@@ -114,13 +84,16 @@ impl Database {
                     io::ErrorKind::NotFound | io::ErrorKind::IsADirectory
                 ) =>
             {
-                // TODO: should NotFound be an error or let the caller handle None?
-                return Ok(None);
+                // we could also have a method find() -> Result<Option<Object>, DbError> and let the
+                // caller decide the absence
+                // initially I had load() return Result<Option<Object>, DbError> but most of the callers
+                // would turn None into NotFound, adjust if it changes
+                return Err(DbError::ObjectNotFound { oid: hex });
             }
-            Err(err) => return Err(DbError::Io { path, source: err }),
+            Err(err) => return Err(DbError::Io(IoError::new("read", Some(path), err))),
         };
 
-        let bytes = match inflate::inflate_bytes(&content) {
+        let bytes = match inflate::inflate_bytes_zlib(&content) {
             Ok(bytes) => bytes,
             Err(err) => {
                 return Err(DbError::Decompress {
@@ -144,15 +117,10 @@ impl Database {
         // the information from any parsing error that occurs during loading an object is never returned
         // to the user. It means something is wrong with our on-disk format. Bad object with {oid}
         // is all they are going to see. The information is only needed for debugging.
-        Ok(Some(
-            Object::deserialize(&bytes).map_err(|_err| DbError::BadObject { oid: hex })?,
-        ))
+        Ok(Object::deserialize(&bytes).map_err(|_err| DbError::BadObject { oid: hex })?)
     }
 
-    pub(super) fn load_tree_files(
-        &self,
-        oid: &Oid,
-    ) -> Result<HashMap<RepoPath, (Oid, Mode)>, DbError> {
+    pub(super) fn load_tree_files(&self, oid: &Oid) -> Result<HashMap<RepoPath, (Oid, Mode)>> {
         let mut files = HashMap::new();
         self.collect_tree_files(&mut files, &RepoPath::new(), oid)?;
 
@@ -164,18 +132,12 @@ impl Database {
         files: &mut HashMap<RepoPath, (Oid, Mode)>,
         prefix: &RepoPath,
         oid: &Oid,
-    ) -> Result<(), DbError> {
-        let entries = match self.load(oid)? {
-            Some(Object::Tree(entries)) => entries,
-            Some(_) => {
-                return Err(DbError::NotATree {
-                    path: prefix.clone(),
-                    oid: oid.to_hex(),
-                });
-            }
-            None => {
-                return Err(DbError::ObjectNotFound { oid: oid.to_hex() });
-            }
+    ) -> Result<()> {
+        let Object::Tree(entries) = self.load(oid)? else {
+            return Err(DbError::NotATree {
+                path: prefix.clone(),
+                oid: oid.to_hex(),
+            });
         };
 
         for entry in entries {
@@ -200,30 +162,30 @@ impl Database {
     // 2 letters, and then the remaining one are the entry's name within parent. When we walk the dir
     // if there is an entry that starts with that prefix then it is a candidate. The dir can be polluted
     // by other non-lit related garbage which will be ignored.
-    pub(crate) fn resolve_oid_prefix(&self, prefix: &str) -> Result<Oid, DbError> {
+    pub(crate) fn resolve_oid_prefix(&self, prefix: &str) -> Result<Oid> {
         if prefix.len() < 4 {
-            return Err(DbError::Prefix(PrefixError::TooShort(prefix.to_string())));
+            return Err(PrefixError::TooShort(prefix.to_string()))?;
         }
-        
+
         if !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err(DbError::Prefix(PrefixError::BadHex(prefix.to_string())));
+            return Err(PrefixError::BadHex(prefix.to_string()))?;
         }
 
         let (dir_name, file_prefix) = prefix.split_at(2);
-        let path = self.path.join(dir_name);
+        let path = self.path.join_unchecked(dir_name);
         let entries = match fs::read_dir(&path) {
             Ok(read_dir) => read_dir,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 return Err(DbError::Prefix(PrefixError::NotFound(prefix.to_string())));
             }
-            Err(err) => return Err(DbError::Io { path, source: err }),
+            Err(err) => return Err(DbError::Io(IoError::new("opendir", Some(path), err))),
         };
 
         let mut matches = Vec::new();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(err) => return Err(DbError::Io { path, source: err }),
+                Err(err) => return Err(DbError::Io(IoError::new("opendir", Some(path), err))),
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -245,10 +207,10 @@ impl Database {
                 oid: prefix.to_string(),
             }),
             1 => Ok(matches[0]),
-            _ => Err(DbError::Prefix(PrefixError::Ambiguous {
+            _ => Err(PrefixError::Ambiguous {
                 prefix: prefix.to_string(),
                 candidates: matches,
-            })),
+            })?,
         }
     }
 }
@@ -258,7 +220,7 @@ pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> Oid {
 }
 
 // header: <type> <len>\0<content>
-fn encode(obj_type: &[u8], content: &[u8]) -> Vec<u8> { 
+fn encode(obj_type: &[u8], content: &[u8]) -> Vec<u8> {
     // These are the bytes that will be used for compression
     let mut bytes = Vec::with_capacity(obj_type.len() + 12 + content.len());
     bytes.extend_from_slice(obj_type);
@@ -281,18 +243,43 @@ pub(crate) enum PrefixError {
     BadHex(String),
 }
 
+impl Error for PrefixError {}
+
+impl fmt::Display for PrefixError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Git does not provide any more info
+            PrefixError::TooShort(prefix)
+            | PrefixError::BadHex(prefix)
+            | PrefixError::NotFound(prefix) => {
+                write!(f, "not a valid object name {}", prefix)
+            }
+            PrefixError::Ambiguous { prefix, candidates } => {
+                writeln!(f, "short object ID {} is ambiguous", prefix)?;
+                writeln!(f, "the candidates are:")?;
+                for oid in candidates {
+                    let hex = oid.to_hex();
+                    // TODO: could this 7 character abbreviation produce identical representations
+                    //  for different candidates?
+                    writeln!(f, "{}", &hex[..7])?;
+                }
+                write!(f, "not a valid object name {}", prefix)
+            }
+        }
+    }
+}
+
+type Result<T> = result::Result<T, DbError>;
+
 #[derive(Debug)]
 pub(crate) enum DbError {
-    Io {
-        path: PathBuf,
-        source: io::Error,
-    },
+    Io(IoError),
     Decompress {
         oid: String,
         reason: String,
     },
     HashMismatch {
-        path: PathBuf,
+        path: OsPath,
         expected: [u8; 20],
         actual: [u8; 20],
     },
@@ -309,43 +296,50 @@ pub(crate) enum DbError {
     Prefix(PrefixError),
 }
 
-impl Error for DbError {}
-
-impl fmt::Display for DbError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Error for DbError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            DbError::Io { path, source } => write!(f, "{}: {source}", path.display()),
-            DbError::Decompress { oid, reason } => {
-                write!(f, "unable to unpack object {oid}: {reason}")
-            }
-            DbError::HashMismatch { path, .. } => {
-                write!(f, "hash-path mismatch for '{}'", path.display())
-            }
-            DbError::BadObject { oid } => write!(f, "bad object {oid}"),
-            DbError::NotATree { oid, .. } => write!(f, "not a tree object: {oid}"),
-            DbError::ObjectNotFound { oid, .. } => write!(f, "object {oid} not found"),
-            DbError::Prefix(err) => write!(f, "{}", err),
+            Self::Io(source) => Some(source),
+            Self::Decompress { .. } => None,
+            Self::HashMismatch { .. } => None,
+            Self::BadObject { .. } => None,
+            Self::NotATree { .. } => None,
+            Self::ObjectNotFound { .. } => None,
+            Self::Prefix(source) => Some(source),
         }
     }
 }
 
-impl fmt::Display for PrefixError {
+impl fmt::Display for DbError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PrefixError::TooShort(prefix)
-            | PrefixError::BadHex(prefix)
-            | PrefixError::NotFound(prefix) => {
-                write!(f, "Not a valid object name {}", prefix)
+            DbError::Io(_) => write!(f, "object database I/O failed",),
+            DbError::Decompress { oid, .. } => {
+                write!(f, "unable to unpack object {oid}")
             }
-            PrefixError::Ambiguous { prefix, candidates } => {
-                writeln!(f, "short object ID {} is ambiguous", prefix)?;
-                writeln!(f, "The candidates are:")?;
-                for oid in candidates {
-                    let hex = oid.to_hex();
-                    writeln!(f, "{}", &hex[..7])?;
-                }
-                write!(f, "Not a valid object name {}", prefix)
+            DbError::HashMismatch { path, .. } => {
+                write!(
+                    f,
+                    "object contents do not match the hash in its path'{}'",
+                    path.display()
+                )
             }
+            DbError::BadObject { oid } => write!(f, "bad object {oid}"),
+            DbError::NotATree { oid, .. } => write!(f, "not a tree object: {oid}"),
+            DbError::ObjectNotFound { oid, .. } => write!(f, "object {oid} not found"),
+            DbError::Prefix(_) => write!(f, "could not resolve object id prefix"),
         }
+    }
+}
+
+impl From<IoError> for DbError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<PrefixError> for DbError {
+    fn from(err: PrefixError) -> Self {
+        Self::Prefix(err)
     }
 }

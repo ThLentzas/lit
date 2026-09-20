@@ -1,13 +1,13 @@
-use crate::repo::db::{Database, DbError};
+use crate::repo::Repository;
+use crate::repo::db::{self, Database, DbError};
 use crate::repo::index::{Index, IndexEntry};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Object, OidError};
 use crate::repo::os::{FileKind, StatNode};
-use crate::repo::repo_path::RepoPath;
 use crate::repo::refs::{RefError, Refs};
+use crate::repo::repo_path::RepoPath;
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{Repository, db};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -88,18 +88,19 @@ impl Report {
     }
 
     // TODO: make sure that when we track the paths we have / as file separator the same way Index
-    // does it. Revisit when printing.
+    //  does it. Revisit when printing.
     fn load_head_entries(&mut self, refs: &Refs, db: &Database) -> Result<(), ReportError> {
         // tried to read the HEAD and got nothing back -> first commit
         let Some(head_oid) = refs.read_head()? else {
             return Ok(());
         };
 
-        let commit = match db.load(&Oid::from_hex(&head_oid)?)? {
+        let oid = Oid::from_hex(&head_oid)?;
+        let commit = match db.load(&oid)? {
             Some(Object::Commit(commit)) => commit,
-            Some(_) => return Err(ReportError::HeadNotACommit { oid: head_oid }),
+            Some(_) => return Err(ReportError::HeadNotACommit { oid }),
             // retrieved the oid of HEAD but is missing from db.
-            None => return Err(ReportError::HeadCommitNotFound { oid: head_oid }),
+            None => return Err(ReportError::HeadCommitNotFound { oid }),
         };
         self.head_entries = db.load_tree_files(&commit.root_id)?;
 
@@ -261,52 +262,61 @@ pub(crate) enum ReportError {
     Workspace(WorkspaceError),
     Database(DbError),
     Ref(RefError),
-    HeadNotACommit { oid: String },
-    HeadCommitNotFound { oid: String },
     HeadBadOid(OidError),
+    HeadNotACommit { oid: Oid },
+    HeadCommitNotFound { oid: Oid },
 }
 
-impl Error for ReportError {}
+impl Error for ReportError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Workspace(source) => Some(source),
+            Self::Database(source) => Some(source),
+            Self::Ref(source) => Some(source),
+            Self::HeadBadOid(source) => Some(source),
+            Self::HeadNotACommit { .. } => None,
+            Self::HeadCommitNotFound { .. } => None,
+        }
+    }
+}
 
 impl fmt::Display for ReportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ReportError::Workspace(err) => write!(f, "{err}"),
-            ReportError::Database(err) => write!(f, "{err}"),
-            ReportError::Ref(err) => write!(f, "{err}"),
-            ReportError::HeadNotACommit { oid } => {
-                write!(f, "HEAD points to object {oid}, which is not a commit")
-            }
-            ReportError::HeadCommitNotFound { oid } => {
-                write!(f, "HEAD points to missing commit {oid}")
-            }
-            ReportError::HeadBadOid(err) => {
+            Self::Workspace(_) => write!(f, "could not inspect workspace"),
+            Self::Database(_) => write!(f, "could not load HEAD commit or tree"),
+            Self::Ref(_) => write!(f, "could not resolve HEAD"),
+            Self::HeadBadOid(err) => {
                 write!(f, "invalid object id in HEAD: {err}")
             }
+            Self::HeadNotACommit { oid } => {
+                write!(f, "HEAD points to object {oid}, which is not a commit")
+            }
+            Self::HeadCommitNotFound { oid } => write!(f, "HEAD points to missing commit {oid}"),
         }
     }
 }
 
 impl From<WorkspaceError> for ReportError {
     fn from(err: WorkspaceError) -> Self {
-        ReportError::Workspace(err)
+        Self::Workspace(err)
     }
 }
 
 impl From<DbError> for ReportError {
     fn from(err: DbError) -> Self {
-        ReportError::Database(err)
+        Self::Database(err)
     }
 }
 
 impl From<RefError> for ReportError {
     fn from(err: RefError) -> Self {
-        ReportError::Ref(err)
+        Self::Ref(err)
     }
 }
 
 impl From<OidError> for ReportError {
     fn from(err: OidError) -> Self {
-        ReportError::HeadBadOid(err)
+        Self::HeadBadOid(err)
     }
 }

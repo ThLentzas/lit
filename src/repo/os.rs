@@ -59,7 +59,7 @@ impl OsPath {
         self.inner.components()
     }
 
-    // As for now we can't return Option<&OsPath> because parent returns &Path and calling
+    // As for now we can't return Option<&OsPath> because PathBuf::parent() returns &Path and calling
     // .map(|parent| OsPath::new_unchecked(parent)).as_ref() returns a ref to a local variable that
     // gets dropped
     pub(crate) fn parent(&self) -> Option<OsPath> {
@@ -83,10 +83,22 @@ impl OsPath {
 
     // returns a &Path because what is left can be an empty path and that would break the invariant
     // of OsPath
-    pub(crate) fn strip_prefix(&self, base: &Path) -> Result<&Path, OsPathError> {
+    pub(crate) fn strip_prefix<P>(&self, base: P) -> Result<&Path, OsPathError>
+    where
+        P: AsRef<Path>,
+    {
         self.inner
             .strip_prefix(base)
             .map_err(OsPathError::StripPrefix)
+    }
+
+    pub(crate) fn with_suffix_unchecked<P>(&self, suffix: P) -> Self
+    where
+        P: AsRef<OsStr>,
+    {
+        let mut path = self.as_os_str().to_os_string();
+        path.push(suffix);
+        Self::new_unchecked(path)
     }
 
     pub(crate) fn display(&self) -> Display<'_> {
@@ -159,6 +171,9 @@ pub(crate) fn atomic_write(
     destination: &OsPath,
 ) -> Result<(), IoError> {
     let parent = File::open(parent_dir).with_context("open", Some(parent_dir))?;
+    // NamedTempFile as of 3.27.0 uses as default name .tmp + 6 alphanumeric, '.tmpA7k2Qz'
+    // if the name already exists, it retries so we don't have to consider collisions
+    // https://docs.rs/tempfile/3.27.0/tempfile/struct.Builder.html
     let mut tempfile =
         NamedTempFile::new_in(parent_dir).with_context("create temp file in", Some(parent_dir))?;
     tempfile
@@ -239,7 +254,7 @@ pub(crate) struct FileStat {
     pub(crate) file_size: u32,
 }
 
-pub(super) fn stat(path: &Path) -> Result<StatNode, IoError> {
+pub(super) fn stat(path: &OsPath) -> Result<StatNode, IoError> {
     // Git tracks symlinks as symlinks, not as the file they point to.
     //  fs::symlink_metadata() does not follow symlinks. We get metadata about the symlink itself
     //  fs::metadata() follows symlinks and reports metadata about the target
@@ -400,10 +415,10 @@ impl IoError {
         Self {
             op,
             path: path.map(|path| OsPath::new_unchecked(path.as_ref())),
-            source
+            source,
         }
     }
-    
+
     pub(crate) fn is_not_found(&self) -> bool {
         self.source.kind() == io::ErrorKind::NotFound
     }

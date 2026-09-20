@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::{fmt, io};
 
+// TODO: test both approach, the Display of ReadableBytes and the method stdout_bytes(below) annd
+//  see what fits best
 pub(crate) struct ReadableBytes<'a> (pub(crate) &'a [u8]);
 
 // one universal rule for printing bad output
@@ -17,11 +19,22 @@ pub(crate) struct ReadableByte(pub(crate) u8);
 
 impl fmt::Display for ReadableByte {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // The initial print as is if ascii_graphic() else print as 0x{:02x} has the following issue
+        // b"a\0b" prints as a0x00b which is the same as the literal "a0x00b" so it is ambiguous
+        //
         // space is not considered graphic in this case, because unexpected byte  looks ambiguous
-        if self.0.is_ascii_graphic() {
-            write!(f, "{}", self.0 as char)
-        } else {
-            write!(f, "0x{:02x}", self.0)
+        //
+        // new approach: we represent each non-printable character with its hex sequence written as
+        // '\x00' fixed width representation, and we escape the backslash itself
+        //
+        // "a\0b", ['a' '\0' 'b'] becomes ['a', '\', 'x', '0', '0', 'b']
+        // "a\\x00b", a literal backslash followed by x00 becomes ['a', '\', '\', 'x', '0', '0', 'b']
+        match self.0 {
+            b'\\' => write!(f, "\\\\"),
+            // this is because the path is enclosed in single quotes: '{path}'
+            b'\'' => write!(f, "\\'"),
+            byte if byte.is_ascii_graphic() => write!(f, "{}", char::from(byte)),
+            byte => write!(f, "\\x{byte:02x}")
         }
     }
 }

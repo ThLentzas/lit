@@ -41,16 +41,14 @@ impl CatFile {
             .and_then(ObjectType::try_from_str)
             .ok_or_else(|| CatFileError::UnknownType(self.obj_type.clone()))?;
 
-        match db.load(&oid)? {
-            Some(object) => {
-                let expected = object.obj_type();
-                if expected != actual {
-                    return Err(CatFileError::TypeMismatch { expected, actual });
-                }
-                let printer = CatFilePrinter;
-                printer.print(&object)?;
+        let object = db.load(&oid)?;
+        {
+            let expected = object.obj_type();
+            if expected != actual {
+                return Err(CatFileError::TypeMismatch { expected, actual });
             }
-            None => return Err(CatFileError::NotFound(oid)),
+            let printer = CatFilePrinter;
+            printer.print(&object)?;
         }
 
         Ok(())

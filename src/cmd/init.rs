@@ -1,9 +1,10 @@
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::format::{
-    FormatVersion, ObjectFormat, ObjectFormatError, RefFormat, RefStorage, RefStorageError,
+    FormatVersion, ObjectFormat, ObjectFormatError, RefFormat, RefFormatError, RefStorage,
     RepositoryFormat, RepositoryFormatError,
 };
 use crate::repo::litfile::{self, LitFileError};
+use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::os::{self, IoError, IoErrorContext, OsPath, OsPathError};
 use crate::repo::refs::{RefError, Refs};
 use crate::repo::{self, Layout, LayoutError, MetadataDirError};
@@ -47,8 +48,9 @@ pub(crate) struct Init {
 
 impl Init {
     // https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2841-L2945
+    // TODO: create hooks, info, description
     pub(super) fn execute(&self) -> Result<(), InitError> {
-        // 1. We need to resolve arguments and env vars for the location of the metadata dir.
+        // resolve arguments and env vars for the location of the metadata dir.
         // resolve() sets rules for a deterministic layout.
         let layout = Layout::resolve(
             // self.path.as_ref().map(PathBuf::as_ref)
@@ -57,32 +59,36 @@ impl Init {
             self.separate_lit_dir.as_deref(),
         )?;
 
-        // 2. Create the positional/root directory
+        // create the positional/root directory first
         fs::create_dir_all(layout.root()).with_context("mkdir", Some(layout.root()))?;
-
-        // 3. If separate-lit-dir flag is set, we create the pointer file and also migrate an
-        // existing repo if it is a reinitialization
+        // we relocate before loading configuration so the rest of init uses the destination repo
         if let Some(link) = layout.separate_link() {
             try_migrate_metadata(link, layout.metadata())?;
         }
 
+        ensure_dir(layout.metadata())?;
         let cfg_path = layout.metadata().join_unchecked("config");
+        let mut lockfile = Lockfile::acquire(&cfg_path)?;
         // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
         let cfg = match ConfigFile::new(cfg_path.clone()) {
             Ok(cfg) => Some(cfg),
+            // a fresh repo, or a reinit with a missing file we have to repair
+            // only an Io::NotFound error produces an empty in memory ConfigFile
             Err(err) if err.is_io_not_found() => None,
-            Err(err) => {
-                return Err(InitError::Config(err));
-            }
+            Err(err) => return Err(InitError::Config(err)),
         };
 
-        // TODO: explain why we return none and not default yet
+        // defer falling back to default for now, read comment below
         let repo_format = match cfg.as_ref() {
             Some(cfg) => RepositoryFormat::from_config(cfg)?,
             None => None,
         };
+        let mut cfg = cfg.unwrap_or_else(|| ConfigFile::empty(cfg_path));
+
         // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2765
-        // will be passed to setup_ref_db() when we support reftables
+        // if repo format is absent, init options like --object-format or --ref-format can select the
+        // format. For an existing format its options must not conflict with the user provided ones
+        // If we initialize repo_format to default, we wouldn't be able to make the distinction
         let mut repo_format = match repo_format {
             // for an existing repo don't allow the user to specify a different hash/ref format, it
             // can lead to unexpected behavior/corruption of the repo.
@@ -102,23 +108,20 @@ impl Init {
                 repo_format
             }
             None => {
+                // safe to default it and let user provided option overwrite the formats
                 let mut repo_format = RepositoryFormat::default();
-                *repo_format.object_format_mut() =
-                    resolve_object_format(self.object_format, cfg.as_ref())?;
-                *repo_format.ref_storage_mut() =
-                    resolve_ref_storage(self.ref_format, cfg.as_ref())?;
+                *repo_format.object_format_mut() = resolve_object_format(self.object_format, &cfg)?;
+                *repo_format.ref_storage_mut() = resolve_ref_storage(self.ref_format, &cfg)?;
                 repo_format
             }
         };
-        let mut cfg = cfg.unwrap_or_else(|| ConfigFile::empty(cfg_path));
 
         // TODO: next is apply_repository_format()
         //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2884
         //  apply_repo_format() checks at this point for GIT_SHALLOW_FILE, need to revisit when we
         //  support shallow repositories(contains truncated history)
-        ensure_dir(layout.metadata())?;
-        //  TODO: next is to copy any templates
-        //   https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2587
+        //  next is to copy any templates
+        //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2587
         let reinit = is_reinit(layout.metadata())?;
         finalize_format_version(&mut cfg, &mut repo_format)?;
         // When a tracked entry's mode differs from what is recorded, Git must distinguish if the
@@ -130,11 +133,11 @@ impl Init {
         } else {
             cfg.set_all("core.filemode".as_ref(), "false".as_ref())?;
         }
-        // -`lit init project` and then `lit init --bare project` there is no confusion on what
-        // happens. Different metadata directories. For non-bare the metadata entries are created in
-        // project/.lit, then directly inside project, so project/HEAD, project/config etc.
-        // -`LIT_DIR = repo/meta` and then `lit init` with or without --bare results metadata entries
-        // end up in the same directory with different worktree state.
+        // -`lit init project` and `lit init --bare project`,is no confusion on what happens.
+        // Different metadata directories. For non-bare the metadata entries are created in
+        // project/.lit, then directly inside `project/`, so `project/HEAD`, `project/config` etc.
+        // -`LIT_DIR = repo/meta` and `lit init` with or without --bare results in metadata entries
+        // ending up in the same directory with different worktree state.
         //
         // we honor the invariant that we set in resolve() that explicit --bare flag wins. Calling
         // --bare on an existing repo will set the `core.bare = true` and delete all `core.worktree`
@@ -158,7 +161,7 @@ impl Init {
             // true if absent
             match cfg.get_bool("core.logallrefupdates".as_ref()) {
                 Ok(_) => {}
-                Err(err) if err.is_not_found() => {
+                Err(err) if err.is_key_not_found() => {
                     cfg.set("core.logallrefupdates".as_ref(), "true".as_ref())?;
                 }
                 Err(err) => return Err(InitError::Config(err)),
@@ -184,25 +187,29 @@ impl Init {
             }
         }
         setup_object_db(layout.metadata())?;
-        setup_ref_db(
+        setup_ref_backend(
             layout.metadata(),
             // as_ref() would give us Option<&OsString>
             self.initial_branch.as_deref(),
             &cfg,
             reinit,
         )?;
+        // TODO: Git adjust the message based on share repo settings
+        //  https://github.com/git/git/blob/d38352cd43ab9745686d697872408bc3249a153f/setup.c#L2929-L2938
         if !reinit {
-            // print
+            println!(
+                "Initialized existing Lit repository in {}",
+                layout.metadata().display()
+            );
+        } else {
+            println!(
+                "Reinitialized existing Lit repository in {}",
+                layout.metadata().display()
+            );
         }
+        lockfile.write(&cfg.serialize())?;
+        lockfile.commit()?;
 
-        // Migration vs Reinit
-        //  The requirements are different. Reinit needs to know if there is existing repository state
-        //  that initialization preserve, while migration needs to know that if it is a metadata
-        //  directory that is safe to relocate and lit can work on. Reinit must be more conservative.
-        //      if .lit/HEAD exists, but /objects and /refs are missing, it might be a damaged repo,
-        //      a repo that something went wrong in the previous init call. We have to preserve the
-        //      current state, and try to repair the missing structure. A stricter requirement would
-        //      not allow us to repair anything, which is the main goal for reinit.
         Ok(())
     }
 }
@@ -339,7 +346,7 @@ fn setup_object_db(metadata: &OsPath) -> Result<(), InitError> {
 //  reftables we need to rewrite it. Even this impl with files does not support files with payload
 //  refstorage.format = RefFormat::Files, payload = None,
 //  Probably need to move the logic to Refs something like create_on_disk() or something
-fn setup_ref_db(
+fn setup_ref_backend(
     metadata: &OsPath,
     name: Option<&OsStr>,
     cfg: &ConfigFile,
@@ -366,7 +373,7 @@ fn setup_ref_db(
                     let name = os::os_str_from_bytes(entry.as_ref());
                     refs.new_unborn_branch(Some(name))?
                 }
-                Err(err) if err.is_not_found() => refs.new_unborn_branch(None)?,
+                Err(err) if err.is_key_not_found() => refs.new_unborn_branch(None)?,
                 Err(err) => return Err(InitError::Config(err)),
             },
         }
@@ -461,21 +468,32 @@ fn finalize_format_version(
 }
 
 // https://github.com/git/git/blob/1a3e64c6c4a623626ff0687008732a8e007e2a1c/setup.c#L2675-L2696
-// we convert an embedded repo layout into a separate one
-// TODO: explain rename and file descriptors and the unavoidable TOCTOU race conditions when working
+// TODO: explain rename, file descriptors and the unavoidable TOCTOU race conditions when working
 //  with paths.
+//
+// If separate-lit-dir flag is set, we create the pointer file and also migrate an existing
+// repo if it is a reinitialization
+// Migration vs Reinit
+//  The requirements are different. Reinit needs to know if there is existing repository state
+//  that initialization preserve, while migration needs to know that if it is a metadata
+//  directory that is safe to relocate and lit can work on. Reinit must be more conservative.
+//      if .lit/HEAD exists, but /objects and /refs are missing, it might be a damaged repo,
+//      a repo that something went wrong in the previous init call. We have to preserve the
+//      current state, and try to repair the missing structure. A stricter requirement would
+//      not allow us to repair anything, which is the main goal for reinit.
+//
 // link path to project/.lit pointer file
 fn try_migrate_metadata(link: &OsPath, metadata_destination: &OsPath) -> Result<(), InitError> {
     // lit --separate-lit-dir /new/metadata project
     //
-    // if project/.lit exists as a path we need to inspect it because now we have to move the
-    // contents to the new location.
-    //  - a directory means it is the existing metadata directory
-    //  - a file means we have to check if it contains an existing pointer such as: `litdir: /old/metadata`
-    //  and follow the pointer to find the content we want to move
+    // from Layout's construction link points to `project/.lit`
+    // if `project/.lit` exists we need to inspect it and move the contents to the new location
+    //  - a directory means we treat it as metadata directory
+    //  - a file means it must be a litfile such as: `litdir: /old/metadata`, follow the pointer to
+    //  find the content we want to move
     //  - a symlink must be resolved first
-    let resolved_entry_path = resolve_litfile_pointer(link)?;
-    let Some(current_metadata_dir) = resolved_entry_path else {
+    let link_path = resolve_litfile_pointer(link)?;
+    let Some(current_metadata_dir) = link_path else {
         // if the pointer points nowhere, nothing to migrate, create the .lit file
         return Ok(litfile::write(link, metadata_destination.as_bytes())?);
     };
@@ -532,11 +550,10 @@ fn try_migrate_metadata(link: &OsPath, metadata_destination: &OsPath) -> Result<
 }
 
 // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2787-L2801
-// precedence: flag > env var > config value(only in .litconfig or system, the local config does not
-// exist yet for a new repo)
+// precedence: flag > env var > config value
 fn resolve_object_format(
     flag: Option<ObjectFormat>,
-    cfg: Option<&ConfigFile>,
+    cfg: &ConfigFile,
 ) -> Result<ObjectFormat, InitError> {
     if let Some(format) = flag {
         return Ok(format);
@@ -547,30 +564,23 @@ fn resolve_object_format(
         return ObjectFormat::try_from(hash).map_err(InitError::UnknownObjectFormat);
     }
 
-    if let Some(cfg) = cfg {
-        // TODO: cfg needs to look for this in the global config not local?
-        return match cfg.get_str("init.defaultObjectFormat".as_ref()) {
-            Ok(hash) => {
-                ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat)
-            }
-            Err(err) if err.is_io_not_found() => Ok(ObjectFormat::default()),
-            Err(err) => Err(InitError::Config(err)),
-        };
+    // TODO: cfg needs to look for this in the global config not local?
+    match cfg.get_str("init.defaultObjectFormat".as_ref()) {
+        Ok(hash) => ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat),
+        Err(err) if err.is_key_not_found() => Ok(ObjectFormat::default()),
+        Err(err) => Err(InitError::Config(err)),
     }
-    Ok(ObjectFormat::default())
 }
 
-fn resolve_ref_storage(
-    flag: Option<RefFormat>,
-    cfg: Option<&ConfigFile>,
-) -> Result<RefStorage, InitError> {
+fn resolve_ref_storage(flag: Option<RefFormat>, cfg: &ConfigFile) -> Result<RefStorage, InitError> {
     let mut ref_storage = RefStorage::default();
 
     // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2824-L2838
     // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/environment.h#L46
     // when I wrote this, I couldn't find any reference for that env var in the docs
     // In the src code, linked above, the branch that checks this env var is a separate one, disconnected
-    // from the above logic. It has the highest precedence, it overwrites any previously set value.
+    // from the rest of the logic. It has the highest precedence, it overwrites any previously set
+    // value.
     if let Some(ref_backend) = env::var_os("LIT_REFERENCE_BACKEND") {
         let ref_backend = os::os_str_as_bytes(ref_backend.as_os_str());
         ref_storage = RefStorage::try_from(ref_backend)?;
@@ -583,20 +593,16 @@ fn resolve_ref_storage(
         *ref_storage.format_mut() = ref_format;
     } else if let Some(ref_format) = env::var_os("LIT_DEFAULT_REF_FORMAT") {
         let ref_format = os::os_str_as_bytes(ref_format.as_os_str());
-        *ref_storage.format_mut() = RefFormat::try_from(ref_format)
-            .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
+        *ref_storage.format_mut() = RefFormat::try_from(ref_format)?;
     } else {
-        if let Some(cfg) = cfg {
-            match cfg.get_str("init.defaultRefFormat".as_ref()) {
-                Ok(ref_format) => {
-                    *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_bytes())
-                        .map_err(|err| InitError::UnknownRefStorage(RefStorageError(err)))?;
-                }
-                // if the config value is not set, storage is already default, we don't have to
-                // perform any action
-                Err(err) if err.is_io_not_found() => {}
-                Err(err) => return Err(InitError::Config(err)),
+        match cfg.get_str("init.defaultRefFormat".as_ref()) {
+            Ok(ref_format) => {
+                *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_bytes())?;
             }
+            // if the config value is not set, storage is already default, we don't have to
+            // perform any action
+            Err(err) if err.is_key_not_found() => {}
+            Err(err) => return Err(InitError::Config(err)),
         }
     }
     Ok(ref_storage)
@@ -610,7 +616,6 @@ fn ensure_dir(path: &OsPath) -> Result<(), InitError> {
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(path).with_context("lstat", Some(path))?;
             // safe to call create_dir() in existing dirs, it will return without touching them
-            // TODO: this is TOCTOU case
             if metadata.file_type().is_dir() {
                 Ok(())
             } else {
@@ -640,7 +645,6 @@ fn resolve_litfile_pointer(litfile_pointer: &OsPath) -> Result<Option<Cow<'_, Os
         Err(err) => Err(IoError::new("lstat", Some(litfile_pointer), err)),
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EntryType {
@@ -678,17 +682,18 @@ impl From<FileType> for EntryType {
 
 #[derive(Debug)]
 pub(super) enum InitError {
+    Layout(LayoutError),
     Io(IoError),
+    Lockfile(LockfileError),
     // TODO: should this be UnsupportedFileType
     BadEntry { path: OsPath, entry: EntryType },
     Refs(RefError),
     LitFile(LitFileError),
-    Layout(LayoutError),
     MetadataDir(MetadataDirError),
     Config(ConfigFileError),
     OsPath(OsPathError),
     RepositoryFormat(RepositoryFormatError),
-    UnknownRefStorage(RefStorageError),
+    UnknownRefStorage(RefFormatError),
     UnknownObjectFormat(ObjectFormatError),
     HashMismatch,
     RefStorageMisMatch,
@@ -697,17 +702,22 @@ pub(super) enum InitError {
 impl Error for InitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Layout(source) => Some(source),
             Self::Io(source) => Some(source),
+            Self::Lockfile(source) => Some(source),
             Self::Refs(source) => Some(source),
             Self::LitFile(source) => Some(source),
-            Self::Layout(source) => Some(source),
             Self::MetadataDir(source) => Some(source),
             Self::Config(source) => Some(source),
             Self::OsPath(source) => Some(source),
             Self::RepositoryFormat(source) => Some(source),
             Self::UnknownRefStorage(source) => Some(source),
             Self::UnknownObjectFormat(source) => Some(source),
-            _ => None,
+            // don't try to use _ because if we add a new entry variant we would swallow it without
+            // knowing it
+            Self::BadEntry { .. } => None,
+            Self::HashMismatch => None,
+            Self::RefStorageMisMatch => None,
         }
     }
 }
@@ -715,9 +725,9 @@ impl Error for InitError {
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(_) => {
-                write!(f, "fs operation failed during initialization")
-            }
+            Self::Layout(_) => write!(f, "could not resolve repository layout"),
+            Self::Io(_) => write!(f, "fs operation failed during initialization"),
+            Self::Lockfile(_) => write!(f, "could not update repository metadata"),
             Self::BadEntry { path, entry } => {
                 write!(
                     f,
@@ -727,13 +737,10 @@ impl fmt::Display for InitError {
                 )
             }
             Self::Refs(_) => write!(f, "could not initialize repository refs"),
-            Self::LitFile(_) => {
-                write!(f, "could not process repository pointer")
-            }
-            Self::Layout(_) => write!(f, "could not resolve repository layout"),
+            Self::LitFile(_) => write!(f, "could not process repository pointer"),
             Self::MetadataDir(_) => write!(f, "could not prepare metadata directory"),
             Self::Config(_) => write!(f, "could not configure repository"),
-            Self::OsPath(_) => write!(f, "bad fs path"),
+            Self::OsPath(_) => write!(f, "bad path"),
             Self::RepositoryFormat(_) => write!(f, "could not determine repository format"),
             Self::UnknownRefStorage(_) => write!(f, "bad reference storage selection"),
             Self::UnknownObjectFormat(_) => write!(f, "bad object format selection"),
@@ -773,6 +780,12 @@ impl From<LitFileError> for InitError {
     }
 }
 
+impl From<LockfileError> for InitError {
+    fn from(err: LockfileError) -> Self {
+        Self::Lockfile(err)
+    }
+}
+
 impl From<RefError> for InitError {
     fn from(err: RefError) -> Self {
         Self::Refs(err)
@@ -803,8 +816,8 @@ impl From<ObjectFormatError> for InitError {
     }
 }
 
-impl From<RefStorageError> for InitError {
-    fn from(err: RefStorageError) -> Self {
+impl From<RefFormatError> for InitError {
+    fn from(err: RefFormatError) -> Self {
         Self::UnknownRefStorage(err)
     }
 }

@@ -117,7 +117,7 @@ impl fmt::Display for LitFileErrorKind {
             Self::MissingLineEnding => {
                 write!(f, "invalid litfile format: missing line ending")
             }
-            Self::OsPath(_) => write!(f, "bad fs path"),
+            Self::OsPath(_) => write!(f, "bad path"),
         }
     }
 }

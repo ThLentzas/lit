@@ -1,4 +1,4 @@
-use crate::repo::config::{ConfigFile, ConfigFileErrorKind};
+use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::parse::ParseError;
@@ -46,12 +46,9 @@ impl Signature {
         let name = match env::var("GIT_AUTHOR_NAME") {
             Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => cfg
-                    .get_str("author.name".as_ref())
-                    .or_else(|_| cfg.get_str("user.name".as_ref()))
-                    .map_err(|_| SignatureError::NotFound("author name"))?
-                    .into_owned(),
-                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotPresent => {
+                    get_with_fallback(cfg, "author.name", "user.name", "author name")?
+                }
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
                         var: "GIT_AUTHOR_NAME",
@@ -64,12 +61,9 @@ impl Signature {
         let email = match env::var("GIT_AUTHOR_EMAIL") {
             Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => cfg
-                    .get_str("author.email".as_ref())
-                    .or_else(|_| cfg.get_str("user.email".as_ref()))
-                    .map_err(|_| SignatureError::NotFound("author email"))?
-                    .into_owned(),
-                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotPresent => {
+                    get_with_fallback(cfg, "author.email", "user.email", "author email")?
+                }
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
                         var: "GIT_AUTHOR_EMAIL",
@@ -90,12 +84,9 @@ impl Signature {
         let name = match env::var("GIT_COMMITTER_NAME") {
             Ok(name) => name,
             Err(err) => match err {
-                VarError::NotPresent => cfg
-                    .get_str("committer.name".as_ref())
-                    .or_else(|_| cfg.get_str("user.name".as_ref()))
-                    .map_err(|_| SignatureError::NotFound("committer name"))?
-                    .into_owned(),
-                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotPresent => {
+                    get_with_fallback(cfg, "committer.name", "user.name", "commiter name")?
+                }
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
                         var: "GIT_COMMITTER_NAME",
@@ -107,12 +98,9 @@ impl Signature {
         let email = match env::var("GIT_COMMITTER_EMAIL") {
             Ok(email) => email,
             Err(err) => match err {
-                VarError::NotPresent => cfg
-                    .get_str("committer.email".as_ref())
-                    .or_else(|_| cfg.get_str("user.email".as_ref()))
-                    .map_err(|_| SignatureError::NotFound("committer email"))?
-                    .into_owned(),
-                // write!(f, "environment variable was not valid Unicode: {:?}", s)
+                VarError::NotPresent => {
+                    get_with_fallback(cfg, "committer.email", "user.email", "committer email")?
+                }
                 VarError::NotUnicode(s) => {
                     return Err(SignatureError::EnvNotUnicode {
                         var: "GIT_COMMITTER_EMAIL",
@@ -127,6 +115,28 @@ impl Signature {
             email,
             timestamp: Timestamp::now(),
         })
+    }
+}
+
+fn get_with_fallback(
+    cfg: &ConfigFile,
+    key: &'static str,
+    fallback: &'static str,
+    name: &'static str,
+) -> Result<String, SignatureError> {
+    let value = match cfg.get_str(key.as_ref()) {
+        Ok(name) => Some(name),
+        Err(err) if err.is_key_not_found() => None,
+        Err(err) => return Err(SignatureError::ConfigError(err)),
+    };
+
+    match value {
+        Some(value) => Ok(value),
+        None => match cfg.get_str(fallback.as_ref()) {
+            Ok(value) => Ok(value),
+            Err(err) if err.is_key_not_found() => Err(SignatureError::NotFound(name)),
+            Err(err) => Err(SignatureError::ConfigError(err)),
+        },
     }
 }
 
@@ -152,9 +162,9 @@ impl fmt::Display for ObjectType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             // when it is a literal we can write it directly without write!(f, "{}", "blob")
-            ObjectType::Blob => write!(f, "blob"),
-            ObjectType::Tree => write!(f, "tree"),
-            ObjectType::Commit => write!(f, "commit"),
+            Self::Blob => write!(f, "blob"),
+            Self::Tree => write!(f, "tree"),
+            Self::Commit => write!(f, "commit"),
         }
     }
 }
@@ -250,71 +260,38 @@ impl Object {
 pub(crate) enum SignatureError {
     NotFound(&'static str),
     EnvNotUnicode { var: &'static str, value: OsString },
-    ConfigError(ConfigFileErrorKind),
+    ConfigError(ConfigFileError),
 }
 
-impl From<ConfigFileErrorKind> for SignatureError {
-    fn from(err: ConfigFileErrorKind) -> Self {
+impl Error for SignatureError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::ConfigError(source) => Some(source),
+            Self::NotFound(_) => None,
+            Self::EnvNotUnicode { .. } => None,
+        }
+    }
+}
+
+impl fmt::Display for SignatureError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigError(_) => write!(f, "bad config"),
+            Self::NotFound(name) => write!(f, "{name} is not set"),
+            Self::EnvNotUnicode { var, value } => {
+                write!(
+                    f,
+                    "environment variable {var} was not valid Unicode: {value:?}",
+                )
+            }
+        }
+    }
+}
+
+impl From<ConfigFileError> for SignatureError {
+    fn from(err: ConfigFileError) -> Self {
         SignatureError::ConfigError(err)
     }
-}
-
-unsafe fn pair_to_u8_unchecked(buf: &[u8; 2]) -> u8 {
-    let first = to_base10_digit(buf[0]);
-    let second = to_base10_digit(buf[1]);
-    (first << 4) | second
-}
-
-fn pair_to_u8(buf: &[u8; 2]) -> Result<u8, HexError> {
-    let first = buf[0];
-    let second = buf[1];
-
-    if !is_hex_digit(first) {
-        return Err(HexError {
-            digit: first,
-            pos: 0,
-        });
-    }
-    if !is_hex_digit(second) {
-        return Err(HexError {
-            digit: second,
-            pos: 1,
-        });
-    }
-
-    let first = to_base10_digit(first);
-    let second = to_base10_digit(second);
-    // there are a lot of ways to write the conversion
-    // This is what we want: second * 16u8.pow(0) + first * 16u8.pow(1) but because 16^0 is always 0
-    // and 16^1 is always 16 we can write as follows first * 16 + second
-    //
-    // 1 byte = [4 high] [4 bits]
-    // because each hex digit is in the 0 - 15 range we can use exactly 4 bits
-    // 'af' -> 'a' = 10 = 1010, 'f' = 15 = 1111, 10101111
-    //
-    // 1011 are the high bits 1111 are the low bits
-    // first << 4 moves first into the high bits and the low bits of the number are all 0s
-    // 'a' as u8 is written as 00001011 with extra padding, shifting 10110000
-    // next we want to set 'f' to the low bits, we use OR
-    // a OR 0 = a
-    // 'f' in u8 is 00001111 so the high bits of 'a' are ORed with 0 so they stay as is and the low
-    // bits of 'a' are 0s which are ORed with the low bits of 'f' and become 'f'
-    Ok((first << 4) | second)
-}
-
-fn to_base10_digit(byte: u8) -> u8 {
-    if byte.is_ascii_digit() {
-        byte - b'0'
-    } else {
-        byte - b'a' + 10
-    }
-}
-
-// we can't use the is_ascii_hex() from std because it includes the capital case letters and Git
-// writes the hash always using lower case letters. Even if they are same in some sense, we have to
-// stay case-sensitive because they produce different hashes when it comes to storing commits.
-pub(crate) fn is_hex_digit(byte: u8) -> bool {
-    matches!(byte, b'0'..=b'9' | b'a'..=b'f')
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -324,6 +301,7 @@ pub(crate) enum OidError {
 }
 
 impl Error for OidError {}
+
 impl fmt::Display for OidError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

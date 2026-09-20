@@ -9,7 +9,7 @@ use std::path::{Component, Path};
 // the set of paths certain commands should operate on
 #[derive(Debug)]
 pub(crate) struct Pathspec {
-    pub(crate) original: OsString,
+    original: OsString,
     pub(crate) pattern: RepoPath,
 }
 
@@ -45,7 +45,7 @@ impl Pathspec {
         let path = if normalized.is_absolute() {
             normalized.strip_prefix(root)?
         } else {
-            normalized.as_path()
+            normalized.as_ref()
         };
 
         let mut pattern = RepoPath::new();
@@ -64,10 +64,7 @@ impl Pathspec {
                 }
                 Component::Normal(name) => {
                     if name == ".lit" {
-                        return Err(PathspecError::ReservedComponent {
-                            path: cli_path,
-                            component: name.to_os_string(),
-                        });
+                        return Err(PathspecError::ReservedComponent { path: cli_path });
                     }
                     pattern = pattern.join_unchecked(name);
                 }
@@ -85,27 +82,34 @@ impl Pathspec {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PathspecError {
     OutsideRepository { path: OsPath },
-    ReservedComponent { path: OsPath, component: OsString },
+    ReservedComponent { path: OsPath },
     OsPath(OsPathError),
 }
 
-impl Error for PathspecError {}
+impl Error for PathspecError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::OsPath(source) => Some(source),
+            Self::OutsideRepository { .. } => None,
+            Self::ReservedComponent { .. } => None,
+        }
+    }
+}
 
 impl fmt::Display for PathspecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            PathspecError::OsPath(_) => write!(f, "bad path"),
             PathspecError::OutsideRepository { path } => {
                 write!(f, "path '{}' is outside the repository", path.display())
             }
-            PathspecError::ReservedComponent { path, component } => {
+            PathspecError::ReservedComponent { path } => {
                 write!(
                     f,
-                    "path '{}' contains reserved component '{}'",
+                    "path '{}' contains reserved component '.lit'",
                     path.display(),
-                    component.to_string_lossy()
                 )
             }
-            PathspecError::OsPath(err) => write!(f, "{err}"),
         }
     }
 }

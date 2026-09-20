@@ -3,12 +3,11 @@ mod parse;
 use crate::repo::index::parse::Parser;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
-use crate::repo::os::FileStat;
-use crate::repo::repo_path::{RepoPathError, RepoPath};
+use crate::repo::os::{FileStat, IoError, OsPath};
+use crate::repo::repo_path::{RepoPath, RepoPathError};
 use sha1::{Digest, Sha1};
 use std::error::Error;
 use std::io;
-use std::path::PathBuf;
 use std::{fmt, fs};
 
 // git has multiple versions(2, 3, 4) for the index format
@@ -148,14 +147,14 @@ impl IndexEntry {
 pub(crate) struct Index {
     // TODO: on the rewrite test if a BTreeMap could work
     pub(crate) entries: Vec<IndexEntry>,
-    pub(crate) path: PathBuf,
+    pub(crate) path: OsPath,
     // a flag that is used to not unnecessary write if no changes detected
     pub(crate) modified: bool,
 }
 
 // .lit/index is created lazily on the first write
 impl Index {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    pub(crate) fn new(path: OsPath) -> Self {
         Self {
             path,
             entries: Vec::new(),
@@ -278,10 +277,11 @@ impl Index {
                 return Ok(());
             }
             Err(err) => {
-                return Err(IndexError::Io {
-                    path: self.path.clone(),
-                    source: err,
-                });
+                return Err(IndexError::Io(IoError::new(
+                    "read",
+                    Some(self.path.clone()),
+                    err,
+                )));
             }
         };
 
@@ -422,7 +422,7 @@ pub(crate) enum IndexError {
     InvalidChecksum,
     UnsupportedVersion(u32),
     InvalidFormat(FormatError),
-    Io { path: PathBuf, source: io::Error },
+    Io(IoError),
 }
 
 impl IndexError {
@@ -436,21 +436,28 @@ impl IndexError {
     }
 }
 
-impl Error for IndexError {}
+impl Error for IndexError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidFormat(source) => Some(source),
+            Self::Io(source) => Some(source),
+            Self::InvalidChecksum => None,
+            Self::UnsupportedVersion(_) => None,
+        }
+    }
+}
 
 // errors that have IndexError as a variant will include a generic error message and not carry the
 // actual format error since the user can't do anything if the format is broken
 impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IndexError::InvalidChecksum => write!(f, "invalid index checksum"),
-            IndexError::UnsupportedVersion(version) => {
+            Self::InvalidChecksum => write!(f, "invalid index checksum"),
+            Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported index version {version}")
             }
-            IndexError::InvalidFormat(err) => write!(f, "{err}"),
-            IndexError::Io { path, source } => {
-                write!(f, "{}: {source}", path.display())
-            }
+            Self::InvalidFormat(err) => write!(f, "{err}"),
+            Self::Io(_) => write!(f, "index I/O failed"),
         }
     }
 }
@@ -472,25 +479,25 @@ pub(crate) enum FormatErrorKind {
 impl fmt::Display for FormatErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FormatErrorKind::UnexpectedEof { needed, remaining } => {
+            Self::UnexpectedEof { needed, remaining } => {
                 write!(
                     f,
                     "unexpected end of file: needed {needed} bytes, only {remaining} remaining"
                 )
             }
-            FormatErrorKind::InvalidSignature => write!(f, "invalid index signature"),
-            FormatErrorKind::EntriesOutOfSorted => write!(f, "index entries are out of order"),
-            FormatErrorKind::InvalidMode(mode) => write!(f, "invalid index entry mode {mode:#o}"),
-            FormatErrorKind::InvalidNanoseconds => write!(f, "invalid nanosecond value"),
-            FormatErrorKind::MissingNulTerminator => write!(f, "missing NUL terminator"),
-            FormatErrorKind::InvalidPadding => write!(f, "invalid index entry padding"),
-            FormatErrorKind::LongPathLenMisMatch => {
+            Self::InvalidSignature => write!(f, "invalid index signature"),
+            Self::EntriesOutOfSorted => write!(f, "index entries are out of order"),
+            Self::InvalidMode(mode) => write!(f, "invalid index entry mode {mode:#o}"),
+            Self::InvalidNanoseconds => write!(f, "invalid nanosecond value"),
+            Self::MissingNulTerminator => write!(f, "missing NUL terminator"),
+            Self::InvalidPadding => write!(f, "invalid index entry padding"),
+            Self::LongPathLenMisMatch => {
                 write!(f, "path length does not match the index flags")
             }
-            FormatErrorKind::InvalidPathSyntax(err) => {
+            Self::InvalidPathSyntax(err) => {
                 write!(f, "invalid index path: {err}")
             }
-            FormatErrorKind::TrailingData { remaining } => {
+            Self::TrailingData { remaining } => {
                 write!(f, "unexpected trailing data: {remaining} bytes remaining")
             }
         }
@@ -519,6 +526,6 @@ impl fmt::Display for FormatError {
 
 impl From<FormatError> for IndexError {
     fn from(err: FormatError) -> Self {
-        IndexError::InvalidFormat(err)
+        Self::InvalidFormat(err)
     }
 }

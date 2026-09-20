@@ -1,8 +1,8 @@
+use crate::repo::os::{IoError, IoErrorContext, OsPath};
 use std::error::Error;
-use std::{fmt, fs, io};
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::{fmt, result};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 
 // https://git-scm.com/docs/api-lockfile
 // Lockfile guarantees mutual exclusion, atomic updates and cleanup of the tmp files in case of an
@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 // TODO:  explain why not some OS level lock
 pub(crate) struct Lockfile {
     // the path to the file we want to write to
-    pub(super) file_path: PathBuf,
+    pub(super) file_path: OsPath,
     // the path to <filename>.lock
-    pub(super) lock_path: PathBuf,
+    pub(super) lock_path: OsPath,
     // the open handle to the .lock file.
     // Option<File> rather than File solely as an implementation detail: Drop::drop requires all
     // fields to remain valid, and we need to move the file out during commit to close it before the
@@ -45,10 +45,8 @@ impl Lockfile {
     // returns Ok(Some(()) when it successfully acquires the lock
     // returns Ok(None) if it fails to acquire the lock
     // returns Err for any Io
-    pub(crate) fn acquire(path: &Path) -> Result<Lockfile, LockfileError> {
-        let file_path = path.to_path_buf();
-        let lock_path = PathBuf::from(format!("{}.lock", file_path.display()));
-
+    pub(crate) fn acquire(path: &OsPath) -> Result<Lockfile> {
+        let lock_path = path.with_suffix_unchecked(".lock");
         // a naive implementation would be if !path.exists() then create but this causes Time of
         // check Time of Use issues. Two processes can perform the check before either proceeds and
         // would try to create the same file twice. https://doc.rust-lang.org/std/fs/
@@ -59,33 +57,35 @@ impl Lockfile {
             .open(&lock_path)
         {
             Ok(file) => Ok(Lockfile {
-                file_path,
+                file_path: path.clone(),
                 lock_path,
                 file: Some(file),
                 committed: false,
             }),
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                Err(LockfileError::LockDenied { path: lock_path })
+                Err(LockfileError::LockDenied(lock_path))
             }
-            Err(err) => Err(LockfileError::Io {
-                path: lock_path,
-                source: err,
-            }),
+            Err(err) => Err(LockfileError::Io(IoError::new(
+                "open",
+                Some(lock_path),
+                err,
+            ))),
         }
     }
 
     // TODO: the current impl of write creates an allocation where the caller invokes serialize()
     //  which returns a Vec<u8> and that is passed to write(). Can we do better? Can we make Lockfile
     //  impl Write?
-    pub(crate) fn write(&mut self, content: &[u8]) -> Result<(), LockfileError> {
+    pub(crate) fn write(&mut self, content: &[u8]) -> Result<()> {
         // safe to call unwrap because file is None only when commit() returns
         let file = self.file.as_mut().unwrap();
         match file.write_all(content) {
             Ok(_) => Ok(()),
-            Err(err) => Err(LockfileError::Io {
-                path: self.lock_path.clone(),
-                source: err,
-            }),
+            Err(err) => Err(LockfileError::Io(IoError::new(
+                "write",
+                Some(&self.lock_path),
+                err,
+            ))),
         }
     }
 
@@ -98,7 +98,7 @@ impl Lockfile {
     //
     // we consume self because once we commit the changes Lockfile is no longer needed. It's a one
     // time use. We try to enforce it via the type system
-    pub(crate) fn commit(mut self) -> Result<(), LockfileError> {
+    pub(crate) fn commit(mut self) -> Result<()> {
         let file = self.file.take().unwrap();
         // sync_all() does not close the file, we can still call file.write_all()
         //
@@ -111,20 +111,18 @@ impl Lockfile {
         // Depending on the OS, some platforms might not allow renaming in open files, so we make
         // sure the file is closed before calling rename(). Note we don't call drop on self(Lockfile)
         // but in the <filename>.lock field of self. We can still access lock_path and file_path
-        file.sync_all().map_err(|err| LockfileError::Io {
-            path: self.lock_path.clone(),
-            source: err,
-        })?;
+        file.sync_all()
+            .with_context("fsync", Some(&self.lock_path))?;
         drop(file);
-        fs::rename(&self.lock_path, &self.file_path).map_err(|err| LockfileError::Io {
-            path: self.file_path.clone(),
-            source: err,
-        })?;
+        fs::rename(&self.lock_path, &self.file_path)
+            .with_context("rename", Some(&self.file_path))?;
         self.committed = true;
 
         Ok(())
     }
 }
+
+type Result<T> = result::Result<T, LockfileError>;
 
 // Lockfile dropped without calling commit() (early return, panic, etc.).file is still Some, rename
 // was never called, the tmp file was never deleted, and we have to do the cleanup in Drop. An approach
@@ -143,19 +141,30 @@ impl Drop for Lockfile {
 
 #[derive(Debug)]
 pub(crate) enum LockfileError {
-    Io { path: PathBuf, source: io::Error },
-    LockDenied { path: PathBuf },
+    Io(IoError),
+    LockDenied(OsPath),
 }
 
-impl Error for LockfileError {}
+impl From<IoError> for LockfileError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl Error for LockfileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(source) => Some(source),
+            Self::LockDenied(_) => None,
+        }
+    }
+}
 
 impl fmt::Display for LockfileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LockfileError::Io { path, source } => {
-                write!(f, "{}: {}", path.display(), source)
-            }
-            LockfileError::LockDenied { path } => {
+            Self::Io(_) => write!(f, "lockfile I/O failed"),
+            Self::LockDenied(path) => {
                 write!(f, "could not acquire lock on {}", path.display())
             }
         }

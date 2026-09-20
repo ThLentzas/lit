@@ -36,3 +36,5 @@ fn main() {
 // TODO: should we do a warn!() macro?
 // TODO: No1 priority is to fix the os_str to bytes conversions, look at resolve_object_format()
 //  in init.rs::execute() and the signature logic
+// TODO: review every single Display impl that prints path, bytes etc to have 1 universal logic
+//  know it is mixed, path.display(), ReadableBytes and escape_ascii()

@@ -1,9 +1,9 @@
 use crate::repo::os;
-use crate::repo::os::{FileKind, OsPath, StatNode};
+use crate::repo::os::{FileKind, IoError, IoErrorContext, OsPath, StatNode};
 use crate::repo::repo_path::RepoPath;
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::{env, fmt, fs, io};
+use std::{env, fmt, fs};
 
 // root relative path -> fs calls
 //
@@ -11,7 +11,7 @@ use std::{env, fmt, fs, io};
 // etc. The syscalls though need absolute paths, Workspace is responsible for doing this translation
 // It is the working tree viewed from the repo root.
 pub(crate) struct Workspace {
-    pub(crate) root: PathBuf,
+    pub(crate) root: OsPath,
 }
 
 impl Workspace {
@@ -26,9 +26,10 @@ impl Workspace {
     //
     // we need the prefix to later compute repo relative paths
     // if cwd is root then prefix is an empty path
+    // it returns a PathBuf because prefix can be empty and OsPath cannot
+    // read OsPath::strip_prefix()
     pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
-        let cwd =
-            env::current_dir().map_err(WorkspaceError::CurrentDirUnavailable)?;
+        let cwd = env::current_dir().with_context::<&Path>("getcwd", None)?;
 
         let cwd = OsPath::new_unchecked(cwd);
         // can't return &Path because cwd is local
@@ -38,29 +39,21 @@ impl Workspace {
     }
 
     // returns the target's path
-    pub(crate) fn read_link(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
-        let absolute = self.to_absolute(path)?;
-        let path = fs::read_link(&absolute).map_err(|err| WorkspaceError::Io {
-            path: absolute,
-            source: err,
-        })?;
-
-        Ok(path.as_os_str().as_encoded_bytes().to_vec())
+    pub(crate) fn read_link(&self, path: &RepoPath) -> Result<Vec<u8>, IoError> {
+        let absolute = self.to_absolute(path);
+        let path = fs::read_link(&absolute).with_context("readlink", Some(absolute))?;
+        Ok(os::os_str_as_bytes(path.as_os_str()).to_vec())
     }
 
-    pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, WorkspaceError> {
-        let absolute = self.to_absolute(path)?;
+    pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, IoError> {
+        let absolute = self.to_absolute(path);
 
-        fs::read(&absolute).map_err(|err| WorkspaceError::Io {
-            path: absolute,
-            source: err,
-        })
+        fs::read(&absolute).with_context("read", Some(&absolute))
     }
 
-    pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, WorkspaceError> {
-        let absolute = self.to_absolute(path)?;
-
-        Ok(os::stat(&absolute)?)
+    pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, IoError> {
+        let absolute = self.to_absolute(path);
+        os::stat(&absolute)
     }
 
     // returns all entries of a directory pointed by the path, a list of all entries that live under
@@ -68,16 +61,11 @@ impl Workspace {
     pub(crate) fn dir_entries(
         &self,
         path: &RepoPath,
-    ) -> Result<Vec<(RepoPath, StatNode)>, WorkspaceError> {
-        let absolute = self.to_absolute(path)?;
+    ) -> Result<Vec<(RepoPath, StatNode)>, IoError> {
+        let absolute = self.to_absolute(path);
         let read_dir = match fs::read_dir(&absolute) {
             Ok(read_dir) => read_dir,
-            Err(err) => {
-                return Err(WorkspaceError::Io {
-                    path: absolute,
-                    source: err,
-                });
-            }
+            Err(err) => return Err(IoError::new("opendir", Some(&absolute), err)),
         };
 
         let mut entries = Vec::new();
@@ -91,12 +79,7 @@ impl Workspace {
             // genuinely the most precise path available.
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(err) => {
-                    return Err(WorkspaceError::Io {
-                        path: absolute,
-                        source: err,
-                    });
-                }
+                Err(err) => return Err(IoError::new("opendir", Some(&absolute), err)),
             };
             let name = entry.file_name();
             // TODO: remove .git and add .litignore
@@ -135,42 +118,40 @@ impl Workspace {
         }
     }
 
-    fn to_absolute(&self, path: &RepoPath) -> Result<PathBuf, WorkspaceError> {
-        Ok(self.root.join(os::bytes_to_path(path.as_bytes())?))
+    fn to_absolute(&self, path: &RepoPath) -> OsPath {
+        self.root
+            .join_unchecked(os::os_str_from_bytes(path.as_bytes()))
     }
 }
 
 #[derive(Debug)]
 pub(crate) enum WorkspaceError {
-    CurrentDirUnavailable(io::Error),
-    Io { path: PathBuf, source: io::Error },
+    Io(IoError),
     OutsideRepository { path: OsPath },
-    Os(OsError),
 }
 
-impl Error for WorkspaceError {}
+impl Error for WorkspaceError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(source) => Some(source),
+            Self::OutsideRepository { .. } => None,
+        }
+    }
+}
 
 impl fmt::Display for WorkspaceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WorkspaceError::CurrentDirUnavailable(err) => {
-                write!(f, "could not determine current directory: {err}")
-            }
-            WorkspaceError::Io { path, source } => {
-                write!(f, "{}: {source}", path.display())
-            }
-            WorkspaceError::OutsideRepository { path } => {
+            Self::Io(_) => write!(f, "workspace I/O failed"),
+            Self::OutsideRepository { path } => {
                 write!(f, "path '{}' is outside the repository", path.display())
-            }
-            WorkspaceError::Os(err) => {
-                write!(f, "{err}")
             }
         }
     }
 }
 
-impl From<OsError> for WorkspaceError {
-    fn from(err: OsError) -> Self {
-        WorkspaceError::Os(err)
+impl From<IoError> for WorkspaceError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
     }
 }

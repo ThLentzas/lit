@@ -1,14 +1,12 @@
 use std::cmp::PartialEq;
 // TODO: if repo/mod.rs ends up being not too big we could move the logic there?
 //  check the visibility of what gets exposed and where
-use crate::repo::config::{ConfigFile, ConfigFileErrorKind, Value, VariableEntry};
-use clap::{Args, ValueEnum};
+use crate::repo::config::{ConfigFile, ConfigFileError, Value, VariableEntry};
+use clap::ValueEnum;
 use memchr::memmem;
 use std::error::Error;
 use std::fmt;
 
-// TODO: we need to search more on why the config read is enough to determine the repo version and
-//  consider it valid. We never walk directories to determine the actual Hash used for reinit etch???
 // Note: all extension names, even the unknown ones, are guaranteed to be valid Strings. Specifically
 // each is restricted to ASCII alphanum characters and '-' since these are config-file variables
 // names and the parser accepts only that character set
@@ -42,6 +40,8 @@ impl Extension {
             Extension::RefStorage => "refStorage",
             Extension::RelativeWorktrees => "relativeWorktrees",
             Extension::SubmodulePathConfig => "submodulePathConfig",
+            // TODO: this should probably change to unreachable!() because we should never call
+            //  .name() for unknown.
             Extension::Unknown => "unknown",
         }
     }
@@ -57,27 +57,26 @@ impl Extension {
                 | Extension::Unknown
         )
     }
-}
 
-impl From<&[u8]> for Extension {
-    fn from(value: &[u8]) -> Extension {
-        match value {
+    // https://doc.rust-lang.org/std/convert/trait.From.html#when-to-implement-from
+    fn from_bytes(bytes: &[u8]) -> Self {
+        match bytes {
             // v0
-            value if value.eq_ignore_ascii_case(b"noop") => Extension::Noop,
-            value if value.eq_ignore_ascii_case(b"preciousObjects") => Extension::PreciousObjects,
-            value if value.eq_ignore_ascii_case(b"partialClone") => Extension::PartialClone,
-            value if value.eq_ignore_ascii_case(b"worktreeConfig") => Extension::WorktreeConfig,
+            bytes if bytes.eq_ignore_ascii_case(b"noop") => Extension::Noop,
+            bytes if bytes.eq_ignore_ascii_case(b"preciousObjects") => Extension::PreciousObjects,
+            bytes if bytes.eq_ignore_ascii_case(b"partialClone") => Extension::PartialClone,
+            bytes if bytes.eq_ignore_ascii_case(b"worktreeConfig") => Extension::WorktreeConfig,
             // v1
-            value if value.eq_ignore_ascii_case(b"noop-v1") => Extension::NoopV1,
-            value if value.eq_ignore_ascii_case(b"objectFormat") => Extension::ObjectFormat,
-            value if value.eq_ignore_ascii_case(b"compatObjectFormat") => {
+            bytes if bytes.eq_ignore_ascii_case(b"noop-v1") => Extension::NoopV1,
+            bytes if bytes.eq_ignore_ascii_case(b"objectFormat") => Extension::ObjectFormat,
+            bytes if bytes.eq_ignore_ascii_case(b"compatObjectFormat") => {
                 Extension::CompatObjectFormat
             }
-            value if value.eq_ignore_ascii_case(b"refStorage") => Extension::RefStorage,
-            value if value.eq_ignore_ascii_case(b"relativeWorktrees") => {
+            bytes if bytes.eq_ignore_ascii_case(b"refStorage") => Extension::RefStorage,
+            bytes if bytes.eq_ignore_ascii_case(b"relativeWorktrees") => {
                 Extension::RelativeWorktrees
             }
-            value if value.eq_ignore_ascii_case(b"submodulePathConfig") => {
+            bytes if bytes.eq_ignore_ascii_case(b"submodulePathConfig") => {
                 Extension::SubmodulePathConfig
             }
             _ => Extension::Unknown,
@@ -176,8 +175,10 @@ impl Default for RefStorage {
     }
 }
 
+// TODO: should this be from_bytes() and drop TryFrom?
+//  https://doc.rust-lang.org/std/convert/trait.From.html#when-to-implement-from
 impl TryFrom<&[u8]> for RefStorage {
-    type Error = RefStorageError;
+    type Error = RefFormatError;
 
     // the URI has the form <format>://<payload>
     // https://git-scm.com/docs/git-config#Documentation/git-config.txt-refStorage
@@ -194,7 +195,7 @@ impl TryFrom<&[u8]> for RefStorage {
             }
             None => (value, None),
         };
-        let ref_format = RefFormat::try_from(backend).map_err(|err| RefStorageError(err))?;
+        let ref_format = RefFormat::try_from(backend)?;
         Ok(Self {
             ref_format,
             payload: payload.map(|p| p.to_vec()),
@@ -255,14 +256,14 @@ impl RepositoryFormat {
     // Determines the repo format based on config. If no `core.repositoryformatversion` is set we
     // let the caller handle it but the extension entries are not read.
     // from_config() guarantees:
-    //  1. any unknown v1 extensions are rejected
-    //  2. unrecognizable values for known extensions are rejected
-    //  3. if compatObjectFormat is set, it never clashes with object format(primary hash is always
+    //  - any unknown v1 extensions are rejected
+    //  - unrecognizable values for known extensions are rejected
+    //  - if compatObjectFormat is set, it never clashes with object format(primary hash is always
     //  different from compatibility hash).
     pub(crate) fn from_config(cfg: &ConfigFile) -> Result<Option<Self>, RepositoryFormatError> {
         let version = match cfg.get_int("core.repositoryformatversion".as_ref()) {
-            Ok(None) => return Ok(None),
-            Ok(Some(version)) => FormatVersion::try_from(version)?,
+            Ok(version) => FormatVersion::try_from(version)?,
+            Err(err) if err.is_key_not_found() => return Ok(None),
             Err(err) => return Err(RepositoryFormatError::Config(err)),
         };
         let mut format = RepositoryFormat::with_version(version);
@@ -272,7 +273,8 @@ impl RepositoryFormat {
                 format.apply_extension(entry)?;
             }
         }
-        // TODO: if version is v1 with no extensions Git says that it should have been v0 instead
+        // TODO: if version is v1 with no extensions Git says that it should have been v0 instead,
+        //  should we warn?
         if let Some(compat_obj_fmt) = &format.compat_object_format {
             if *compat_obj_fmt == format.object_format {
                 return Err(RepositoryFormatError::SamePrimaryAndCompatObjectFormat(
@@ -300,12 +302,12 @@ impl RepositoryFormat {
         &mut self.object_format
     }
 
-    pub(crate) fn ref_storage_mut(&mut self) -> &mut RefStorage {
-        &mut self.ref_storage
-    }
-
     pub(crate) fn ref_storage(&self) -> &RefStorage {
         &self.ref_storage
+    }
+
+    pub(crate) fn ref_storage_mut(&mut self) -> &mut RefStorage {
+        &mut self.ref_storage
     }
 
     fn with_version(version: FormatVersion) -> Self {
@@ -337,7 +339,7 @@ impl RepositoryFormat {
         &mut self,
         entry: VariableEntry<'_>,
     ) -> Result<(), RepositoryFormatError> {
-        let extension = Extension::from(entry.name());
+        let extension = Extension::from_bytes(entry.name());
 
         if !extension.is_v0_compatible() {
             return Err(RepositoryFormatError::V1ExtensionInV0(extension));
@@ -350,7 +352,7 @@ impl RepositoryFormat {
         &mut self,
         entry: VariableEntry<'_>,
     ) -> Result<(), RepositoryFormatError> {
-        let extension = Extension::from(entry.name());
+        let extension = Extension::from_bytes(entry.name());
 
         match extension {
             // all v0 extensions are treated the same by v1, apart from unknown
@@ -406,7 +408,11 @@ impl RepositoryFormat {
                     .to_bool()
                     .ok_or(RepositoryFormatError::UnknownExtensionValue(extension))?;
             }
-            Extension::Unknown => return Err(RepositoryFormatError::UnknownV1Extension(extension)),
+            Extension::Unknown => {
+                return Err(RepositoryFormatError::UnknownV1Extension(
+                    entry.name().to_vec(),
+                ));
+            }
         }
         Ok(())
     }
@@ -415,7 +421,7 @@ impl RepositoryFormat {
         &mut self,
         entry: VariableEntry<'_>,
     ) -> Result<(), RepositoryFormatError> {
-        let extension = Extension::from(entry.name());
+        let extension = Extension::from_bytes(entry.name());
 
         match extension {
             Extension::PreciousObjects => {
@@ -498,93 +504,93 @@ impl fmt::Display for RefFormatError {
 }
 
 #[derive(Debug)]
-// unknown backend
-pub(crate) struct RefStorageError(pub(crate) RefFormatError);
-
-impl Error for RefStorageError {}
-
-impl fmt::Display for RefStorageError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // TODO: check if we need to use our ReadableByte, we probably should because config values
-        //  are arbitrary byte sequences(double check cfg parser)
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug)]
 pub(crate) enum RepositoryFormatError {
-    Config(ConfigFileErrorKind),
+    Config(ConfigFileError),
     UnsupportedVersion(FormatVersionError),
     V1ExtensionInV0(Extension),
     // a value that Git does not recognize
     UnknownExtensionValue(Extension),
-    UnknownV1Extension(Extension),
+    UnknownV1Extension(Vec<u8>),
     // returned by bad object format or compat object format extension values
     ObjectFormat {
         extension: Extension,
         source: ObjectFormatError,
     },
-    RefStorage(RefStorageError),
+    RefStorage(RefFormatError),
     DuplicateCompatObjectFormatExtension,
     // hash algo of object format is the same as the compatibility one
     SamePrimaryAndCompatObjectFormat(ObjectFormat),
 }
 
-impl Error for RepositoryFormatError {}
+impl Error for RepositoryFormatError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(source) => Some(source),
+            Self::UnsupportedVersion(source) => Some(source),
+            Self::V1ExtensionInV0(_) => None,
+            Self::UnknownExtensionValue(_) => None,
+            Self::UnknownV1Extension(_) => None,
+            Self::ObjectFormat { source, .. } => Some(source),
+            Self::RefStorage(source) => Some(source),
+            Self::DuplicateCompatObjectFormatExtension => None,
+            Self::SamePrimaryAndCompatObjectFormat(_) => None,
+        }
+    }
+}
 
 impl fmt::Display for RepositoryFormatError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            RepositoryFormatError::Config(source) => write!(f, "{source}"),
-            RepositoryFormatError::UnsupportedVersion(source) => write!(f, "{source}"),
-            RepositoryFormatError::V1ExtensionInV0(extension) => {
+            Self::Config(_) => {
+                write!(f, "could not repository format configuration")
+            }
+            Self::UnsupportedVersion(_) => {
+                write!(f, "unsupported value for 'core.repositoryformatversion'")
+            }
+            Self::V1ExtensionInV0(extension) => {
                 write!(
                     f,
                     "extension 'extensions.{}' requires format version 1 but the repository uses v0",
                     extension.name()
                 )
             }
-            RepositoryFormatError::UnknownV1Extension(extension) => {
-                write!(
-                    f,
-                    "unknown extension 'extensions.{}' in repository format version 1",
-                    extension.name()
-                )
-            }
-            RepositoryFormatError::ObjectFormat { extension, source } => {
-                write!(
-                    f,
-                    "invalid value for 'extensions.{}': {source}",
-                    extension.name()
-                )
-            }
-            RepositoryFormatError::RefStorage(source) => write!(f, "{source}"),
-            RepositoryFormatError::DuplicateCompatObjectFormatExtension => {
-                write!(
-                    f,
-                    "'extensions.compatObjectFormat' must not be specified more than once"
-                )
-            }
-            RepositoryFormatError::SamePrimaryAndCompatObjectFormat(format) => {
-                write!(
-                    f,
-                    "'extensions.compatObjectFormat' must differ from 'extensions.objectFormat'. Both were: {}",
-                    format.name()
-                )
-            }
-            RepositoryFormatError::UnknownExtensionValue(extension) => {
+            Self::UnknownExtensionValue(extension) => {
                 write!(
                     f,
                     "unknown extension value for 'extensions.{}'",
                     extension.name()
                 )
             }
+            Self::UnknownV1Extension(name) => {
+                write!(
+                    f,
+                    "unknown extension 'extensions.{}' in repository format version 1",
+                    name.escape_ascii()
+                )
+            }
+            Self::ObjectFormat { extension, .. } => {
+                write!(f, "invalid value for 'extensions.{}'", extension.name())
+            }
+            Self::RefStorage(_) => write!(f, ""),
+            Self::DuplicateCompatObjectFormatExtension => {
+                write!(
+                    f,
+                    "'extensions.compatObjectFormat' must not be specified more than once"
+                )
+            }
+            Self::SamePrimaryAndCompatObjectFormat(format) => {
+                write!(
+                    f,
+                    "'extensions.compatObjectFormat' must differ from 'extensions.objectFormat', both use: '{}'",
+                    format.name()
+                )
+            }
         }
     }
 }
 
-impl From<ConfigFileErrorKind> for RepositoryFormatError {
-    fn from(err: ConfigFileErrorKind) -> Self {
+impl From<ConfigFileError> for RepositoryFormatError {
+    fn from(err: ConfigFileError) -> Self {
         Self::Config(err)
     }
 }
@@ -595,8 +601,8 @@ impl From<FormatVersionError> for RepositoryFormatError {
     }
 }
 
-impl From<RefStorageError> for RepositoryFormatError {
-    fn from(err: RefStorageError) -> Self {
+impl From<RefFormatError> for RepositoryFormatError {
+    fn from(err: RefFormatError) -> Self {
         Self::RefStorage(err)
     }
 }

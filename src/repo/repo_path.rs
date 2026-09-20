@@ -1,3 +1,4 @@
+use crate::cmd::print::ReadableBytes;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -32,7 +33,7 @@ impl RepoPath {
         check_bytes(bytes)?;
         let mut inner = Vec::with_capacity(bytes.len());
         inner.extend_from_slice(bytes);
-        
+
         Ok(RepoPath { inner })
     }
 
@@ -45,7 +46,7 @@ impl RepoPath {
 
     pub(super) fn join_unchecked<P: AsRef<Path>>(&self, path: P) -> Self {
         let path = path.as_ref().as_os_str().as_encoded_bytes();
-        
+
         let mut inner = Vec::with_capacity(self.inner.len() + 1 + path.len());
         inner.extend_from_slice(&self.inner);
         if !self.inner.is_empty() {
@@ -58,7 +59,7 @@ impl RepoPath {
 
     pub(super) fn join_bytes(&self, bytes: &[u8]) -> Result<Self, RepoPathError> {
         check_bytes(bytes)?;
-        
+
         Ok(self.join_bytes_unchecked(bytes))
     }
 
@@ -72,7 +73,6 @@ impl RepoPath {
 
         RepoPath { inner }
     }
-
 
     pub(super) fn len(&self) -> usize {
         self.inner.len()
@@ -102,8 +102,8 @@ impl RepoPath {
         self.inner.split(|&byte| byte == b'/')
     }
 
-    pub(crate) fn display(&self,) -> String {
-       String::from_utf8_lossy(&self.inner).to_string()
+    pub(crate) fn display(&self) -> String {
+        String::from_utf8_lossy(&self.inner).to_string()
     }
 }
 
@@ -155,10 +155,9 @@ fn check_bytes(bytes: &[u8]) -> Result<(), RepoPathError> {
             });
         }
     }
-    
+
     Ok(())
 }
-
 
 #[derive(Debug)]
 pub(super) enum RepoPathErrorKind {
@@ -181,19 +180,20 @@ impl Error for RepoPathError {}
 
 impl fmt::Display for RepoPathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // TODO: review if printing the path should use ReadableBytes or print.rs::stdout_path_bytes
+        let path = ReadableBytes(&self.path);
+
         match &self.kind {
             RepoPathErrorKind::Empty => write!(f, "path is empty"),
-            RepoPathErrorKind::LeadingSlash => write!(f, "path '{:?}' begins with '/'", self.path),
-            RepoPathErrorKind::TrailingSlash => write!(f, "path '{:?}' ends with '/'", self.path),
+            RepoPathErrorKind::LeadingSlash => write!(f, "path '{path}' begins with '/'"),
+            RepoPathErrorKind::TrailingSlash => write!(f, "path '{path}' ends with '/'"),
             RepoPathErrorKind::EmptyComponent => {
-                write!(f, "path '{:?}' contains an empty component", self.path)
+                write!(f, "path '{path}' contains an empty component")
             }
             RepoPathErrorKind::ReservedComponent => {
-                write!(f, "path '{:?}' contains a reserved component", self.path)
+                write!(f, "path '{path}' contains a reserved component")
             }
-            RepoPathErrorKind::ContainsNul => {
-                write!(f, "path '{:?}' contains a NUL byte", self.path)
-            }
+            RepoPathErrorKind::ContainsNul => write!(f, "path '{path}' contains a NUL byte"),
         }
     }
 }
