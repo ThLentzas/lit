@@ -10,11 +10,18 @@ use std::{env, fmt, fs};
 // our internal language is root relative paths, that's what the index stores, what pathspec match
 // etc. The syscalls though need absolute paths, Workspace is responsible for doing this translation
 // It is the working tree viewed from the repo root.
-pub(crate) struct Workspace {
-    pub(crate) root: OsPath,
+pub(crate) struct Workspace<'repo> {
+    // root of the working tree
+    root: &'repo OsPath,
 }
 
-impl Workspace {
+impl<'repo> Workspace<'repo> {
+    pub(super) fn new(root: &'repo OsPath) -> Self {
+        Self { root }
+    }
+    pub(crate) fn root(&self) -> &OsPath {
+        self.root
+    }
     // resolves cwd path to root relative path
     //
     // prefix refers to the path from root to the cwd

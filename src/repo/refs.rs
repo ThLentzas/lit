@@ -1,15 +1,14 @@
 use crate::command::print::ReadableBytes;
-use crate::repo::db::DbError;
+use crate::repo::db::DatabaseError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
 use crate::repo::os;
-use crate::repo::os::OsPath;
+use crate::repo::os::{IoError, OsPath};
 
 const DEFAULT_BRANCH_NAME: &[u8] = b"master";
 
@@ -33,6 +32,7 @@ impl Refs {
             tags
         }
     }
+
     // We can't use the same approach to update the head as we did to write objects. In the writing
     // object case, we don't care about competing writes. The object path is derived from its content. If
     // both processes are writing the same object, they should be writing the same bytes. So the main
@@ -98,7 +98,7 @@ impl Refs {
         // just provide the behavior once we get access to parent. Could also be an approach where we
         // return the lock and continue our logic but this will need to change are refs api and lockfile
         // quite a lot.
-        F: FnOnce(Vec<Oid>) -> Result<Oid, DbError>,
+        F: FnOnce(Vec<Oid>) -> Result<Oid, DatabaseError>,
     {
         let mut lockfile = Lockfile::acquire(&self.head)?;
         let parent = self.read_head()?;
@@ -115,6 +115,7 @@ impl Refs {
         Ok(())
     }
 
+    // TODO: this should return HEAD an enum with 2 variants, either a SymRef or an OID
     pub(super) fn read_head(&self) -> Result<Option<String>, RefError> {
         // HEAD contains the id as a 40-character hex string already (plain text 903a71ad300d5aa1ba0c0495ce9341f42e3fcd7c)
         // we know it is valid utf8 so we can call read_to_string()
@@ -123,10 +124,7 @@ impl Refs {
             // no HEAD yet (first commit)
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             // something actually went wrong (permissions, corrupt data, etc.)
-            Err(err) => Err(RefError::Io {
-                path: self.head.clone(),
-                source: err,
-            }),
+            Err(err) => Err(RefError::Io(IoError::new("open", Some(&self.head), err))),
         }
     }
 
@@ -357,9 +355,9 @@ impl fmt::Display for BranchNameError {
 
 #[derive(Debug)]
 pub(crate) enum RefError {
-    Io { path: PathBuf, source: io::Error },
+    Io(IoError),
     Lockfile(LockfileError),
-    Database(DbError),
+    Database(DatabaseError),
     Oid(OidError),
     BadBranchName(BranchNameError),
 }
@@ -369,9 +367,8 @@ impl Error for RefError {}
 impl fmt::Display for RefError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            RefError::Io { path, source } => {
-                write!(f, "{}: {source}", path.display())
-            }
+            // TODO: add a message similar to the other IoErrors
+            RefError::Io(_) => write!(f, "",),
             RefError::Lockfile(err) => write!(f, "{err}"),
             RefError::Database(err) => write!(f, "{err}"),
             RefError::Oid(err) => write!(f, "{err}"),
@@ -386,8 +383,8 @@ impl From<LockfileError> for RefError {
     }
 }
 
-impl From<DbError> for RefError {
-    fn from(err: DbError) -> Self {
+impl From<DatabaseError> for RefError {
+    fn from(err: DatabaseError) -> Self {
         RefError::Database(err)
     }
 }

@@ -1,5 +1,5 @@
 use crate::repo::Repository;
-use crate::repo::db::{self, Database, DbError};
+use crate::repo::db::{self, Database, DatabaseError};
 use crate::repo::index::{Index, IndexEntry};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
@@ -72,13 +72,13 @@ impl Report {
 
     pub(crate) fn generate(repo: &Repository, index: &Index) -> Result<Self, ReportError> {
         let mut report = Self::new();
-        let db = Database {
-            path: repo.objects_dir(),
-        };
-        let workspace = Workspace {
-            root: repo.root.clone(),
-        };
-        let refs = Refs::new(&repo.root);
+        let db = repo.database();
+        // TODO: this unwrap is technically safe, workspace requires the root of the worktree and if 
+        //  worktree is None then we have a bare repo but if a command that requires a workspace is
+        //  executed against a bare repo then we have a bug in our code
+        let workspace = repo.workspace().unwrap();
+        let refs = repo.refs();
+        
         report.load_head_entries(&refs, &db)?;
         report.scan_workspace(&workspace, index, &RepoPath::new())?;
         report.check_index_against(index, &workspace)?;
@@ -96,11 +96,14 @@ impl Report {
         };
 
         let oid = Oid::from_hex(&head_oid)?;
-        let commit = match db.load(&oid)? {
-            Some(Object::Commit(commit)) => commit,
-            Some(_) => return Err(ReportError::HeadNotACommit { oid }),
+        let commit = match db.load(&oid) {
+            Ok(Object::Commit(commit)) => commit,
+            Ok(_) => return Err(ReportError::HeadNotACommit { oid }),
             // retrieved the oid of HEAD but is missing from db.
-            None => return Err(ReportError::HeadCommitNotFound { oid }),
+            Err(err) if err.is_object_not_found() => {
+                return Err(ReportError::HeadCommitNotFound { oid });
+            }
+            Err(err) => return Err(ReportError::Database(err)),
         };
         self.head_entries = db.load_tree_files(&commit.root_id)?;
 
@@ -260,7 +263,7 @@ impl Report {
 #[derive(Debug)]
 pub(crate) enum ReportError {
     Workspace(WorkspaceError),
-    Database(DbError),
+    Database(DatabaseError),
     Ref(RefError),
     HeadBadOid(OidError),
     HeadNotACommit { oid: Oid },
@@ -303,8 +306,8 @@ impl From<WorkspaceError> for ReportError {
     }
 }
 
-impl From<DbError> for ReportError {
-    fn from(err: DbError) -> Self {
+impl From<DatabaseError> for ReportError {
+    fn from(err: DatabaseError) -> Self {
         Self::Database(err)
     }
 }

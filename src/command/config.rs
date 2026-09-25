@@ -67,18 +67,17 @@ pub(crate) struct Config {
 impl Config {
     pub(crate) fn execute(&self) {
         let repo = Repository::discover().unwrap();
-        let cfg_path = repo.config_path();
 
         match &self.action {
             Action::Get(get) => {
-                let cfg = ConfigFile::new(&cfg_path).unwrap();
+                let cfg = repo.config().unwrap();
                 let _entry = cfg.get(&get.name).unwrap();
             }
             Action::Set(set) => {
                 // TODO: should cfg itself acquire the lock like refs do for HEAD or not?
-                let mut lock  = Lockfile::acquire(&cfg_path).unwrap();
-                let cfg = ConfigFile::new(&cfg_path).unwrap();
-                let cfg = cfg.set(&set.name, &set.value).unwrap();
+                let mut lock  = Lockfile::acquire(&repo.config_path()).unwrap();
+                let mut cfg = repo.config().unwrap();
+                cfg.set(&set.name, &set.value).unwrap();
                 lock.write(&cfg.serialize()).unwrap();
                 lock.commit().unwrap();
             }

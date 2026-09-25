@@ -11,13 +11,21 @@ use std::{fmt, fs, io, result};
 
 const MINIMUM_UNIQUE_PREFIX_LEN: usize = 4;
 
-pub(crate) struct Database {
-    path: OsPath,
+pub(crate) struct Database<'repo> {
+    objects_dir: &'repo OsPath,
     object_format: ObjectFormat,
 }
 
 // TODO: info and packs files
-impl Database {
+impl<'repo> Database<'repo> {
+    pub(super) fn new(objects_dir: &'repo OsPath, object_format: ObjectFormat) -> Self {
+        Self {
+            objects_dir,
+            object_format,
+        }
+    }
+
+
     pub(crate) fn store(&self, object: Object) -> Result<Oid> {
         let obj_type = object.obj_type().to_string();
         let content = object.serialize();
@@ -37,14 +45,14 @@ impl Database {
         // the two character split is just to avoid having of thousands of files in one directory,
         // which would slow down file systems
         let hex = oid.to_hex();
-        let parent = self.path.join_unchecked(&hex[..2]);
+        let parent = self.objects_dir.join_unchecked(&hex[..2]);
         // if the parent dir does not exist, create parent first .lit/objects/90/ before trying to
         // write tmp
         match fs::create_dir(&parent) {
             Ok(_) => {}
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
             Err(err) => {
-                return Err(DbError::Io(IoError::new("mkdir", Some(&parent), err)));
+                return Err(DatabaseError::Io(IoError::new("mkdir", Some(&parent), err)));
             }
         }
 
@@ -77,7 +85,7 @@ impl Database {
         let hex = oid.to_hex();
         // always safe to index since hex is a valid 40 character long hex string
         let (parent, child) = hex.split_at(2);
-        let path = self.path.join_unchecked(parent).join_unchecked(child);
+        let path = self.objects_dir.join_unchecked(parent).join_unchecked(child);
         let content = match fs::read(&path) {
             Ok(content) => content,
             Err(err)
@@ -90,15 +98,15 @@ impl Database {
                 // caller decide the absence
                 // initially I had load() return Result<Option<Object>, DbError> but most of the callers
                 // would turn None into NotFound, adjust if it changes
-                return Err(DbError::ObjectNotFound { oid: hex });
+                return Err(DatabaseError::ObjectNotFound { oid: hex });
             }
-            Err(err) => return Err(DbError::Io(IoError::new("read", Some(path), err))),
+            Err(err) => return Err(DatabaseError::Io(IoError::new("read", Some(path), err))),
         };
 
         let bytes = match inflate::inflate_bytes_zlib(&content) {
             Ok(bytes) => bytes,
             Err(err) => {
-                return Err(DbError::Decompress {
+                return Err(DatabaseError::Decompress {
                     oid: hex,
                     reason: err,
                 });
@@ -110,7 +118,7 @@ impl Database {
             // tampered object: someone opened the file, changed its contents, compressed the new
             // content and wrote back to the file, the hashes do not match or someone changed the
             // object's path and set it to whatever was provided to load
-            return Err(DbError::HashMismatch {
+            return Err(DatabaseError::HashMismatch {
                 path,
                 expected: oid.inner(),
                 actual: hash,
@@ -119,7 +127,7 @@ impl Database {
         // the information from any parsing error that occurs during loading an object is never returned
         // to the user. It means something is wrong with our on-disk format. Bad object with {oid}
         // is all they are going to see. The information is only needed for debugging.
-        Ok(Object::deserialize(&bytes).map_err(|_err| DbError::BadObject { oid: hex })?)
+        Ok(Object::deserialize(&bytes).map_err(|_err| DatabaseError::BadObject { oid: hex })?)
     }
 
     pub(super) fn load_tree_files(&self, oid: &Oid) -> Result<HashMap<RepoPath, (Oid, Mode)>> {
@@ -136,7 +144,7 @@ impl Database {
         oid: &Oid,
     ) -> Result<()> {
         let Object::Tree(entries) = self.load(oid)? else {
-            return Err(DbError::NotATree {
+            return Err(DatabaseError::NotATree {
                 path: prefix.clone(),
                 oid: oid.to_hex(),
             });
@@ -174,20 +182,20 @@ impl Database {
         }
 
         let (dir_name, file_prefix) = prefix.split_at(2);
-        let path = self.path.join_unchecked(dir_name);
+        let path = self.objects_dir.join_unchecked(dir_name);
         let entries = match fs::read_dir(&path) {
             Ok(read_dir) => read_dir,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(DbError::Prefix(PrefixError::NotFound(prefix.to_string())));
+                return Err(DatabaseError::Prefix(PrefixError::NotFound(prefix.to_string())));
             }
-            Err(err) => return Err(DbError::Io(IoError::new("opendir", Some(path), err))),
+            Err(err) => return Err(DatabaseError::Io(IoError::new("opendir", Some(path), err))),
         };
 
         let mut matches = Vec::new();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(err) => return Err(DbError::Io(IoError::new("opendir", Some(path), err))),
+                Err(err) => return Err(DatabaseError::Io(IoError::new("opendir", Some(path), err))),
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -205,7 +213,7 @@ impl Database {
             }
         }
         match matches.len() {
-            0 => Err(DbError::ObjectNotFound {
+            0 => Err(DatabaseError::ObjectNotFound {
                 oid: prefix.to_string(),
             }),
             1 => Ok(matches[0]),
@@ -271,10 +279,10 @@ impl fmt::Display for PrefixError {
     }
 }
 
-type Result<T> = result::Result<T, DbError>;
+type Result<T> = result::Result<T, DatabaseError>;
 
 #[derive(Debug)]
-pub(crate) enum DbError {
+pub(crate) enum DatabaseError {
     Io(IoError),
     Decompress {
         oid: String,
@@ -298,7 +306,13 @@ pub(crate) enum DbError {
     Prefix(PrefixError),
 }
 
-impl Error for DbError {
+impl DatabaseError {
+    pub(super) fn is_object_not_found(&self) -> bool {
+        matches!(self, Self::ObjectNotFound { .. })
+    }
+}
+
+impl Error for DatabaseError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(source) => Some(source),
@@ -312,35 +326,35 @@ impl Error for DbError {
     }
 }
 
-impl fmt::Display for DbError {
+impl fmt::Display for DatabaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DbError::Io(_) => write!(f, "object database I/O failed",),
-            DbError::Decompress { oid, .. } => {
+            DatabaseError::Io(_) => write!(f, "object database I/O failed",),
+            DatabaseError::Decompress { oid, .. } => {
                 write!(f, "unable to unpack object {oid}")
             }
-            DbError::HashMismatch { path, .. } => {
+            DatabaseError::HashMismatch { path, .. } => {
                 write!(
                     f,
                     "object contents do not match the hash in its path'{}'",
                     path.display()
                 )
             }
-            DbError::BadObject { oid } => write!(f, "bad object {oid}"),
-            DbError::NotATree { oid, .. } => write!(f, "not a tree object: {oid}"),
-            DbError::ObjectNotFound { oid, .. } => write!(f, "object {oid} not found"),
-            DbError::Prefix(_) => write!(f, "could not resolve object id prefix"),
+            DatabaseError::BadObject { oid } => write!(f, "bad object {oid}"),
+            DatabaseError::NotATree { oid, .. } => write!(f, "not a tree object: {oid}"),
+            DatabaseError::ObjectNotFound { oid, .. } => write!(f, "object {oid} not found"),
+            DatabaseError::Prefix(_) => write!(f, "could not resolve object id prefix"),
         }
     }
 }
 
-impl From<IoError> for DbError {
+impl From<IoError> for DatabaseError {
     fn from(err: IoError) -> Self {
         Self::Io(err)
     }
 }
 
-impl From<PrefixError> for DbError {
+impl From<PrefixError> for DatabaseError {
     fn from(err: PrefixError) -> Self {
         Self::Prefix(err)
     }

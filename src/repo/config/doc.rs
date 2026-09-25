@@ -513,13 +513,13 @@ impl DocIndex {
 // slice() tries to access line's content for rebuilding the index it never reads from the buffer
 // it reads from the Vec LineKind::Owned holds.
 #[derive(Default)]
-pub(super) struct ConfigDoc {
+pub(super) struct Doc {
     buf: Vec<u8>,
     lines: Vec<Line>,
     index: DocIndex,
 }
 
-impl ConfigDoc {
+impl Doc {
     pub(super) fn empty() -> Self {
         Self::default()
     }
@@ -533,7 +533,7 @@ impl ConfigDoc {
     //
     // This is a zero-copy approach. The name of a variable is a sub-slice of its line, which is a
     // sub-slice of the file.
-    pub(super) fn load(path: &OsPath) -> Result<Self, ConfigDocError> {
+    pub(super) fn load(path: &OsPath) -> Result<Self, DocError> {
         let mut buf = Vec::new();
         let lines = read_lines(&mut buf, path)?;
         let index = DocIndex::new(&buf, &lines);
@@ -700,7 +700,7 @@ impl ConfigDoc {
     }
 }
 
-fn read_lines(buf: &mut Vec<u8>, path: &OsPath) -> Result<Vec<Line>, ConfigDocError> {
+fn read_lines(buf: &mut Vec<u8>, path: &OsPath) -> Result<Vec<Line>, DocError> {
     let file = File::open(path).with_context("open", Some(path))?;
     let mut lines = Vec::new();
     let mut reader = BufReader::new(&file);
@@ -746,7 +746,7 @@ fn read_lines(buf: &mut Vec<u8>, path: &OsPath) -> Result<Vec<Line>, ConfigDocEr
             // we can't pass self.lines.len() + 1 because that would result in the logical lines
             // physical lines != logical lines
             // the user sees the physical lines of the file
-            .map_err(|err| ConfigDocError::InvalidFormat {
+            .map_err(|err| DocError::InvalidFormat {
                 line: physical_lines,
                 source: err,
             })?;
@@ -906,12 +906,12 @@ fn encode_value(value: &[u8]) -> Cow<'_, [u8]> {
 }
 
 #[derive(Debug)]
-pub(crate) enum ConfigDocError {
+pub(crate) enum DocError {
     Io(IoError),
     InvalidFormat { line: usize, source: ParseError },
 }
 
-impl ConfigDocError {
+impl DocError {
     pub(super) fn is_io_not_found(&self) -> bool {
         match self {
             Self::Io(source) => source.is_not_found(),
@@ -920,7 +920,7 @@ impl ConfigDocError {
     } 
 }
 
-impl Error for ConfigDocError {
+impl Error for DocError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(source) => Some(source),
@@ -929,7 +929,7 @@ impl Error for ConfigDocError {
     }
 }
 
-impl fmt::Display for ConfigDocError {
+impl fmt::Display for DocError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Io(_) => {
@@ -942,7 +942,7 @@ impl fmt::Display for ConfigDocError {
     }
 }
 
-impl From<IoError> for ConfigDocError {
+impl From<IoError> for DocError {
     fn from(err: IoError) -> Self {
         Self::Io(err)
     }

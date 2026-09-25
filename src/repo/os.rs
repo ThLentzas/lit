@@ -38,7 +38,7 @@ impl OsPath {
     {
         Self { inner: path.into() }
     }
-    
+
     pub(crate) fn inner(&self) -> &Path {
         &self.inner
     }
@@ -170,7 +170,7 @@ impl OsPath {
     pub(crate) fn has_same_canonical_path_with(&self, other: &OsPath) -> Result<bool, IoError> {
         let lhs = fs::canonicalize(self).with_context("realpath", Some(self))?;
         let rhs = fs::canonicalize(other).with_context("realpath", Some(other))?;
-        
+
         Ok(lhs == rhs)
     }
 }
@@ -437,7 +437,7 @@ impl IoError {
     }
 
     pub(crate) fn is_not_found(&self) -> bool {
-        self.source.kind() == io::ErrorKind::NotFound
+        matches!(self.source.kind(), io::ErrorKind::NotFound)
     }
 }
 

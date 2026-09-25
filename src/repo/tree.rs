@@ -1,4 +1,4 @@
-use crate::repo::db::{Database, DbError};
+use crate::repo::db::{Database, DatabaseError};
 use crate::repo::index::Index;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
@@ -198,7 +198,7 @@ impl Tree {
     // its entries, we walk the list and check the mode if a directory is found we recurse. It is
     // very important to see that the entry's name is a directory level, there is no nesting. The name
     // never contains '/'
-    pub(crate) fn write(self, db: &Database) -> Result<Oid, DbError> {
+    pub(crate) fn write(self, db: &Database) -> Result<Oid, DatabaseError> {
         let mut entries = Vec::new();
 
         for (name, node) in self.entries {

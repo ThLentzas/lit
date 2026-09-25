@@ -161,6 +161,10 @@ impl Index {
             modified: false,
         }
     }
+    
+    pub(crate) fn path(&self) -> &OsPath {
+        &self.path
+    }
 
     // This method is used by status to see if the entry pointed by `path` is tracked by the index.
     // If path points to a file, a single binary search call is enough, but directories have specific

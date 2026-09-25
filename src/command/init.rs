@@ -25,6 +25,8 @@ pub(crate) struct Init {
     // it conflicts with bare because it separates the metadata directory from a working tree, while
     // bare creates a repo without a working tree. The pointer file left behind by this flag must
     // live somewhere in this case the root of the working tree
+    //
+    // git init --separate-git-dir /path/to/repo.git path/to/worktree
     #[arg(long, conflicts_with = "bare")]
     separate_lit_dir: Option<PathBuf>,
     #[arg(long, value_enum)]
@@ -46,17 +48,19 @@ impl Init {
         // resolve arguments and env vars for the location of the metadata dir.
         // resolve() sets rules for a deterministic layout.
         let layout = Layout::resolve(
-            // self.path.as_ref().map(PathBuf::as_ref)
             self.path.as_deref(),
             self.bare,
             self.separate_lit_dir.as_deref(),
         )?;
 
         // create the positional/root directory first
+        // non-bare repos need the working tree directory while bare repos need the metadata
         fs::create_dir_all(layout.root()).with_context("mkdir", Some(layout.root()))?;
         let cwd = environment::cwd()?;
         // we relocate before loading configuration so the rest of init uses the destination repo
         if let Some(link) = layout.pointer_file() {
+            // TODO: we need to write a test and see what happens if someone provides --separate-lit-dir
+            //  flag for an existing bare repo
             try_migrate_metadata(link, layout.metadata_dir(), &cwd)?;
         }
 
@@ -113,11 +117,11 @@ impl Init {
         // does not support Unix permissions(Windows, a fs mounted without permissions)
         let trust_filemode = trust_filemode(layout.metadata_dir())?;
         if trust_filemode {
-            cfg.set_all("core.filemode".as_ref(), "true".as_ref())?;
+            cfg.set_all("core.filemode", "true")?;
         } else {
-            cfg.set_all("core.filemode".as_ref(), "false".as_ref())?;
+            cfg.set_all("core.filemode", "false")?;
         }
-        // -`lit init project` and `lit init --bare project`,is no confusion on what happens.
+        // -`lit init project` and `lit init --bare project`, causes no confusion on what happens.
         // Different metadata directories. For non-bare the metadata entries are created in
         // project/.lit, then directly inside `project/`, so `project/HEAD`, `project/config` etc.
         // -`LIT_DIR = repo/meta` and `lit init` with or without --bare results in metadata entries
@@ -127,10 +131,10 @@ impl Init {
         // --bare on an existing repo will set the `core.bare = true` and delete all `core.worktree`
         // instances.
         if layout.is_bare() {
-            cfg.unset_all("core.worktree".as_ref())?;
-            cfg.set_all("core.bare".as_ref(), "true".as_ref())?;
+            cfg.unset_all("core.worktree")?;
+            cfg.set_all("core.bare", "true")?;
         } else {
-            cfg.set_all("core.bare".as_ref(), "false".as_ref())?;
+            cfg.set_all("core.bare", "false")?;
             // https://git-scm.com/docs/git-config#Documentation/git-config.txt-corelogAllRefUpdates
             // From the docs: `This value is true by default in a repository that has a working
             //  directory associated with it, and false by default in a bare repository.`
@@ -143,17 +147,17 @@ impl Init {
             // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2636-L2637
             // as of 2.55 Git rejects a bad boolean value, respects one if present and defaults to
             // true if absent
-            match cfg.get_bool("core.logallrefupdates".as_ref()) {
+            match cfg.get_bool("core.logallrefupdates") {
                 Ok(_) => {}
                 Err(err) if err.is_key_not_found() => {
-                    cfg.set("core.logallrefupdates".as_ref(), "true".as_ref())?;
+                    cfg.set("core.logallrefupdates", "true")?;
                 }
                 Err(err) => return Err(InitError::Config(err)),
             }
             if layout.needs_worktree_config() {
-                // non-bare layout so root() is the worktree
-                let value = os::os_str_from_bytes(layout.root().as_bytes());
-                cfg.set_all("core.worktree".as_ref(), value)?;
+                // non-bare layout so worktree_dir() is safe to unwarp
+                let value = os::os_str_from_bytes(layout.worktree_dir().unwrap().as_bytes());
+                cfg.set_all("core.worktree", value)?;
             }
         }
 
@@ -165,11 +169,11 @@ impl Init {
             // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2646-L2653
             // only writes false in the else block
             if !support_symlinks(layout.metadata_dir())? {
-                cfg.set_all("core.symlinks".as_ref(), "false".as_ref())?;
+                cfg.set_all("core.symlinks", "false")?;
             }
             // absence -> implicitly false
             if !is_case_sensitive_fs(layout.metadata_dir())? {
-                cfg.set_all("core.ignorecase".as_ref(), "true".as_ref())?;
+                cfg.set_all("core.ignorecase", "true")?;
             }
         }
         setup_object_db(layout.metadata_dir(), &cwd)?;
@@ -343,7 +347,7 @@ fn setup_ref_backend(
         match name {
             // user provided branch name has the highest precedence
             Some(name) => refs.new_unborn_branch(Some(name))?,
-            None => match cfg.get_bytes("init.defaultBranch".as_ref()) {
+            None => match cfg.get_bytes("init.defaultBranch") {
                 Ok(entry) => {
                     let name = os::os_str_from_bytes(entry.as_ref());
                     refs.new_unborn_branch(Some(name))?
@@ -397,25 +401,22 @@ fn finalize_format_version(
     let ref_format = ref_storage.format();
 
     if *object_format == ObjectFormat::Sha256 {
-        cfg.set_all(
-            "extensions.objectformat".as_ref(),
-            object_format.name().as_ref(),
-        )?;
+        cfg.set_all("extensions.objectformat", object_format.name())?;
     }
     if let Some(payload) = ref_storage.payload() {
         let payload = unsafe { OsStr::from_encoded_bytes_unchecked(payload) };
-        cfg.set_all("extensions.refstorage".as_ref(), payload)?;
+        cfg.set_all("extensions.refstorage", payload)?;
     } else if *ref_format == RefFormat::RefTable {
-        cfg.set_all("extensions.refstorage".as_ref(), ref_format.name().as_ref())?;
+        cfg.set_all("extensions.refstorage", ref_format.name())?;
     }
 
     // sha1 is implicit, we remove any explicit object-format declaration
     if *format.object_format() == ObjectFormat::Sha1 {
-        cfg.unset_all("extensions.objectformat".as_ref())?;
+        cfg.unset_all("extensions.objectformat")?;
     }
     // same as sha1 above, payload with files format as in `files://<payload>` must be persisted
     if *format.ref_storage().format() == RefFormat::Files && !ref_storage.has_payload() {
-        cfg.unset_all("extensions.refstorage".as_ref())?;
+        cfg.unset_all("extensions.refstorage")?;
     }
 
     // TODO: https://github.com/git/git/blob/47ce80527c56f462cb97db4ca8125342204d3783/setup.c#L2500
@@ -424,10 +425,7 @@ fn finalize_format_version(
     //  https://git-scm.com/docs/git-config#Documentation/git-config.txt-submodulePathConfig
     //  It requires v1 so when we support it we need to check set the version
 
-    cfg.set(
-        "core.repositoryformatversion".as_ref(),
-        format.version().as_str().as_ref(),
-    )?;
+    cfg.set("core.repositoryformatversion", format.version().as_str())?;
 
     // there are 2 cases that we still need to check:
     //  - v0 with v1 extensions
@@ -443,9 +441,6 @@ fn finalize_format_version(
 }
 
 // https://github.com/git/git/blob/1a3e64c6c4a623626ff0687008732a8e007e2a1c/setup.c#L2675-L2696
-// TODO: explain rename, file descriptors and the unavoidable TOCTOU race conditions when working
-//  with paths.
-//
 // If separate-lit-dir flag is set, we create the pointer file and also migrate an existing
 // repo if it is a reinitialization
 // Migration vs Reinit
@@ -467,7 +462,14 @@ fn try_migrate_metadata(
         // if the pointer points nowhere, nothing to migrate, create the .lit file
         return Ok(litfile::write(link, metadata_destination.as_bytes())?);
     };
-    let location = repo::resolve_metadata_location(entry.into_owned(), cwd)?;
+    // Note: don't call Repository::discover_at()
+    // at this point we have already resolved the layout of the repo from the init arguments.
+    // it means we know the destination, but we have not yet created or validated anything
+    // what is left is to determine for migration is metadata resolution, structural validation and
+    // format validation. We could technically call Repository::discover_at() and discard the repo
+    // but this process can fail during worktree or placement resolution(Layout) that it does not
+    // need
+    let location = repo::validate_metadata_for_migration(entry.into_owned(), cwd)?;
     // rename does not automatically canonicalize either path, `from` is guaranteed to be an absolute
     // canonical path, but `to` is not. `metadata_destination` is absolute by construction in
     // Layout::resolve() but not canonical(still can be a symlink)
@@ -512,7 +514,7 @@ fn resolve_object_format(
     }
 
     // TODO: cfg needs to look for this in the global config not local?
-    match cfg.get_str("init.defaultObjectFormat".as_ref()) {
+    match cfg.get_str("init.defaultObjectFormat") {
         Ok(hash) => ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat),
         Err(err) if err.is_key_not_found() => Ok(ObjectFormat::default()),
         Err(err) => Err(InitError::Config(err)),
@@ -542,7 +544,7 @@ fn resolve_ref_storage(flag: Option<RefFormat>, cfg: &ConfigFile) -> Result<RefS
         let ref_format = os::os_str_as_bytes(ref_format.as_os_str());
         *ref_storage.format_mut() = RefFormat::try_from(ref_format)?;
     } else {
-        match cfg.get_str("init.defaultRefFormat".as_ref()) {
+        match cfg.get_str("init.defaultRefFormat") {
             Ok(ref_format) => {
                 *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_bytes())?;
             }
@@ -680,27 +682,15 @@ impl fmt::Display for InitError {
     }
 }
 
-impl From<IoError> for InitError {
-    fn from(err: IoError) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<OsPathError> for InitError {
-    fn from(err: OsPathError) -> Self {
-        Self::OsPath(err)
-    }
-}
-
 impl From<LayoutError> for InitError {
     fn from(err: LayoutError) -> Self {
         Self::Layout(err)
     }
 }
 
-impl From<LitFileError> for InitError {
-    fn from(err: LitFileError) -> Self {
-        Self::LitFile(err)
+impl From<IoError> for InitError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
     }
 }
 
@@ -716,6 +706,12 @@ impl From<RefError> for InitError {
     }
 }
 
+impl From<LitFileError> for InitError {
+    fn from(err: LitFileError) -> Self {
+        Self::LitFile(err)
+    }
+}
+
 impl From<RepositoryError> for InitError {
     fn from(err: RepositoryError) -> Self {
         Self::Migration(err)
@@ -725,6 +721,12 @@ impl From<RepositoryError> for InitError {
 impl From<ConfigFileError> for InitError {
     fn from(err: ConfigFileError) -> Self {
         Self::Config(err)
+    }
+}
+
+impl From<OsPathError> for InitError {
+    fn from(err: OsPathError) -> Self {
+        Self::OsPath(err)
     }
 }
 

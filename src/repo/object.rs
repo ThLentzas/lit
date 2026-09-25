@@ -124,7 +124,7 @@ fn get_with_fallback(
     fallback: &'static str,
     name: &'static str,
 ) -> Result<String, SignatureError> {
-    let value = match cfg.get_str(key.as_ref()) {
+    let value = match cfg.get_str(key) {
         Ok(name) => Some(name),
         Err(err) if err.is_key_not_found() => None,
         Err(err) => return Err(SignatureError::ConfigError(err)),
@@ -132,7 +132,7 @@ fn get_with_fallback(
 
     match value {
         Some(value) => Ok(value),
-        None => match cfg.get_str(fallback.as_ref()) {
+        None => match cfg.get_str(fallback) {
             Ok(value) => Ok(value),
             Err(err) if err.is_key_not_found() => Err(SignatureError::NotFound(name)),
             Err(err) => Err(SignatureError::ConfigError(err)),

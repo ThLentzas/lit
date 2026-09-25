@@ -1,17 +1,17 @@
-use crate::repo::db::{Database, DbError};
+use crate::repo::db::{Database, DatabaseError};
 use crate::repo::index::{Index, IndexEntry, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
-use crate::repo::os::{FileKind, StatNode};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::os::{FileKind, IoError, StatNode};
 use crate::repo::pathspec::{Pathspec, PathspecError};
+use crate::repo::repo_path::RepoPath;
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{DiscoverError, Repository, RepositoryError};
+use crate::repo::{Repository, RepositoryError};
 use std::error::Error;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::{fmt, io};
+use std::fmt;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) struct Add {
@@ -20,7 +20,7 @@ pub(crate) struct Add {
 }
 
 // TODO: when we add .litignore support, if a file is already tracked by lit and then added to .litignore
-// we still update it. .litignore rules apply for untracked files.
+//  we still update it. .litignore rules apply for untracked files.
 impl Add {
     // cwd -> where the user ran the command from
     // root -> directory that owns .lit
@@ -34,14 +34,10 @@ impl Add {
     // not just lexer.rs(what the user provided, self.path in our case)
     pub(super) fn execute(&self) -> Result<(), AddError> {
         let repo = Repository::discover()?;
-        let db = Database {
-            path: repo.objects_dir(),
-        };
-        let workspace = Workspace {
-            root: repo.root.clone(),
-        };
-        let mut index = Index::new(repo.index_path());
-        let mut lockfile = Lockfile::acquire(&index.path)?;
+        let db = repo.database();
+        let workspace = repo.workspace().unwrap();
+        let mut index = repo.index();
+        let mut lockfile = Lockfile::acquire(index.path())?;
         index.load()?;
 
         for path in self.paths.iter() {
@@ -49,27 +45,23 @@ impl Add {
             // also  "". This is fine because in collect_entries() for the dir case we call dir_entries()
             // which does self.to_absolute() so absolute root + "" give us the absolute root path
             // which is what we want.
-            let pathspec = if path.is_absolute() {
-                Pathspec::new(path.as_os_str(), Path::new(""), &repo.root)?
+            let prefix = if path.is_absolute() {
+                None
             } else {
-                let prefix = workspace.prefix()?;
-                Pathspec::new(path.as_os_str(), &prefix, &repo.root)?
+                Some(workspace.prefix()?)
             };
-
-            let node = match workspace.stat(&pathspec.pattern) {
+            let pathspec = Pathspec::new(path.as_os_str(), prefix.as_deref(), workspace.root())?;
+            let pattern = pathspec.pattern();
+            let node = match workspace.stat(pattern) {
                 Ok(node) => Some(node),
-                Err(WorkspaceError::Io { source, .. })
-                    if source.kind() == io::ErrorKind::NotFound =>
-                {
-                    None
-                }
+                Err(err) if err.is_not_found() => None,
                 Err(err) => return Err(err.into()),
             };
 
             match node {
                 Some(node) => {
                     let mut collector =
-                        EntryCollector::new(&workspace, &db, &pathspec.pattern, &index, &node);
+                        EntryCollector::new(&workspace, &db, pattern, &index, &node);
                     collector.collect()?;
                     index.add_entries(collector.finish())?;
                 }
@@ -77,12 +69,12 @@ impl Add {
                 //
                 // this is referred to as a stage deletion because index no longer contains the specific
                 // file next time we ran status or commit HEAD will have the file, but index will not
-                None if index.is_tracked(&pathspec.pattern) => {
-                    index.remove(&pathspec.pattern);
+                None if index.is_tracked(pattern) => {
+                    index.remove(pattern);
                 }
                 None => {
                     return Err(AddError::FoundNoMatch {
-                        path: pathspec.original,
+                        path: pathspec.original().to_os_string(),
                     });
                 }
             }
@@ -95,26 +87,30 @@ impl Add {
     }
 }
 
-struct EntryCollector<'a> {
-    workspace: &'a Workspace,
-    db: &'a Database,
+// 'a: for how long Collector can borrow workspace database
+// 'repo: for how long workspace/database borrows their paths from repository
+// we could drop `path` and `node` since they are only used once to start the recursion and we could
+// pass them to `collect()` instead of keeping them internally.
+struct EntryCollector<'a, 'repo> {
+    workspace: &'a Workspace<'repo>,
+    database: &'a Database<'repo>,
     path: &'a RepoPath,
     index: &'a Index,
     node: &'a StatNode,
     entries: Vec<IndexEntry>,
 }
 
-impl<'a> EntryCollector<'a> {
+impl<'a, 'repo> EntryCollector<'a, 'repo> {
     fn new(
-        workspace: &'a Workspace,
-        db: &'a Database,
+        workspace: &'a Workspace<'repo>,
+        db: &'a Database<'repo>,
         path: &'a RepoPath,
         index: &'a Index,
         node: &'a StatNode,
     ) -> Self {
         Self {
             workspace,
-            db,
+            database: db,
             path,
             index,
             node,
@@ -132,7 +128,7 @@ impl<'a> EntryCollector<'a> {
         match node.kind {
             FileKind::Regular(_) => {
                 let content = self.workspace.read_file(path)?;
-                let oid = self.db.store(Object::Blob(content))?;
+                let oid = self.database.store(Object::Blob(content))?;
                 // Safe to unwarp because file kind is regular and has a corresponding Mode
                 let mode = Mode::try_from(node.kind).unwrap();
                 self.entries
@@ -157,7 +153,7 @@ impl<'a> EntryCollector<'a> {
                 // different size, we have to rehash and see that the oid are unchanged which is not
                 // correct, can't have different size but identical hashes.
                 let content = self.workspace.read_link(path)?;
-                let oid = self.db.store(Object::Blob(content))?;
+                let oid = self.database.store(Object::Blob(content))?;
                 // Safe to unwarp because file kind is symlink and has a corresponding Mode
                 let mode = Mode::try_from(node.kind).unwrap();
                 self.entries
@@ -195,10 +191,11 @@ impl<'a> EntryCollector<'a> {
 pub(super) enum AddError {
     Repository(RepositoryError),
     Index(IndexError),
-    Database(DbError),
+    Database(DatabaseError),
     Workspace(WorkspaceError),
     Pathspec(PathspecError),
     Lockfile(LockfileError),
+    Io(IoError),
     UnsupportedFileType { path: RepoPath },
     // user provided path verbatim
     FoundNoMatch { path: OsString },
@@ -235,6 +232,7 @@ impl fmt::Display for AddError {
                     path.to_string_lossy()
                 )
             }
+            AddError::Io(_) => write!(f, "I/O error during add"),
         }
     }
 }
@@ -251,14 +249,20 @@ impl From<PathspecError> for AddError {
     }
 }
 
+impl From<IoError> for AddError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
+    }
+}
+
 impl From<IndexError> for AddError {
     fn from(err: IndexError) -> Self {
         AddError::Index(err)
     }
 }
 
-impl From<DbError> for AddError {
-    fn from(err: DbError) -> Self {
+impl From<DatabaseError> for AddError {
+    fn from(err: DatabaseError) -> Self {
         AddError::Database(err)
     }
 }

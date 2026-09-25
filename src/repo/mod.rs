@@ -17,15 +17,19 @@ pub(super) mod tree;
 pub(super) mod workspace;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
+use crate::repo::db::Database;
 use crate::repo::format::{ObjectFormat, RepositoryFormat, RepositoryFormatError};
 use crate::repo::litfile::LitFileError;
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::{IoError, IoErrorContext, OsPath, OsPathError};
+use crate::repo::workspace::Workspace;
 use std::error::Error;
 use std::fs::{self, File, FileType};
 use std::path::Path;
 use std::{fmt, io};
+use crate::repo::index::Index;
+use crate::repo::refs::Refs;
 
 // describes how the resolved worktree is connected to the metadata directory
 enum MetadataPlacement {
@@ -38,7 +42,9 @@ enum MetadataPlacement {
 }
 
 impl MetadataPlacement {
-    // TODO: we need to list every possible combination and then write a test for each
+    // TODO: we need to list every possible combination and then write a test for each. In our tests
+    //  we need to make sure that any bare repo ends up with worktree_dir: None and any non-bare repo
+    //  always ends up with Some(worktree_dir)
     //
     // we can't naively compare paths without resolution first
     //
@@ -142,16 +148,17 @@ impl Layout {
         let path = path.map(OsPath::new).transpose()?;
 
         let cwd = environment::cwd()?;
+        // root of the worktree
         let root = path
             .as_ref()
             .map_or(cwd.clone(), |path| cwd.join_unchecked(path));
 
-        if let Some(dir_path) = separate_lit_dir {
+        if let Some(metadata_dir) = separate_lit_dir {
             // TODO: should this be a notification to the user that LIT_DIR is actually ignored
             //  because the flag has higher precedence. This is a conflict because both try to
             //  name the metadata dir
             return Ok(Self {
-                metadata_dir: cwd.join(dir_path)?,
+                metadata_dir: cwd.join(metadata_dir)?,
                 // the parent identifies the worktree even though the metadata is elsewhere
                 worktree_dir: Some(root.clone()),
                 placement: MetadataPlacement::Separate {
@@ -242,6 +249,10 @@ impl Layout {
         &self.metadata_dir
     }
 
+    pub(super) fn worktree_dir(&self) -> Option<&OsPath> {
+        self.worktree_dir.as_ref()
+    }
+
     // link is always absolute by construction
     pub(super) fn pointer_file(&self) -> Option<&OsPath> {
         if let MetadataPlacement::Separate { pointer_file } = &self.placement {
@@ -299,20 +310,19 @@ impl Layout {
 
 // validate that the directory pointed by path is a valid Lit repository before migration for the
 // separate-lit-dir flag
-// If `path` already points to a dir it moves it, if it points to a regular file then it must be a
-// litfile, so read it first before moving.
-// https://github.com/git/git/blob/d38352cd43ab9745686d697872408bc3249a153f/setup.c#L413-L451
-//
-// The conditions that must hold true are:
-//  - accessible dir pointed by path(r/w)
-//  - valid HEAD, a proper "ref:", or a regular file HEAD that has a properly formatted sha1 object
-//  name
-//  - accessible objects dir or LIT_OBJECT_DIRECTORY env var
-//  - accessible refs dir
-//  - has a valid repository format
-//
-// This is the structure a valid Lit repo guarantees
-// TODO: move this comment to migration
+pub(super) fn validate_metadata_for_migration(
+    path: OsPath,
+    cwd: &OsPath,
+) -> Result<RepositoryPaths, RepositoryError> {
+    let location = resolve_metadata_location(path, cwd)?;
+    let cfg_path = location.metadata_dir.join_unchecked("config");
+    let cfg = ConfigFile::new_or_empty(cfg_path)?;
+    // if version is absent, we don't discard the repo
+    // the absent version does not make a structurally valid repo ineligible to move
+    let _ = RepositoryFormat::from_config(&cfg)?;
+
+    Ok(location)
+}
 
 fn require_accessible_dir(path: &OsPath) -> Result<(), RepositoryError> {
     match fs::read_dir(path) {
@@ -354,7 +364,7 @@ fn validate_head(path: &OsPath) -> Result<(), RepositoryError> {
 // return the path pointed by the litfile. This avoids a clone() call in the first case. There are
 // other ways of doing it, we could use Cow too and the caller knows that if Cow::Borrowed then the
 // path that was passed must be returned.
-pub(super) fn resolve_metadata_location(
+fn resolve_metadata_location(
     path: OsPath,
     cwd: &OsPath,
 ) -> Result<RepositoryPaths, RepositoryError> {
@@ -435,6 +445,17 @@ fn is_metadata_dir(metadata_dir: &OsPath, objects_dir: &OsPath) -> Result<bool, 
     }
 }
 
+// https://github.com/git/git/blob/d38352cd43ab9745686d697872408bc3249a153f/setup.c#L413-L451
+//
+// The conditions that must hold true are:
+//  - accessible dir pointed by path(r/w)
+//  - valid HEAD, a proper "ref:", or a regular file HEAD that has a properly formatted sha1 object
+//  name
+//  - accessible objects dir or LIT_OBJECT_DIRECTORY env var
+//  - accessible refs dir
+//  - has a valid repository format(this is handled by the caller)
+//
+// This is the structure a valid Lit repo guarantees
 fn validate_metadata_structure(path: &OsPath, objects_dir: &OsPath) -> Result<(), RepositoryError> {
     require_accessible_dir(path)?;
     validate_head(&path.join_unchecked("HEAD"))?;
@@ -475,7 +496,7 @@ fn resolve_worktree_dir(
     metadata_dir: &OsPath,
     default: Option<OsPath>,
 ) -> Result<Option<OsPath>, RepositoryError> {
-    let bare = match cfg.get_bool("core.bare".as_ref()) {
+    let bare = match cfg.get_bool("core.bare") {
         Ok(bare) => bare,
         // absent defaults to false
         Err(err) if err.is_key_not_found() => false,
@@ -487,7 +508,7 @@ fn resolve_worktree_dir(
         // TODO: https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreworktree
         //  we need to consider GIT_COMMON_DIR when we support linked worktrees.
         //  The value of core.worktree must be ignored if GIT_COMMON_DIR is set.
-        match cfg.get_bytes("core.worktree".as_ref()) {
+        match cfg.get_bytes("core.worktree") {
             Ok(bytes) => {
                 let path = os::os_str_from_bytes(bytes.as_ref());
                 Some(metadata_dir.join(path)?)
@@ -721,12 +742,39 @@ impl Repository {
         })
     }
 
-    pub(super) fn objects_dir(&self) -> &OsPath {
-        &self.objects_dir
+    pub(super) fn database(&self) -> Database<'_> {
+        Database::new(&self.objects_dir, *self.format.object_format())
     }
 
-    pub(super) fn index_path(&self) -> OsPath {
-        self.layout.metadata_dir.join_unchecked("index")
+    // bare repos have no worktree
+    pub(super) fn workspace(&self) -> Option<Workspace<'_>> {
+        self.worktree_dir().map(Workspace::new)
+    }
+
+    pub(super) fn index(&self) -> Index {
+        Index::new(self.metadata_dir().join_unchecked("index"))
+    }
+
+    // TODO: need testing if this should be just `new()`, for now the approach is to treat a missing
+    //  config as "no local settings" instead of repository error
+    pub(super) fn config(&self) -> Result<ConfigFile, ConfigFileError> {
+        ConfigFile::new_or_empty(self.config_path())
+    }
+
+    pub(super) fn refs(&self) -> Refs {
+        Refs::new(self.metadata_dir())
+    }
+
+    pub(super) fn metadata_dir(&self) -> &OsPath {
+        self.layout.metadata_dir()
+    }
+
+    pub(super) fn worktree_dir(&self) -> Option<&OsPath> {
+        self.layout.worktree_dir()
+    }
+
+    pub(super) fn objects_dir(&self) -> &OsPath {
+        &self.objects_dir
     }
 
     pub(super) fn config_path(&self) -> OsPath {

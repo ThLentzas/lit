@@ -261,14 +261,14 @@ impl RepositoryFormat {
     //  - if compatObjectFormat is set, it never clashes with object format(primary hash is always
     //  different from compatibility hash).
     pub(crate) fn from_config(cfg: &ConfigFile) -> Result<Option<Self>, RepositoryFormatError> {
-        let version = match cfg.get_int("core.repositoryformatversion".as_ref()) {
+        let version = match cfg.get_int("core.repositoryformatversion") {
             Ok(version) => FormatVersion::try_from(version)?,
             Err(err) if err.is_key_not_found() => return Ok(None),
             Err(err) => return Err(RepositoryFormatError::Config(err)),
         };
         let mut format = RepositoryFormat::with_version(version);
 
-        if let Some(entries) = cfg.section_entries("extensions".as_ref())? {
+        if let Some(entries) = cfg.section_entries("extensions")? {
             for entry in entries {
                 format.apply_extension(entry)?;
             }

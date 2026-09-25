@@ -10,7 +10,7 @@ use std::path::{Component, Path};
 #[derive(Debug)]
 pub(crate) struct Pathspec {
     original: OsString,
-    pub(crate) pattern: RepoPath,
+    pattern: RepoPath,
 }
 
 impl Pathspec {
@@ -29,26 +29,29 @@ impl Pathspec {
     // In either case, `pattern` is a normalized repo relative path. Note that even when new() returns
     // we don't know if the path actually exists or not we never touched the fs, we just express it
     // relative to root
-    pub(crate) fn new(arg_path: &OsStr, prefix: &Path, root: &Path) -> Result<Self, PathspecError> {
+    //
+    // prefix: there is no prefix when path is absolute, prefix is an empty path when root = cwd
+    // root: working tree root
+    pub(crate) fn new(
+        arg_path: &OsStr,
+        prefix: Option<&Path>,
+        root: &OsPath,
+    ) -> Result<Self, PathspecError> {
         let cli_path = OsPath::new(arg_path)?;
-        let resolved = if cli_path.is_absolute() {
-            // have to clone here because we need to keep cli_path intact for reporting errors
-            cli_path.clone()
-        } else {
+        let resolved = match prefix {
             // the join() creates the root relative path
-            // prefix is the relative path from root to cwd and path is the relative path from cwd
+            // prefix is the relative path from root to cwd and cli_path is the relative path from cwd
             // to the resource the user wants to add
-            OsPath::new_unchecked(prefix.join(&cli_path))
+            Some(prefix) => OsPath::new_unchecked(prefix.join(&cli_path)),
+            None => cli_path.clone(),
         };
-
         let normalized = resolved.normalize_lexically();
-        let path = if normalized.is_absolute() {
-            normalized.strip_prefix(root)?
-        } else {
-            normalized.as_ref()
+        let path = match prefix {
+            Some(_) => normalized.as_ref(),
+            None => normalized.strip_prefix(root)?
         };
-
         let mut pattern = RepoPath::new();
+
         for component in path.components() {
             match component {
                 // path must be relative
@@ -75,6 +78,14 @@ impl Pathspec {
             original: arg_path.to_os_string(),
             pattern,
         })
+    }
+    
+    pub(crate) fn pattern(&self) -> &RepoPath {
+        &self.pattern
+    }
+    
+    pub(crate) fn original(&self) -> &OsStr {
+        &self.original
     }
 }
 
