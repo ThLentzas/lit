@@ -911,11 +911,20 @@ pub(crate) enum ConfigDocError {
     InvalidFormat { line: usize, source: ParseError },
 }
 
+impl ConfigDocError {
+    pub(super) fn is_io_not_found(&self) -> bool {
+        match self {
+            Self::Io(source) => source.is_not_found(),
+            _ => false,
+        }
+    } 
+}
+
 impl Error for ConfigDocError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            ConfigDocError::Io(source) => Some(source),
-            ConfigDocError::InvalidFormat { source, .. } => Some(source),
+            Self::Io(source) => Some(source),
+            Self::InvalidFormat { source, .. } => Some(source),
         }
     }
 }
@@ -923,10 +932,10 @@ impl Error for ConfigDocError {
 impl fmt::Display for ConfigDocError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            ConfigDocError::Io(_) => {
-                write!(f, "could not read config file")
+            Self::Io(_) => {
+                write!(f, "config file I/0 failed")
             }
-            ConfigDocError::InvalidFormat { line, .. } => {
+            Self::InvalidFormat { line, .. } => {
                 write!(f, "bad config line {line}")
             }
         }

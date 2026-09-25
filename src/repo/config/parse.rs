@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use crate::cmd::print::ReadableByte;
+use crate::command::print::ReadableByte;
 use crate::repo::config::doc::LineSpan;
 
 /// Note: use ascii_alphanumeric() not alphanumeric()

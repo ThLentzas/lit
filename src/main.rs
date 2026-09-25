@@ -1,7 +1,7 @@
 extern crate core;
 
 mod cli;
-mod cmd;
+mod command;
 mod repo;
 
 // TODO: every struct field that is called bytes changed it to inner, because it is a Vec<u8> it is obvious
@@ -20,8 +20,6 @@ fn main() {
 // TODO: write the new parser methods that are common in the next rewrite
 // TODO: review every single import and why we declare them that way in terms of access level
 // TODO: When I learn about const fn need to look again everything.
-// TODO: should Io error variants be merged if another variant which is also an enum has an Io variant too?
-// Workspace::Io and Workspace::OsError::Io
 // TODO: add a rustfmt file
 // TODO: check the visibility of all the mods again
 // TODO: can we eventually make a git port where someone can run a lit command their git directory
@@ -34,7 +32,10 @@ fn main() {
 // TODO: should we set a global rule to use ReadableByte for everything printable in stdout/err?
 // TODO: run git help --config to see what we have to support
 // TODO: should we do a warn!() macro?
-// TODO: No1 priority is to fix the os_str to bytes conversions, look at resolve_object_format()
-//  in init.rs::execute() and the signature logic
 // TODO: review every single Display impl that prints path, bytes etc to have 1 universal logic
 //  know it is mixed, path.display(), ReadableBytes and escape_ascii()
+// TODO: make sure that the op message for all IoError are the same for the operation that failed
+// TODO: we need to review the paths that we actually store need to be normalized not just lexically
+//  but with an actual fs call
+// TODO: CHECK the notes on why should never do lexical normalization to symlinks, review if we have
+//  done any so far

@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::{fmt, fs, io, result};
 
+const MINIMUM_UNIQUE_PREFIX_LEN: usize = 4;
+
 pub(crate) struct Database {
     path: OsPath,
     object_format: ObjectFormat,
@@ -159,11 +161,11 @@ impl Database {
     }
 
     // the way we resolve the shortest unique prefix for oids is by computing the parent dir, the first
-    // 2 letters, and then the remaining one are the entry's name within parent. When we walk the dir
+    // 2 letters, and then the remaining ones are the entry's name within parent. When we walk the dir
     // if there is an entry that starts with that prefix then it is a candidate. The dir can be polluted
     // by other non-lit related garbage which will be ignored.
     pub(crate) fn resolve_oid_prefix(&self, prefix: &str) -> Result<Oid> {
-        if prefix.len() < 4 {
+        if prefix.len() < MINIMUM_UNIQUE_PREFIX_LEN {
             return Err(PrefixError::TooShort(prefix.to_string()))?;
         }
 

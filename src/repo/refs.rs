@@ -1,4 +1,4 @@
-use crate::cmd::print::ReadableBytes;
+use crate::command::print::ReadableBytes;
 use crate::repo::db::DbError;
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::OidError;

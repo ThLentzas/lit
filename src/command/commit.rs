@@ -18,7 +18,7 @@ impl Commit {
     pub(super) fn execute(&self) -> Result<(), CommitError> {
         let repo = Repository::discover()?;
         let db = Database {
-            path: repo.db_path(),
+            path: repo.objects_dir(),
         };
         let workspace = Workspace {
             root: repo.root.clone(),

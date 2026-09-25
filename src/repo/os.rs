@@ -38,6 +38,10 @@ impl OsPath {
     {
         Self { inner: path.into() }
     }
+    
+    pub(crate) fn inner(&self) -> &Path {
+        &self.inner
+    }
 
     pub(crate) fn as_os_str(&self) -> &OsStr {
         self.inner.as_os_str()
@@ -156,6 +160,18 @@ impl OsPath {
             path.push(".");
         }
         Self::new_unchecked(path)
+    }
+
+    // we can't just use `==` for path comparisons because `PartialEq` for `PathBuf` calls
+    // `self.components() == other.components()`. It compares path values but paths can still refer
+    // to the same fs path even if they have different components.
+    //
+    // Read: repo/mod.rs::MetadataPlacement::from_discovery()
+    pub(crate) fn has_same_canonical_path_with(&self, other: &OsPath) -> Result<bool, IoError> {
+        let lhs = fs::canonicalize(self).with_context("realpath", Some(self))?;
+        let rhs = fs::canonicalize(other).with_context("realpath", Some(other))?;
+        
+        Ok(lhs == rhs)
     }
 }
 
@@ -364,11 +380,11 @@ impl Error for OsPathError {}
 impl fmt::Display for OsPathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            OsPathError::Empty => write!(f, "path is empty"),
-            OsPathError::ContainsNul(path) => {
+            Self::Empty => write!(f, "path is empty"),
+            Self::ContainsNul(path) => {
                 write!(f, "path {} contains NUL byte", path.display())
             }
-            OsPathError::StripPrefix(err) => write!(f, "{err}"),
+            Self::StripPrefix(err) => write!(f, "{err}"),
         }
     }
 }
@@ -398,6 +414,7 @@ impl<T> IoErrorContext<T> for io::Result<T> {
 // path is Option<OsPath> because we cannot report a path when failing to get the cwd
 #[derive(Debug)]
 pub(crate) struct IoError {
+    // TODO: should ops be an Enum so we can be consistent and void typing errors?
     // fs::metadata() -> stat
     // file.metadata() -> fstat
     // fs::symlink_metadata() -> lstat

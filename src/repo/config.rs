@@ -89,6 +89,19 @@ pub(crate) struct ConfigFile {
 //          you try to unset/set an option for which multiple lines match (ret=5), or
 //          you try to use an invalid regexp (ret=6).
 impl ConfigFile {
+    pub(crate) fn new(path: OsPath) -> Result<Self> {
+        let doc = match ConfigDoc::load(&path) {
+            Ok(doc) => doc,
+            Err(err) => {
+                return Err(ConfigFileError {
+                    path,
+                    kind: ConfigFileErrorKind::Doc(err),
+                });
+            }
+        };
+        Ok(Self { path, doc })
+    }
+
     // creates an in-memory empty ConfigFile, we associate that file with a path
     pub(crate) fn empty(path: OsPath) -> Self {
         Self {
@@ -97,9 +110,10 @@ impl ConfigFile {
         }
     }
 
-    pub(crate) fn new(path: OsPath) -> Result<Self> {
+    pub(crate) fn new_or_empty(path: OsPath) -> Result<Self> {
         let doc = match ConfigDoc::load(&path) {
             Ok(doc) => doc,
+            Err(err) if err.is_io_not_found() => return Ok(Self::empty(path)),
             Err(err) => {
                 return Err(ConfigFileError {
                     path,
@@ -129,23 +143,29 @@ impl ConfigFile {
             path: self.path.clone(),
             kind: ConfigFileErrorKind::BadKey(name.to_os_string()),
         })?;
-        let pos = match self.doc.key_last_pos(&key) {
-            Some(p) => p,
-            // TODO: ExitCode error 1
-            None => {
-                return Err(ConfigFileError {
-                    path: self.path.clone(),
-                    kind: ConfigFileErrorKind::NotFound(name.to_os_string()),
-                });
+
+        match self.doc.key_positions(&key) {
+            Some(positions) if positions.single() => {
+                // when Value is Cow::Borrowed the lifetime is tied to self, in this case doc, and doc lives
+                // in Config which lives enough so we can print for example the output.
+                let value = self.doc.value_at(positions.first());
+                let entry = ConfigEntry { key, value };
+
+                Ok(entry)
             }
-        };
-
-        // when Value is Cow::Borrowed the lifetime is tied to self, in this case doc, and doc lives
-        // in Config which lives enough so we can print for example the output.
-        let value = self.doc.value_at(pos);
-        let entry = ConfigEntry { key, value };
-
-        Ok(entry)
+            // By default, Git will not replace any key with multiple occurrences
+            // it does not matter if they are on the same block or separate
+            // two [core] blocks each with editor or 1 [core] block with multiple editor keys, both
+            // will be rejected with a message:  cannot overwrite multiple values with a single value
+            Some(_) => Err(ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::MultipleValues(name.to_os_string()),
+            }),
+            None => Err(ConfigFileError {
+                path: self.path.clone(),
+                kind: ConfigFileErrorKind::NotFound(name.to_os_string()),
+            }),
+        }
     }
 
     // multivalue key, not all variables of a section
@@ -443,6 +463,7 @@ impl ConfigFile {
 
 type Result<T> = result::Result<T, ConfigFileError>;
 
+// TODO: should we drop the mandatory path for variants like BadSectionName, BadKey?
 #[derive(Debug)]
 pub(crate) struct ConfigFileError {
     path: OsPath,
@@ -452,7 +473,7 @@ pub(crate) struct ConfigFileError {
 impl ConfigFileError {
     pub(crate) fn is_io_not_found(&self) -> bool {
         match &self.kind {
-            ConfigFileErrorKind::Doc(ConfigDocError::Io(err)) if err.is_not_found() => true,
+            ConfigFileErrorKind::Doc(source) => source.is_io_not_found(),
             _ => false,
         }
     }

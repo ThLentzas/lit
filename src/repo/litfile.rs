@@ -7,10 +7,13 @@ use std::io::Read;
 const PREFIX: &'static str = "litdir: ";
 const FILE_MAX_SIZE: u64 = 64 * 1024;
 
-// verifies that the file is a pointer file, not that it points to a valid lit rep
+// verifies that the file is a pointer file, not that it points to a valid lit repo
 // this is not a good api design because we have to pass the file_path just for error messaging
 // File does not have a single permanent path, it can be renamed while open
-pub(crate) fn read(file: &mut File, file_path: &OsPath) -> Result<OsPath, LitFileError> {
+//
+// https://git-scm.com/docs/gitrepository-layout#_description
+// the syntax is: litdir: <path>
+pub(crate) fn read(file: &File, file_path: &OsPath) -> Result<OsPath, LitFileError> {
     let mut buf = Vec::new();
     file.take(FILE_MAX_SIZE + 1)
         .read_to_end(&mut buf)
@@ -50,10 +53,18 @@ pub(crate) fn read(file: &mut File, file_path: &OsPath) -> Result<OsPath, LitFil
     }
     let path = os::os_str_from_bytes(bytes);
 
-    OsPath::new(path).map_err(|err| LitFileError {
+    let path = OsPath::new(path).map_err(|err| LitFileError {
         path: file_path.clone(),
         kind: LitFileErrorKind::OsPath(err),
-    })
+    })?;
+    // the path is relative to the location of .lit not the cwd of the process
+    // https://github.com/JanDeDobbeleer/oh-my-posh/issues/7797
+    //
+    // unwrap() is safe because any absolute path naming a regular file necessarily has a parent
+    // file_path is always absolute by construction, it is the result of resulting layout.link()
+    // via init::follow_pointer_if_symlink()
+    let parent = file_path.parent().unwrap();
+    Ok(parent.join_unchecked(path))
 }
 
 pub(crate) fn write(pointer_file: &OsPath, path_bytes: &[u8]) -> Result<(), IoError> {
@@ -93,8 +104,11 @@ impl Error for LitFileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.kind {
             LitFileErrorKind::Io(source) => Some(source),
+            LitFileErrorKind::TooLarge => None,
+            LitFileErrorKind::MissingPrefix => None,
+            LitFileErrorKind::Empty => None,
+            LitFileErrorKind::MissingLineEnding => None,
             LitFileErrorKind::OsPath(source) => Some(source),
-            _ => None,
         }
     }
 }

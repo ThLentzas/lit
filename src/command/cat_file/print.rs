@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use crate::cmd::print::{self, Printer};
+use crate::command::print::{self, Printer};
 use crate::repo::object::{Object, Signature};
 use crate::repo::object::mode::Mode;
 

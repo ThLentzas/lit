@@ -1,7 +1,7 @@
 mod print;
 
-use crate::cmd::cat_file::print::CatFilePrinter;
-use crate::cmd::print::Printer;
+use crate::command::cat_file::print::CatFilePrinter;
+use crate::command::print::Printer;
 use crate::repo::db::{Database, DbError};
 use crate::repo::object::ObjectType;
 use crate::repo::object::oid::Oid;
@@ -22,7 +22,7 @@ impl CatFile {
     pub(super) fn execute(&self) -> Result<(), CatFileError> {
         let repo = Repository::discover()?;
         let db = Database {
-            path: repo.db_path(),
+            path: repo.objects_dir(),
         };
 
         let oid = self

@@ -1,5 +1,5 @@
 use std::io;
-use crate::cmd::print::Printer;
+use crate::command::print::Printer;
 use crate::repo::config::ConfigEntry;
 
 pub(super) struct ConfigPrinter {

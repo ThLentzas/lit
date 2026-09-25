@@ -1,5 +1,5 @@
-use crate::cmd::print::Printer;
-use crate::cmd::status::print::StatusPrinter;
+use crate::command::print::Printer;
+use crate::command::status::print::StatusPrinter;
 use crate::repo::index::{Index, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::report::{Report, ReportError};

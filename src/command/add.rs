@@ -7,7 +7,7 @@ use crate::repo::os::{FileKind, StatNode};
 use crate::repo::repo_path::RepoPath;
 use crate::repo::pathspec::{Pathspec, PathspecError};
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{DiscoverError, Repository};
+use crate::repo::{DiscoverError, Repository, RepositoryError};
 use std::error::Error;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,7 @@ impl Add {
     pub(super) fn execute(&self) -> Result<(), AddError> {
         let repo = Repository::discover()?;
         let db = Database {
-            path: repo.db_path(),
+            path: repo.objects_dir(),
         };
         let workspace = Workspace {
             root: repo.root.clone(),
@@ -193,7 +193,7 @@ impl<'a> EntryCollector<'a> {
 
 #[derive(Debug)]
 pub(super) enum AddError {
-    Repository(DiscoverError),
+    Repository(RepositoryError),
     Index(IndexError),
     Database(DbError),
     Workspace(WorkspaceError),
@@ -239,8 +239,8 @@ impl fmt::Display for AddError {
     }
 }
 
-impl From<DiscoverError> for AddError {
-    fn from(err: DiscoverError) -> Self {
+impl From<RepositoryError> for AddError {
+    fn from(err: RepositoryError) -> Self {
         AddError::Repository(err)
     }
 }

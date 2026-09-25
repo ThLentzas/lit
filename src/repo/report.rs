@@ -73,7 +73,7 @@ impl Report {
     pub(crate) fn generate(repo: &Repository, index: &Index) -> Result<Self, ReportError> {
         let mut report = Self::new();
         let db = Database {
-            path: repo.db_path(),
+            path: repo.objects_dir(),
         };
         let workspace = Workspace {
             root: repo.root.clone(),

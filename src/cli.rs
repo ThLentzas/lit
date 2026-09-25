@@ -1,4 +1,4 @@
-use crate::cmd::Command;
+use crate::command::Command;
 use clap::Parser;
 
 // TODO: https://git-scm.com/docs/git, top level options

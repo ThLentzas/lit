@@ -1,9 +1,9 @@
-use crate::cmd::status::Format;
+use crate::command::status::Format;
 use crate::repo::os::FileKind;
 use crate::repo::repo_path::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::io::{self, IsTerminal, Write};
-use crate::cmd::print::{self, Printer};
+use crate::command::print::{self, Printer};
 
 // TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;

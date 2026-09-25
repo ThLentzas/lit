@@ -1,4 +1,4 @@
-use crate::cmd::print::ReadableBytes;
+use crate::command::print::ReadableBytes;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;

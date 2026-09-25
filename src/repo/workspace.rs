@@ -41,14 +41,14 @@ impl Workspace {
     // returns the target's path
     pub(crate) fn read_link(&self, path: &RepoPath) -> Result<Vec<u8>, IoError> {
         let absolute = self.to_absolute(path);
-        let path = fs::read_link(&absolute).with_context("readlink", Some(absolute))?;
+        let path = fs::read_link(&absolute).with_context("openlink", Some(absolute))?;
         Ok(os::os_str_as_bytes(path.as_os_str()).to_vec())
     }
 
     pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, IoError> {
         let absolute = self.to_absolute(path);
 
-        fs::read(&absolute).with_context("read", Some(&absolute))
+        fs::read(&absolute).with_context("open", Some(&absolute))
     }
 
     pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, IoError> {
@@ -119,8 +119,7 @@ impl Workspace {
     }
 
     fn to_absolute(&self, path: &RepoPath) -> OsPath {
-        self.root
-            .join_unchecked(os::os_str_from_bytes(path.as_bytes()))
+        self.root.join_unchecked(os::os_str_from_bytes(path.as_bytes()))
     }
 }
 
