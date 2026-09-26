@@ -3,11 +3,12 @@ use crate::repo::format::{
     FormatVersion, ObjectFormat, ObjectFormatError, RefFormat, RefFormatError, RefStorage,
     RepositoryFormat, RepositoryFormatError,
 };
+use crate::repo::layout::Layout;
 use crate::repo::litfile::{self, LitFileError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::os::{self, IoError, IoErrorContext, OsPath, OsPathError};
 use crate::repo::refs::{RefError, Refs};
-use crate::repo::{self, EntryType, Layout, LayoutError, RepositoryError, environment};
+use crate::repo::{self, EntryType, LayoutError, RepositoryError, environment};
 use clap::Args;
 use std::borrow::Cow;
 use std::error::Error;

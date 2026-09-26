@@ -167,7 +167,7 @@ impl OsPath {
     // to the same fs path even if they have different components.
     //
     // Read: repo/mod.rs::MetadataPlacement::from_discovery()
-    pub(crate) fn has_same_canonical_path_with(&self, other: &OsPath) -> Result<bool, IoError> {
+    pub(crate) fn same_canonical_path_with(&self, other: &OsPath) -> Result<bool, IoError> {
         let lhs = fs::canonicalize(self).with_context("realpath", Some(self))?;
         let rhs = fs::canonicalize(other).with_context("realpath", Some(other))?;
 
@@ -446,5 +446,27 @@ impl Error for IoError {}
 impl fmt::Display for IoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: ", self.op)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_empty_path() {
+        let path = PathBuf::from("");
+        let error = OsPath::new(&path).unwrap_err();
+
+        assert_eq!(error, OsPathError::Empty);
+    }
+
+    #[test]
+    fn reject_nul_in_path() {
+        let path = OsStr::from_bytes(&[0, 41, 2]);
+        let path = PathBuf::from(path);
+        let error = OsPath::new(&path).unwrap_err();
+
+        assert_eq!(error, OsPathError::ContainsNul(path));
     }
 }

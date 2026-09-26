@@ -16,8 +16,7 @@ pub(crate) struct Timestamp {
 
 impl Timestamp {
     // TODO: fow now the date for commit is generated at every new commit. In the future when we add
-    // support for Date formats we will adjust the logic.
-    // https://git-scm.com/docs/git-commit#_date_formats
+    //  support for Date formats we will adjust the logic. https://git-scm.com/docs/git-commit#_date_formats
     pub(super) fn now() -> Self {
         let now = Local::now();
         let secs = now.offset().fix().local_minus_utc();

@@ -15,6 +15,7 @@ pub(super) mod report;
 pub(super) mod timestamp;
 pub(super) mod tree;
 pub(super) mod workspace;
+pub(super) mod layout;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::Database;
@@ -29,284 +30,8 @@ use std::fs::{self, File, FileType};
 use std::path::Path;
 use std::{fmt, io};
 use crate::repo::index::Index;
+use crate::repo::layout::Layout;
 use crate::repo::refs::Refs;
-
-// describes how the resolved worktree is connected to the metadata directory
-enum MetadataPlacement {
-    // metadata dir is used directly, typically bare repos where there is no worktree
-    Direct,
-    // Ordinary `<worktree>/.lit` dir
-    Embedded,
-    // `<worktree>/.lit` is a pointer file to metadata
-    Separate { pointer_file: OsPath },
-}
-
-impl MetadataPlacement {
-    // TODO: we need to list every possible combination and then write a test for each. In our tests
-    //  we need to make sure that any bare repo ends up with worktree_dir: None and any non-bare repo
-    //  always ends up with Some(worktree_dir)
-    //
-    // we can't naively compare paths without resolution first
-    //
-    // 1. `worktree_dir` has the `core.worktree` value resolved based on metadata dir
-    //      metadata_dir = /projects/app/.lit
-    //      core.worktree = ..
-    //      worktree = metadata_dir.join(worktree_dir) -> /projects/app/.lit/..
-    //
-    //      let entry = dir.join_unchecked(".lit"); which creates /projects/app/.lit/../.lit
-    //      the comparison then fails, and we end up with `Direct` which
-    //      is incorrect because /projects/app/.lit/../.lit normalizes to /projects/app/.lit so
-    //      the result should be `Embedded`. core.worktree is /projects/app
-    // 2. `pointer_file` is `projects/app/.lit` pointing to `/storage/app-metadata`
-    //      worktree is `core.worktree` = `projects/app/src/..`
-    //      entry = projects/app/src/../.lit
-    //      the comparison fails, and we get `Direct` instead of `Separate`. The actual worktree
-    //      path is `projects/app` and `/projects/app/.lit is a pointer file
-    // 3. worktree is reach via symlink
-    //      `/home/user/app` is a symlink to `/projects/app
-    //      `LIT_DIR` = /projects/app/.lit
-    //      `LIT_WORK_TREE` = /home/user/app
-    //
-    //      we compare /projects/app/.lit to /home/user/app/.lit again getting `Direct` instead of
-    //      `Embedded`
-    fn from_discovery(
-        metadata_dir: &OsPath,
-        worktree_dir: Option<&OsPath>,
-        pointer_file: Option<OsPath>,
-    ) -> Result<Self, IoError> {
-        // bare repos, no relationship to classify
-        let Some(worktree_dir) = worktree_dir else {
-            return Ok(Self::Direct);
-        };
-
-        let entry = worktree_dir.join_unchecked(".lit");
-        let metadata = match fs::metadata(&entry) {
-            Ok(metadata) => metadata,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self::Direct);
-            }
-            Err(err) => return Err(IoError::new("stat", Some(entry), err)),
-        };
-
-        if metadata.is_dir() {
-            // if entry exists and is a dir compare with the metadata dir
-            if metadata_dir.has_same_canonical_path_with(&entry)? {
-                return Ok(Self::Embedded);
-            }
-        } else if metadata.is_file() {
-            // this is case 2 mentioned in the comment above
-            if let Some(pointer_file) = pointer_file
-                && pointer_file.has_same_canonical_path_with(&entry)?
-            {
-                return Ok(Self::Separate { pointer_file });
-            }
-        }
-        Ok(Self::Direct)
-    }
-}
-
-pub(super) struct Layout {
-    // directory containing the repository metadata (HEAD, config, objects, ...)
-    metadata_dir: OsPath,
-    // root of the working tree for non-bare
-    // None for bare
-    worktree_dir: Option<OsPath>,
-    // describes how the metadata is connected to the worktree
-    placement: MetadataPlacement,
-}
-
-impl Layout {
-    // There are 4 factors that determine the location of metadata dir when initializing a repo.
-    // --bare, --separate_lit_dir, path and the LIT_DIR/LIT_WORK_TREE env vars.
-    //
-    //  Resolves the metadata and worktree locations without touching the fs
-    //
-    // Git's init impl will try to "guess" whether a repo should be bare from the value of GIT_DIR
-    // https://github.com/git/git/blob/18e66859d87fb4b76599f73460b54f0848c76b16/builtin/init-db.c#L17-L48
-    //  We avoid this behavior and set the following rules:
-    //  - A repository is bare only when --bare is provided.
-    //  - LIT_DIR has the same meaning as GIT_DIR. It names the metadata directory itself, not the
-    //  directory in which an embedded `.lit` directory should be created, this is what the path
-    //  positional arg refers to.
-    //  - A positional path names the repository location and has precedence over LIT_DIR:
-    //      - non-bare: <path> is the worktree and metadata is stored in <path>/.lit
-    //      - bare: <path> is the metadata directory and there is no worktree
-    //  - If there is no positional path or --separate-lit-dir, LIT_DIR selects the metadata directory:
-    //      - non-bare: LIT_WORK_TREE selects the worktree, falling back to cwd when unset
-    //      - bare: no worktree, so LIT_WORK_TREE is ignored
-    //  - LIT_WORK_TREE without LIT_DIR is ignored
-    //  - With no explicit location, non-bare init uses cwd/.lit and bare init uses cwd directly
-    /// Determines the repository layout
-    pub(super) fn resolve(
-        path: Option<&Path>,
-        bare: bool,
-        separate_lit_dir: Option<&Path>,
-    ) -> Result<Self, LayoutError> {
-        // highest precedence, reject early
-        // if we call map(OsPath::new) we get Option<Result<T, E>> but what we want is Result<Option<T>, E>
-        // that is what transpose does
-        let path = path.map(OsPath::new).transpose()?;
-
-        let cwd = environment::cwd()?;
-        // root of the worktree
-        let root = path
-            .as_ref()
-            .map_or(cwd.clone(), |path| cwd.join_unchecked(path));
-
-        if let Some(metadata_dir) = separate_lit_dir {
-            // TODO: should this be a notification to the user that LIT_DIR is actually ignored
-            //  because the flag has higher precedence. This is a conflict because both try to
-            //  name the metadata dir
-            return Ok(Self {
-                metadata_dir: cwd.join(metadata_dir)?,
-                // the parent identifies the worktree even though the metadata is elsewhere
-                worktree_dir: Some(root.clone()),
-                placement: MetadataPlacement::Separate {
-                    pointer_file: root.join_unchecked(".lit"),
-                },
-            });
-        }
-
-        // explicit positional path wins over LIT_DIR
-        if path.is_some() {
-            return if bare {
-                Ok(Self {
-                    metadata_dir: root,
-                    worktree_dir: None,
-                    placement: MetadataPlacement::Direct,
-                })
-            } else {
-                // lit init <path>
-                Ok(Self {
-                    metadata_dir: root.join_unchecked(".lit"), // <worktree>.lit
-                    worktree_dir: Some(root),
-                    placement: MetadataPlacement::Embedded,
-                })
-            };
-        }
-
-        // LIT_DIR names the metadata directory itself containing HEAD, config, objects/. We don't
-        // append `.lit` to it. This is why placement is MetadataPlacement::Direct
-        // LIT_WORK_TREE names the working tree root, the directory containing the files we want to
-        // work on
-        //
-        // They can be completely separate:
-        //  - LIT_DIR: /srv/lit-metadata/project
-        //  - LIT_WORK_TREE: /home/thanos/projects/project
-        if let Some(env_dir) = environment::var(environment::LIT_DIR) {
-            let env_dir = cwd.join(env_dir)?;
-            // LIT_WORK_TREE makes sense only in conjunction with LIT_DIR without --bare. In any
-            // other case it is ignored.
-            let worktree = environment::var(environment::LIT_WORK_TREE);
-            let worktree = worktree.map(OsPath::new).transpose()?;
-            // bare repos have no worktree
-            if bare && worktree.is_some() {
-                return Err(LayoutError::LitWorkTreeWithBare);
-            }
-
-            return if bare {
-                Ok(Self {
-                    metadata_dir: env_dir,
-                    worktree_dir: None,
-                    placement: MetadataPlacement::Direct,
-                })
-            } else {
-                // if no WORK_TREE found we fall back to cwd
-                let worktree =
-                    worktree.map_or(cwd.clone(), |worktree| cwd.join_unchecked(worktree));
-                Ok(Self {
-                    metadata_dir: env_dir,
-                    worktree_dir: Some(worktree),
-                    placement: MetadataPlacement::Direct,
-                })
-            };
-        }
-
-        // Note: LIT_WORK_TREE is considered only when LIT_DIR is set. This branch is reached when
-        // LIT_DIR is unset, so even if LIT_WORK_TREE is set, it is ignored. bare does not error,
-        // non-bare uses cwd
-        if bare {
-            Ok(Self {
-                metadata_dir: cwd,
-                worktree_dir: None,
-                placement: MetadataPlacement::Direct,
-            })
-        } else {
-            Ok(Self {
-                metadata_dir: cwd.join_unchecked(".lit"),
-                worktree_dir: Some(cwd),
-                placement: MetadataPlacement::Embedded,
-            })
-        }
-    }
-
-    // the worktree root for non-bare or the metadata directory for bare
-    pub(super) fn root(&self) -> &OsPath {
-        self.worktree_dir.as_ref().unwrap_or(&self.metadata_dir)
-    }
-
-    pub(super) fn metadata_dir(&self) -> &OsPath {
-        &self.metadata_dir
-    }
-
-    pub(super) fn worktree_dir(&self) -> Option<&OsPath> {
-        self.worktree_dir.as_ref()
-    }
-
-    // link is always absolute by construction
-    pub(super) fn pointer_file(&self) -> Option<&OsPath> {
-        if let MetadataPlacement::Separate { pointer_file } = &self.placement {
-            return Some(pointer_file);
-        }
-        None
-    }
-
-    pub(super) fn is_bare(&self) -> bool {
-        self.worktree_dir.is_none()
-    }
-
-    // decide if we have to set core.worktree in config
-    pub(super) fn needs_worktree_config(&self) -> bool {
-        let Some(worktree) = &self.worktree_dir else {
-            return false;
-        };
-
-        // core.worktree is only set when LIT_DIR is used which is in the direct case
-        //  LIT_DIR: /foo/metadata
-        //  LIT_WORK_TREE: /bar
-        // we can't use the rule that worktree is the parent of metadata, we have to check
-        // if worktree.join(.lit) is our metadata dir
-        //
-        // It is important to set the core.worktree in this case because when we try to discover if
-        // a repo is a lit repo via LIT_DIR we need a way to identify the worktree. First we check
-        // for LIT_WORK_TREE, then for core.worktree and then we fall back to cwd.
-        //
-        // there is also the case where LIT_DIR is an absolute path, LIT_WORK_TREE is not set and
-        // worktree ends up being the cwd, this needs to be resolved in the same way
-        match self.placement {
-            MetadataPlacement::Direct => self.metadata_dir != worktree.join_unchecked(".lit"),
-            // <worktree>/.lit is metadata, parent is worktree
-            MetadataPlacement::Embedded => false,
-            // pointer file, its parent identifies the worktree even the metadata is elsewhere
-            MetadataPlacement::Separate { .. } => false,
-        }
-    }
-
-    fn from_discovery(
-        metadata_dir: OsPath,
-        worktree_dir: Option<OsPath>,
-        pointer_file: Option<OsPath>,
-    ) -> Result<Self, IoError> {
-        let placement =
-            MetadataPlacement::from_discovery(&metadata_dir, worktree_dir.as_ref(), pointer_file)?;
-
-        Ok(Self {
-            metadata_dir,
-            worktree_dir,
-            placement,
-        })
-    }
-}
 
 // validate that the directory pointed by path is a valid Lit repository before migration for the
 // separate-lit-dir flag
@@ -503,6 +228,8 @@ fn resolve_worktree_dir(
         Err(err) => return Err(RepositoryError::Config(err)),
     };
     let worktree_dir = if bare {
+        // TODO: git still checks if `core.worktree` is present and warns if so because they are in
+        //  conflict
         None
     } else {
         // TODO: https://git-scm.com/docs/git-config#Documentation/git-config.txt-coreworktree
@@ -778,11 +505,7 @@ impl Repository {
     }
 
     pub(super) fn config_path(&self) -> OsPath {
-        self.layout.metadata_dir.join_unchecked("config")
-    }
-
-    pub(super) fn refs_path(&self) -> OsPath {
-        self.layout.metadata_dir.join_unchecked("refs")
+        self.layout.metadata_dir().join_unchecked("config")
     }
 
     pub(super) fn is_bare(&self) -> bool {
