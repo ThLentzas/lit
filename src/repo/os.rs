@@ -354,7 +354,7 @@ pub(crate) fn probe_filemode(path: &OsPath) -> Result<bool, IoError> {
 // symlinks are fine) and we check what the filesystem reports
 pub(crate) fn probe_symlink(link: &OsPath) -> Result<bool, IoError> {
     let test = OsPath::new_unchecked("test_symlink");
-    match unix_fs::symlink(&test, link) {
+    match symlink(&test, link) {
         Ok(_) => fs::symlink_metadata(link)
             .map(|metadata| metadata.file_type().is_symlink())
             .with_context("lstat", Some(link)),
@@ -366,6 +366,14 @@ pub(crate) fn probe_symlink(link: &OsPath) -> Result<bool, IoError> {
 pub(crate) fn is_executable(path: &OsPath) -> Result<bool, IoError> {
     let metadata = fs::symlink_metadata(path).with_context("lstat", Some(path))?;
     Ok(matches!(file_kind(&metadata), FileKind::Regular(true)))
+}
+
+pub(crate) fn symlink<P, Q>(original: P, link: Q) -> Result<(), IoError>
+where
+    P: AsRef<Path>,
+    Q: AsRef<Path>,
+{
+    unix_fs::symlink(original, &link).with_context("symlink", Some(link))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -418,6 +426,9 @@ pub(crate) struct IoError {
     // fs::metadata() -> stat
     // file.metadata() -> fstat
     // fs::symlink_metadata() -> lstat
+    // fs::symlink() -> symlink
+    // fs::remove_file() -> unlink
+    // fs::remove_dir() -> rmdir
     op: &'static str,
     path: Option<OsPath>,
     source: io::Error,

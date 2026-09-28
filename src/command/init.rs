@@ -3,17 +3,16 @@ use crate::repo::format::{
     FormatVersion, ObjectFormat, ObjectFormatError, RefFormat, RefFormatError, RefStorage,
     RepositoryFormat, RepositoryFormatError,
 };
-use crate::repo::layout::Layout;
 use crate::repo::litfile::{self, LitFileError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::os::{self, IoError, IoErrorContext, OsPath, OsPathError};
 use crate::repo::refs::{RefError, Refs};
-use crate::repo::{self, EntryType, LayoutError, RepositoryError, environment};
+use crate::repo::{self, EntryType, RepositoryError, environment};
 use clap::Args;
 use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
 use tempfile::{Builder, NamedTempFile, TempDir};
 
@@ -47,26 +46,24 @@ impl Init {
     // TODO: create hooks, info, description
     pub(super) fn execute(&self) -> Result<(), InitError> {
         // resolve arguments and env vars for the location of the metadata dir.
-        // resolve() sets rules for a deterministic layout.
-        let layout = Layout::resolve(
+        let destination = Destination::resolve(
             self.path.as_deref(),
             self.bare,
             self.separate_lit_dir.as_deref(),
         )?;
-
         // create the positional/root directory first
         // non-bare repos need the working tree directory while bare repos need the metadata
-        fs::create_dir_all(layout.root()).with_context("mkdir", Some(layout.root()))?;
+        fs::create_dir_all(destination.root()).with_context("mkdir", Some(destination.root()))?;
         let cwd = environment::cwd()?;
         // we relocate before loading configuration so the rest of init uses the destination repo
-        if let Some(link) = layout.pointer_file() {
+        if let Some(link) = destination.pointer_file() {
             // TODO: we need to write a test and see what happens if someone provides --separate-lit-dir
             //  flag for an existing bare repo
-            try_migrate_metadata(link, layout.metadata_dir(), &cwd)?;
+            try_migrate_metadata(link, destination.metadata_dir(), &cwd)?;
         }
 
-        ensure_dir(layout.metadata_dir())?;
-        let cfg_path = layout.metadata_dir().join_unchecked("config");
+        ensure_dir(destination.metadata_dir())?;
+        let cfg_path = destination.metadata_dir().join_unchecked("config");
         let mut lockfile = Lockfile::acquire(&cfg_path)?;
         // https://github.com/git/git/blob/3cb9185f65410273787f74333cc027d2ea5daada/setup.c#L751
         // a fresh repo, or a reinit with a missing file we have to repair
@@ -111,12 +108,12 @@ impl Init {
         //  support shallow repositories(contains truncated history)
         //  next is to copy any templates
         //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2587
-        let reinit = is_reinit(layout.metadata_dir())?;
+        let reinit = is_reinit(destination.metadata_dir())?;
         finalize_format_version(&mut cfg, &mut repo_format)?;
         // When a tracked entry's mode differs from what is recorded, Git must distinguish if the
         // change was actually made by the user, or it is a false positive because the environment
         // does not support Unix permissions(Windows, a fs mounted without permissions)
-        let trust_filemode = trust_filemode(layout.metadata_dir())?;
+        let trust_filemode = trust_filemode(destination.metadata_dir())?;
         if trust_filemode {
             cfg.set_all("core.filemode", "true")?;
         } else {
@@ -131,7 +128,7 @@ impl Init {
         // we honor the invariant that we set in resolve() that explicit --bare flag wins. Calling
         // --bare on an existing repo will set the `core.bare = true` and delete all `core.worktree`
         // instances.
-        if layout.is_bare() {
+        if destination.is_bare() {
             cfg.unset_all("core.worktree")?;
             cfg.set_all("core.bare", "true")?;
         } else {
@@ -139,7 +136,7 @@ impl Init {
             // https://git-scm.com/docs/git-config#Documentation/git-config.txt-corelogAllRefUpdates
             // From the docs: `This value is true by default in a repository that has a working
             //  directory associated with it, and false by default in a bare repository.`
-            // The term `working directory` translates to Layout's worktree, not the cwd.
+            // The term `working directory` translates to Destinations's worktree, not the cwd.
             //
             // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2628-L2641
             // Did some manual testing against Git and if the repo is bare it ignores the value if
@@ -155,10 +152,14 @@ impl Init {
                 }
                 Err(err) => return Err(InitError::Config(err)),
             }
-            if layout.needs_worktree_config() {
-                // non-bare layout so worktree_dir() is safe to unwarp
-                let value = os::os_str_from_bytes(layout.worktree_dir().unwrap().as_bytes());
+            if destination.needs_worktree_config()? {
+                // non-bare so worktree_dir() is safe to unwarp
+                let value = os::os_str_from_bytes(destination.worktree_dir().unwrap().as_bytes());
                 cfg.set_all("core.worktree", value)?;
+            } else {
+                // The intended `.lit` relationship provides the worktree, remove an old override
+                // that could select another location
+                cfg.unset_all("core.worktree")?;
             }
         }
 
@@ -169,17 +170,17 @@ impl Init {
             // absence -> implicitly true
             // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2646-L2653
             // only writes false in the else block
-            if !support_symlinks(layout.metadata_dir())? {
+            if !support_symlinks(destination.metadata_dir())? {
                 cfg.set_all("core.symlinks", "false")?;
             }
             // absence -> implicitly false
-            if !is_case_sensitive_fs(layout.metadata_dir())? {
+            if !is_case_sensitive_fs(destination.metadata_dir())? {
                 cfg.set_all("core.ignorecase", "true")?;
             }
         }
-        setup_object_db(layout.metadata_dir(), &cwd)?;
+        setup_object_db(destination.metadata_dir(), &cwd)?;
         setup_ref_backend(
-            layout.metadata_dir(),
+            destination.metadata_dir(),
             // as_ref() would give us Option<&OsString>
             self.initial_branch.as_deref(),
             &cfg,
@@ -190,18 +191,226 @@ impl Init {
         if !reinit {
             println!(
                 "Initialized existing Lit repository in {}",
-                layout.metadata_dir().display()
+                destination.metadata_dir().display()
             );
         } else {
             println!(
                 "Reinitialized existing Lit repository in {}",
-                layout.metadata_dir().display()
+                destination.metadata_dir().display()
             );
         }
         lockfile.write(&cfg.serialize())?;
         lockfile.commit()?;
 
         Ok(())
+    }
+}
+
+// we keep the state after applying our path rules
+// the paths are all absolute but not canonical, they are resolved based on the rules
+// read comment in Self::resolve()
+// it is an intermediate representation of the layout, since those paths are not normalized yet(it
+// is likely that they won't exist for a fresh repo), symlinks are not resolved etc.
+#[derive(Debug)]
+struct Destination {
+    metadata_dir: OsPath,
+    worktree_dir: Option<OsPath>,
+    pointer_file: Option<OsPath>,
+}
+
+impl Destination {
+    // There are 4 factors that determine the location of metadata dir when initializing a repo.
+    // --bare, --separate_lit_dir, path and the LIT_DIR/LIT_WORK_TREE env vars.
+    //
+    //  Resolves the metadata and worktree locations without touching the fs
+    //
+    // Git's init impl will try to "guess" whether a repo should be bare from the value of GIT_DIR
+    // https://github.com/git/git/blob/18e66859d87fb4b76599f73460b54f0848c76b16/builtin/init-db.c#L17-L48
+    //  We avoid this behavior and set the following rules:
+    //  - A repository is bare only when --bare is provided.
+    //  - LIT_DIR has the same meaning as GIT_DIR. It names the metadata directory itself, not the
+    //  directory in which an embedded `.lit` directory should be created, this is what the path
+    //  positional arg refers to.
+    //  - A positional path names the repository location and has precedence over LIT_DIR:
+    //      - non-bare: <path> is the worktree and metadata is stored in <path>/.lit
+    //      - bare: <path> is the metadata directory and there is no worktree
+    //  - If there is no positional path or --separate-lit-dir, LIT_DIR selects the metadata directory:
+    //      - non-bare: LIT_WORK_TREE selects the worktree, falling back to cwd when unset
+    //      - bare: no worktree, so LIT_WORK_TREE is ignored
+    //  - LIT_WORK_TREE without LIT_DIR is ignored
+    //  - With no explicit location, non-bare init uses cwd/.lit and bare init uses cwd directly
+    // These are the rules on how we resolve paths: https://kernel.googlesource.com/pub/scm/git/git.git/%2B/d8a267404cb2a9376bed0ede45c759a0b30590d7/t/t1510-repo-setup.sh
+    fn resolve(
+        path: Option<&Path>,
+        bare: bool,
+        separate_lit_dir: Option<&Path>,
+    ) -> Result<Self, DestinationError> {
+        // highest precedence, reject early
+        // if we call map(OsPath::new) we get Option<Result<T, E>> but what we want is Result<Option<T>, E>
+        // that is what transpose does
+        let path = path.map(OsPath::new).transpose()?;
+        let cwd = environment::cwd()?;
+        // root of the worktree
+        let root = path
+            .as_ref()
+            .map_or(cwd.clone(), |path| cwd.join_unchecked(path));
+
+        if let Some(metadata_dir) = separate_lit_dir {
+            let pointer_file = root.join_unchecked(".lit");
+            return Ok(Self {
+                metadata_dir: cwd.join(metadata_dir)?,
+                worktree_dir: Some(root),
+                pointer_file: Some(pointer_file),
+            });
+        }
+
+        // explicit positional path wins over `LIT_DIR`
+        if path.is_some() {
+            return if bare {
+                Ok(Self {
+                    metadata_dir: root,
+                    worktree_dir: None,
+                    pointer_file: None,
+                })
+            } else {
+                Ok(Self {
+                    // <worktree>/.lit
+                    metadata_dir: root.join_unchecked(".lit"),
+                    worktree_dir: Some(root),
+                    pointer_file: None,
+                })
+            };
+        }
+
+        // LIT_DIR names the metadata directory itself containing HEAD, config, objects/. We don't
+        // append `.lit` to it. This is why placement is MetadataPlacement::Direct
+        // LIT_WORK_TREE names the working tree root, the directory containing the files we want to
+        // work on
+        //
+        // They can be completely separate:
+        //  - LIT_DIR: /srv/lit-metadata/project
+        //  - LIT_WORK_TREE: /home/thanos/projects/project
+        if let Some(metadata_dir) = environment::var(environment::LIT_DIR) {
+            let metadata_dir = cwd.join(metadata_dir)?;
+            // LIT_WORK_TREE makes sense only in conjunction with LIT_DIR without --bare. In any
+            // other case it is ignored.
+            let worktree = environment::var(environment::LIT_WORK_TREE);
+            let worktree = worktree.map(OsPath::new).transpose()?;
+            // bare repos have no worktree
+            if bare && worktree.is_some() {
+                return Err(DestinationError::LitWorkTreeWithBare);
+            }
+
+            let worktree_dir = if bare {
+                None
+            } else {
+                // if no WORK_TREE found we fall back to cwd
+                // https://kernel.googlesource.com/pub/scm/git/git.git/%2B/d8a267404cb2a9376bed0ede45c759a0b30590d7/t/t1510-repo-setup.sh
+                // https://git-scm.com/docs/git#Documentation/git.txt---work-treeltpathgt
+                // LIT_WORK_TREE is resolved against cwd if relative
+                Some(worktree.map_or(cwd.clone(), |worktree| cwd.join_unchecked(worktree)))
+            };
+            return Ok(Self {
+                metadata_dir,
+                worktree_dir,
+                pointer_file: None,
+            });
+        }
+
+        // Note: LIT_WORK_TREE is considered only when LIT_DIR is set. This branch is reached when
+        // LIT_DIR is unset, so even if LIT_WORK_TREE is set, it is ignored. bare does not error,
+        // non-bare uses cwd
+        if bare {
+            Ok(Self {
+                metadata_dir: root,
+                worktree_dir: None,
+                pointer_file: None,
+            })
+        } else {
+            Ok(Self {
+                metadata_dir: root.join_unchecked(".lit"),
+                worktree_dir: Some(root),
+                pointer_file: None,
+            })
+        }
+    }
+
+    // the worktree root for non-bare or the metadata directory for bare
+    fn root(&self) -> &OsPath {
+        self.worktree_dir.as_ref().unwrap_or(&self.metadata_dir)
+    }
+
+    fn metadata_dir(&self) -> &OsPath {
+        &self.metadata_dir
+    }
+
+    fn worktree_dir(&self) -> Option<&OsPath> {
+        self.worktree_dir.as_ref()
+    }
+
+    fn pointer_file(&self) -> Option<&OsPath> {
+        self.pointer_file.as_ref()
+    }
+
+    fn is_bare(&self) -> bool {
+        self.worktree_dir.is_none()
+    }
+
+    // TODO: provide 1 example for each case
+    // resolve() provides absolute paths but those are not canonical, and we can not determine if
+    // we should write `core.worktree` without making an `fs` call. Symlinks can make the comparison
+    // incorrectly conclude that the setting is necessary. Paths with special components('.', '..')
+    // also can lead to the same behavior. We might end up writing redundant config.
+    //
+    // 1. no worktree -> no setting(bare)
+    //  `metadata_dir` = /repos/app.git
+    //  `worktree_dir` = None,
+    //  `pointer_file` = None
+    // 2. pointer_file -> no setting
+    //  `metadata_dir` = /storage/app-metadata
+    //  `worktree_dir` = /projects/app,
+    //  `pointer_file` = /projects/app/.lit -> `litdir: /storage/app-metadata`
+    //      During discovery in `search_ancestors()` we find the `pointer_file` and we set as `worktree_dir`
+    //      /project/app and `metadata_dir` its target, so worktree is not needed
+    // 3. same canonical path -> no setting
+    //  `metadata_dir` = /projects/app/.lit
+    //  `worktree_dir` = /projects/app,
+    //  `pointer_file` = None
+    //      Same as case 2, we discover the `metadata_dir` which now is a directory and through that
+    //      we can determine the worktree
+    // 4. `.lit` missing -> write setting
+    //  `metadata_dir` = /storage/app-metadata
+    //  `worktree_dir` = /projects/app,
+    //  `pointer_file` = None
+    //      Both directories exist, but the `entry` does not. Calling canonicalize() returns `NotFound`
+    //      we need to write the setting because we can not discover the worktree otherwise.
+    // 5. different canonical paths -> write
+    //  `metadata_dir` = /storage/app-metadata
+    //  `worktree_dir` = /projects/app,
+    //  `pointer_file` = None
+    //      `entry` = /projects/app/.lit exists but paths disagree `metadata_dir` != `entry` so we
+    //      must write the setting and set `core.worktree` to `/projects/app`
+    // 6. any other error propagates
+    //  if we have a symlink whose target is a directory we can't traverse, canonicalize will return
+    //  something like `PermissionDenied` which we propagate.
+    fn needs_worktree_config(&self) -> Result<bool, IoError> {
+        let Some(worktree_dir) = &self.worktree_dir else {
+            return Ok(false);
+        };
+
+        if self.pointer_file().is_some() {
+            return Ok(false);
+        }
+
+        let metadata_dir = fs::canonicalize(self.metadata_dir())
+            .with_context("realpath", Some(self.metadata_dir()))?;
+        let entry = worktree_dir.join_unchecked(".lit");
+
+        match fs::metadata(&entry) {
+            Ok(_) => Ok(&metadata_dir != entry.inner()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(err) => Err(IoError::new("realpath", Some(&entry), err)),
+        }
     }
 }
 
@@ -464,16 +673,14 @@ fn try_migrate_metadata(
         return Ok(litfile::write(link, metadata_destination.as_bytes())?);
     };
     // Note: don't call Repository::discover_at()
-    // at this point we have already resolved the layout of the repo from the init arguments.
+    // at this point we have already resolved the destination of the repo from the init arguments.
     // it means we know the destination, but we have not yet created or validated anything
     // what is left is to determine for migration is metadata resolution, structural validation and
-    // format validation. We could technically call Repository::discover_at() and discard the repo
-    // but this process can fail during worktree or placement resolution(Layout) that it does not
-    // need
+    // format validation.
     let location = repo::validate_metadata_for_migration(entry.into_owned(), cwd)?;
     // rename does not automatically canonicalize either path, `from` is guaranteed to be an absolute
     // canonical path, but `to` is not. `metadata_destination` is absolute by construction in
-    // Layout::resolve() but not canonical(still can be a symlink)
+    // Destination::resolve() but not canonical(still can be a symlink)
     // a NotFound error for the `to` path is accepted by fs::rename()
     // fs::rename() does not replace the symlink's target but the symlink itself
     match fs::canonicalize(metadata_destination) {
@@ -581,7 +788,7 @@ fn ensure_dir(path: &OsPath) -> Result<(), InitError> {
 
 // lit --separate-lit-dir /new/metadata project
 //
-// from Layout's construction link points to `project/.lit`
+// from Destination's construction link points to `project/.lit`
 //
 // if `project/.lit` exists we need to inspect it and move the contents to the new location
 //  - a directory means we treat it as metadata directory
@@ -608,8 +815,49 @@ fn resolve_entry_if_symlink(pointer_file: &OsPath) -> Result<Option<Cow<'_, OsPa
 }
 
 #[derive(Debug)]
+pub(super) enum DestinationError {
+    Io(IoError),
+    OsPath(OsPathError),
+    LitWorkTreeWithBare,
+}
+
+impl Error for DestinationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(source) => Some(source),
+            Self::OsPath(source) => Some(source),
+            Self::LitWorkTreeWithBare => None,
+        }
+    }
+}
+
+impl fmt::Display for DestinationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(_) => write!(f, "destination resolution I/O failed"),
+            Self::OsPath(_) => write!(f, "bad path"),
+            Self::LitWorkTreeWithBare => {
+                write!(f, "LIT_WORK_TREE not allowed with --bare option")
+            }
+        }
+    }
+}
+
+impl From<IoError> for DestinationError {
+    fn from(err: IoError) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<OsPathError> for DestinationError {
+    fn from(err: OsPathError) -> Self {
+        Self::OsPath(err)
+    }
+}
+
+#[derive(Debug)]
 pub(super) enum InitError {
-    Layout(LayoutError),
+    Foo(DestinationError),
     Io(IoError),
     Lockfile(LockfileError),
     // TODO: should this be UnsupportedFileType
@@ -629,7 +877,7 @@ pub(super) enum InitError {
 impl Error for InitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Layout(source) => Some(source),
+            Self::Foo(source) => Some(source),
             Self::Io(source) => Some(source),
             Self::Lockfile(source) => Some(source),
             Self::Refs(source) => Some(source),
@@ -652,7 +900,7 @@ impl Error for InitError {
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Layout(_) => write!(f, "could not resolve repository layout"),
+            Self::Foo(_) => write!(f, "could not resolve repository destination"),
             Self::Io(_) => write!(f, "fs operation failed during initialization"),
             Self::Lockfile(_) => write!(f, "could not update repository metadata"),
             Self::BadEntry { path, entry } => {
@@ -683,9 +931,9 @@ impl fmt::Display for InitError {
     }
 }
 
-impl From<LayoutError> for InitError {
-    fn from(err: LayoutError) -> Self {
-        Self::Layout(err)
+impl From<DestinationError> for InitError {
+    fn from(err: DestinationError) -> Self {
+        Self::Foo(err)
     }
 }
 
@@ -751,216 +999,210 @@ impl From<RefFormatError> for InitError {
 
 #[cfg(test)]
 mod tests {
-    // TODO: fix
-    // use crate::command::init::{EntryType, Init, InitError};
-    // use std::fs;
-    // use std::path::{Path, PathBuf};
-    // use tempfile;
-    //
-    // struct TempDir {
-    //     // in both with_missing_root() and with_existing_root() when I wasn't keeping temp_dir alive
-    //     // drop() was called and the temp_dir path was deleted. The test init_on_a_missing_dir()
-    //     // will pass but for the wrong reason, when we pass the root to Init, it calls create_dir_all()
-    //     // and it would create the path again and all assertions would pass. We only want Init to create
-    //     // root in {temp_dir}/root and then .lit.
-    //     // The test init_on_an_existing_dir() that called with_existing_root() would fail.
-    //     // with_existing_root() creates {temp_dir}/root. when drop() was called, it would delete
-    //     // temp_dir and all its entries including the root. In with_existing_root() we would call
-    //     // let dir_entry = temp_dir.root.join("foo"); // a parent path that no longer exists
-    //     // so fs::write(&dir_entry, b":)").unwrap(); would err
-    //     //
-    //     // This is why we need to keep the temp_dir alive.
-    //     _temp_dir: tempfile::TempDir,
-    //     root: PathBuf,
-    //     lit: PathBuf,
-    // }
-    //
-    // impl TempDir {
-    //     fn with_missing_root(root: &Path) -> Self {
-    //         let temp_dir = tempfile::tempdir().unwrap();
-    //         let root = temp_dir.path().join(root);
-    //         let lit = root.join(".lit");
-    //
-    //         Self {
-    //             _temp_dir: temp_dir,
-    //             root,
-    //             lit,
-    //         }
-    //     }
-    //
-    //     fn with_existing_root(root: &Path) -> Self {
-    //         let temp_dir = tempfile::tempdir().unwrap();
-    //         let root = temp_dir.path().join(root);
-    //         fs::create_dir(&root).unwrap();
-    //
-    //         let lit = root.join(".lit");
-    //
-    //         Self {
-    //             _temp_dir: temp_dir,
-    //             root,
-    //             lit,
-    //         }
-    //     }
-    //
-    //     fn objects(&self) -> PathBuf {
-    //         self.lit.join("objects")
-    //     }
-    //
-    //     fn refs(&self) -> PathBuf {
-    //         self.lit.join("refs")
-    //     }
-    //
-    //     fn config(&self) -> PathBuf {
-    //         self.lit.join("config")
-    //     }
-    // }
-    //
-    // #[test]
-    // fn init_on_a_missing_dir() {
-    //     let temp_dir = TempDir::with_missing_root("test".as_ref());
-    //     // root does not exist and init should create {temp_dir}/root/.lit
-    //     let init = Init {
-    //         path: Some(temp_dir.root.clone()),
-    //         git_dir: None,
-    //     };
-    //
-    //     init.execute().unwrap();
-    //
-    //     assert!(temp_dir.root.is_dir());
-    //     assert!(temp_dir.lit.is_dir());
-    //     assert!(temp_dir.objects().is_dir());
-    //     assert!(temp_dir.refs().is_dir());
-    //     assert!(temp_dir.config().is_file());
-    // }
-    //
-    // // we assert that calling init on an existing directory does not alter its structure or any of the
-    // // contents of its entries
-    // #[test]
-    // fn init_on_an_existing_dir() {
-    //     let temp_dir = TempDir::with_existing_root("test".as_ref());
-    //     let init = Init {
-    //         path: Some(temp_dir.root.clone()),
-    //         git_dir: None,
-    //     };
-    //     // entry of the existing dir
-    //     let dir_entry = temp_dir.root.join("foo");
-    //     fs::write(&dir_entry, b":)").unwrap();
-    //
-    //     init.execute().unwrap();
-    //
-    //     let contents = fs::read(&dir_entry).unwrap();
-    //
-    //     assert!(temp_dir.objects().is_dir());
-    //     assert!(temp_dir.refs().is_dir());
-    //     assert!(temp_dir.config().is_file());
-    //     assert!(dir_entry.is_file());
-    //     assert_eq!(contents, ":)".as_bytes().to_vec())
-    // }
-    // // TODO: write an IT tests where we call execute twice and assert on the print logic
-    //
-    // // calling init in an existing repo should not touch any of the files of the directory no matter
-    // // if they are owned by lit or not
-    // #[test]
-    // fn reinit_preserves_existing_repo_files() {
-    //     let temp_dir = TempDir::with_existing_root("test".as_ref());
-    //     let init = Init {
-    //         path: Some(temp_dir.root.clone()),
-    //         git_dir: None,
-    //     };
-    //
-    //     init.execute().unwrap();
-    //
-    //     let config = temp_dir.config();
-    //     let object_dir = temp_dir.objects().join("ef");
-    //     let blob = object_dir.join("b1e0e54a68d5928831b3e3749ec764b346c987");
-    //     let head = temp_dir.refs().join("HEAD");
-    //
-    //     // init creates objects/, but not the two-character object subdirectory.
-    //     fs::create_dir_all(&object_dir).unwrap();
-    //     fs::write(
-    //         &config,
-    //         b"[user]\n    name = Alex Morgan\n    email = alex.morgan@example.com\n",
-    //     )
-    //     .unwrap();
-    //     // obviously this is not the actual content of the blob, it is zlibed compress, and we could
-    //     // easily use random data
-    //     fs::write(&blob, b"blob 6\0hello\n").unwrap();
-    //     fs::write(&head, b"821bf054e7f1fbc9a920609db2b5b6e256382b4e").unwrap();
-    //
-    //     let config_before = fs::read(&config).unwrap();
-    //     let blob_before = fs::read(&blob).unwrap();
-    //     let head_before = fs::read(&head).unwrap();
-    //
-    //     init.execute().unwrap();
-    //
-    //     // reinit should not touch any of the content of the existing files
-    //     assert_eq!(fs::read(&config).unwrap(), config_before);
-    //     assert_eq!(fs::read(&blob).unwrap(), blob_before);
-    //     assert_eq!(fs::read(&head).unwrap(), head_before);
-    // }
-    //
-    // #[test]
-    // fn reinit_recreates_deleted_repo_files() {
-    //     let temp_dir = TempDir::with_existing_root("test".as_ref());
-    //     let init = Init {
-    //         path: Some(temp_dir.root.clone()),
-    //         git_dir: None,
-    //     };
-    //
-    //     init.execute().unwrap();
-    //
-    //     let config = temp_dir.config();
-    //     let objects = temp_dir.objects();
-    //     let refs = temp_dir.refs();
-    //     fs::remove_dir_all(&objects).unwrap();
-    //     fs::remove_dir_all(&refs).unwrap();
-    //     fs::remove_file(&config).unwrap();
-    //
-    //     init.execute().unwrap();
-    //
-    //     assert!(objects.is_dir());
-    //     assert!(refs.is_dir());
-    //     assert!(config.is_file());
-    // }
-    //
-    // // this is true for other dirs like objects and refs, they are all created by the same method
-    // // ensure_dir()
-    // #[test]
-    // fn init_fails_when_lit_exists_but_is_not_a_directory() {
-    //     let temp_dir = TempDir::with_existing_root("test".as_ref());
-    //     fs::write(temp_dir.root.join(".lit"), ":/").unwrap();
-    //
-    //     let init = Init {
-    //         path: Some(temp_dir.root.clone()),
-    //         git_dir: None,
-    //     };
-    //
-    //     match init.execute().unwrap_err() {
-    //         InitError::BadEntry { path, entry } => {
-    //             assert_eq!(path, temp_dir.root.join(".lit"));
-    //             assert_eq!(entry, EntryType::File);
-    //         }
-    //         err => panic!("expected InitError::BadEntry, got {err:?}"),
-    //     }
-    // }
-    //
-    // // this is true for all files created by init
-    // #[test]
-    // fn init_fails_when_config_exists_but_is_not_a_file() {
-    //     let temp_dir = TempDir::with_existing_root("test".as_ref());
-    //     fs::create_dir_all(temp_dir.lit.join("config")).unwrap();
-    //
-    //     let init = Init {
-    //         path: Some(temp_dir.root.clone()),
-    //         git_dir: None,
-    //     };
-    //
-    //     match init.execute().unwrap_err() {
-    //         InitError::BadEntry { path, entry } => {
-    //             assert_eq!(path, temp_dir.config());
-    //             assert_eq!(entry, EntryType::Directory);
-    //         }
-    //         err => panic!("expected InitError::BadEntry, got {err:?}"),
-    //     }
-    // }
+    use super::*;
+    use crate::repo::environment;
+    use sealed_test::prelude::*;
+    use std::env;
+
+    // `separate_lit_dir` is set, worktree is cwd, pointer_file points to `cwd/.lit`
+    #[test]
+    fn l01() {
+        let path = OsPath::new_unchecked("/foo/bar");
+        let cwd = environment::cwd().unwrap();
+        let destination = Destination::resolve(None, false, Some(path.inner())).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &path);
+        assert_eq!(destination.worktree_dir(), Some(&cwd));
+        assert_eq!(destination.pointer_file(), Some(&cwd.join_unchecked(".lit")));
+    }
+
+    // `separate_lit_dir` is set, positional path is set, pointer_file points to `<positional_path>/.lit`
+    #[test]
+    fn l02() {
+        let path = OsPath::new_unchecked("/projects/lit");
+        let separate_lit_dir = OsPath::new_unchecked("/foo/bar");
+        let destination =
+            Destination::resolve(Some(path.inner()), false, Some(separate_lit_dir.inner()))
+                .unwrap();
+
+        assert_eq!(destination.metadata_dir(), &separate_lit_dir);
+        assert_eq!(destination.worktree_dir(), Some(&path));
+        assert_eq!(
+            destination.pointer_file(),
+            Some(&path.join_unchecked(".lit"))
+        );
+    }
+
+    // `LIT_DIR` is set, but ignored since `separate_lit_dir` has higher precedence
+    #[sealed_test]
+    fn l03() {
+        unsafe {
+            env::set_var("LIT_DIR", "/home/user/storage");
+        }
+        let path = OsPath::new_unchecked("/foo/bar");
+        let destination = Destination::resolve(None, false, Some(path.inner())).unwrap();
+        let cwd = environment::cwd().unwrap();
+
+        assert_eq!(destination.metadata_dir(), &path);
+        assert_eq!(destination.worktree_dir(), Some(&cwd));
+        assert_eq!(
+            destination.pointer_file(),
+            Some(&cwd.join_unchecked(".lit"))
+        );
+    }
+
+    // only positional path is set
+    #[test]
+    fn l04() {
+        let path = OsPath::new_unchecked("/foo");
+        let destination = Destination::resolve(Some(path.inner()), false, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &(path.join_unchecked(".lit")));
+        assert_eq!(destination.worktree_dir(), Some(&OsPath::new_unchecked("/foo")));
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // positional with bare
+    #[test]
+    fn l05() {
+        let path = OsPath::new_unchecked("/foo");
+        let destination = Destination::resolve(Some(path.inner()), true, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &path);
+        assert_eq!(destination.worktree_dir(), None);
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // `LIT_DIR` and `LIT_WORK_TREE` are both set, but ignored since positional path has higher
+    // precedence
+    #[sealed_test]
+    fn l06() {
+        unsafe {
+            env::set_var("LIT_DIR", "/home/user/storage");
+            env::set_var("LIT_WORK_TREE", "/projects/jolt");
+        }
+        let path = OsPath::new_unchecked("/foo/bar");
+        let destination = Destination::resolve(Some(path.inner()), true, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &path);
+        assert_eq!(destination.worktree_dir(), None);
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // `LIT_DIR` with bare
+    #[sealed_test]
+    fn l07() {
+        unsafe {
+            env::set_var("LIT_DIR", "/foo/bar/");
+        }
+        let lit_dir = environment::var("LIT_DIR").unwrap();
+        let destination = Destination::resolve(None, true, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &OsPath::new_unchecked(lit_dir));
+        assert_eq!(destination.worktree_dir(), None);
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // worktree is cwd
+    #[sealed_test]
+    fn l08() {
+        unsafe {
+            env::set_var("LIT_DIR", "/foo/bar/..");
+        }
+        let cwd = environment::cwd().unwrap();
+        let lit_dir = environment::var("LIT_DIR").unwrap();
+        let destination = Destination::resolve(None, false, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &OsPath::new_unchecked(lit_dir));
+        assert_eq!(destination.worktree_dir(), Some(&cwd));
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // `LIT_WORK_TREE` is relative, resolve it against cwd
+    #[sealed_test]
+    fn l09() {
+        unsafe {
+            env::set_var("LIT_DIR", "/home/user/metadata");
+            env::set_var("LIT_WORK_TREE", "projects/lit");
+        }
+        let cwd = environment::cwd().unwrap();
+        let lit_dir = environment::var("LIT_DIR").unwrap();
+        let lit_work_tree = environment::var("LIT_WORK_TREE").unwrap();
+        let destination = Destination::resolve(None, false, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &OsPath::new_unchecked(lit_dir));
+        assert_eq!(
+            destination.worktree_dir(),
+            Some(&cwd.join_unchecked(lit_work_tree))
+        );
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // env exclusive
+    #[sealed_test]
+    fn l10() {
+        unsafe {
+            env::set_var("LIT_DIR", "/home/user/storage");
+            env::set_var("LIT_WORK_TREE", "/projects/jolt");
+        }
+        let lit_dir = environment::var("LIT_DIR").unwrap();
+        let lit_work_tree = environment::var("LIT_WORK_TREE").unwrap();
+        let destination = Destination::resolve(None, false, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &OsPath::new_unchecked(lit_dir));
+        assert_eq!(
+            destination.worktree_dir(),
+            Some(&OsPath::new_unchecked(lit_work_tree))
+        );
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // bare
+    #[test]
+    fn l11() {
+        let cwd = environment::cwd().unwrap();
+        let destination = Destination::resolve(None, true, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &cwd);
+        assert_eq!(destination.worktree_dir(), None);
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // nothing is set
+    #[test]
+    fn l12() {
+        let cwd = environment::cwd().unwrap();
+        let destination = Destination::resolve(None, false, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &cwd.join_unchecked(".lit"));
+        assert_eq!(destination.worktree_dir(), Some(&cwd));
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // if `LIT_DIR` is not set, `LIT_WORK_TREE` is set and bare is true, `LIT_WORK_TREE` is ignored
+    #[sealed_test]
+    fn l13() {
+        unsafe {
+            env::set_var("LIT_WORK_TREE", "/projects/jolt");
+        }
+        let cwd = environment::cwd().unwrap();
+        let destination = Destination::resolve(None, true, None).unwrap();
+
+        assert_eq!(destination.metadata_dir(), &cwd);
+        assert_eq!(destination.worktree_dir(), None);
+        assert_eq!(destination.pointer_file(), None);
+    }
+
+    // if `LIT_DIR` and `LIT_WORK_TREE` are set and bare is true, conflict
+    // unlike the test above where `LIT_WORK_TREE` is ignored since `LIT_DIR` is absent, now that is
+    // present we consider it and it conflicts with bare.
+    #[sealed_test]
+    fn l14() {
+        unsafe {
+            env::set_var("LIT_DIR", "/home/user/storage");
+            env::set_var("LIT_WORK_TREE", "/projects/jolt");
+        }
+        let error = Destination::resolve(None, true, None).unwrap_err();
+        assert!(matches!(error, DestinationError::LitWorkTreeWithBare));
+    }
 }

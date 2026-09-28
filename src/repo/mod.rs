@@ -4,6 +4,7 @@ mod diagnostic;
 pub(super) mod environment;
 pub(super) mod format;
 pub(super) mod index;
+pub(super) mod layout;
 pub(super) mod litfile;
 pub(super) mod lockfile;
 pub(super) mod object;
@@ -15,23 +16,22 @@ pub(super) mod report;
 pub(super) mod timestamp;
 pub(super) mod tree;
 pub(super) mod workspace;
-pub(super) mod layout;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::Database;
 use crate::repo::format::{ObjectFormat, RepositoryFormat, RepositoryFormatError};
+use crate::repo::index::Index;
+use crate::repo::layout::Layout;
 use crate::repo::litfile::LitFileError;
 use crate::repo::object::OidError;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::{IoError, IoErrorContext, OsPath, OsPathError};
+use crate::repo::refs::Refs;
 use crate::repo::workspace::Workspace;
 use std::error::Error;
 use std::fs::{self, File, FileType};
 use std::path::Path;
 use std::{fmt, io};
-use crate::repo::index::Index;
-use crate::repo::layout::Layout;
-use crate::repo::refs::Refs;
 
 // validate that the directory pointed by path is a valid Lit repository before migration for the
 // separate-lit-dir flag
@@ -190,6 +190,9 @@ fn validate_metadata_structure(path: &OsPath, objects_dir: &OsPath) -> Result<()
 
 // `LIT_OBJECT_DIRECTORY` has the highest precedence when set, otherwise objects are stored under:
 // `<metadata>/objects`
+// Note: Do not try to call `canonicalize_path()` before returning. This function is also used by
+// `init::setup_object_db()` before the object's directory is created. Making the method unconditionally
+// canonicalize would break fresh init.
 pub(super) fn resolve_objects_dir(
     metadata_dir: &OsPath,
     cwd: &OsPath,
@@ -306,12 +309,12 @@ fn probe_metadata_location(
         });
     }
 
-    let file = File::open(&path).with_context("open", Some(path))?;
+    let file = File::open(path).with_context("open", Some(path))?;
     if !file.metadata().with_context("fstat", Some(path))?.is_file() {
         return Err(RepositoryError::NotARegularFile(path.clone()));
     }
 
-    let target = litfile::read(&file, &path)?;
+    let target = litfile::read(&file, path)?;
     // a pointer explicitly selects the target, any failure here unlike the dir case above is an
     // error no fall back
     let metadata_dir = fs::canonicalize(&target).with_context("realpath", Some(&target))?;
@@ -360,6 +363,15 @@ fn search_ancestors(cwd: &OsPath) -> Result<(RepositoryPaths, Option<OsPath>), R
         // TODO: At this point we need to check for Celling values.
         dir = parent;
     }
+}
+
+// Note: don't try to call this method inside `resolve_worktree_dir` because it is not always getting
+// invoked but we always to canonicalize worktree dir path.
+
+fn canonicalize_path(path: &OsPath) -> Result<OsPath, IoError> {
+    fs::canonicalize(path)
+        .with_context("realpath", Some(path))
+        .map(OsPath::new_unchecked)
 }
 
 // extract state as we do traversal to resolve later
@@ -437,6 +449,14 @@ impl Repository {
         } else {
             resolve_worktree_dir(&cfg, &metadata_dir, Some(cwd))?
         };
+        let worktree_dir = worktree_dir
+            .map(|path| canonicalize_path(&path))
+            .transpose()?;
+        let objects_dir = canonicalize_path(&objects_dir)?;
+
+        let pointer_file = pointer_file
+            .map(|path| canonicalize_path(&path))
+            .transpose()?;
         let layout = Layout::from_discovery(metadata_dir, worktree_dir, pointer_file)?;
         let format = RepositoryFormat::from_config(&cfg)?.unwrap_or_default();
 
@@ -458,11 +478,14 @@ impl Repository {
             pointer_file,
         } = paths;
         let cfg = ConfigFile::new_or_empty(metadata_dir.join_unchecked("config"))?;
-        let worktree_dir = resolve_worktree_dir(&cfg, &metadata_dir, worktree_dir)?;
+        let worktree_dir = resolve_worktree_dir(&cfg, &metadata_dir, worktree_dir)?
+            .map(|path| canonicalize_path(&path))
+            .transpose()?;
+        let objects_dir = canonicalize_path(&objects_dir)?;
         let layout = Layout::from_discovery(metadata_dir, worktree_dir, pointer_file)?;
         let format = RepositoryFormat::from_config(&cfg)?.unwrap_or_default();
 
-        Ok(Self {
+        Ok(Self { 
             layout,
             format,
             objects_dir,
@@ -544,47 +567,6 @@ impl From<FileType> for EntryType {
         } else {
             Self::Other
         }
-    }
-}
-
-#[derive(Debug)]
-pub(super) enum LayoutError {
-    Io(IoError),
-    OsPath(OsPathError),
-    LitWorkTreeWithBare,
-}
-
-impl Error for LayoutError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io(source) => Some(source),
-            Self::OsPath(source) => Some(source),
-            Self::LitWorkTreeWithBare => None,
-        }
-    }
-}
-
-impl fmt::Display for LayoutError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(_) => write!(f, "layout resolution I/O failed"),
-            Self::OsPath(_) => write!(f, "bad path"),
-            Self::LitWorkTreeWithBare => {
-                write!(f, "LIT_WORK_TREE not allowed with --bare option")
-            }
-        }
-    }
-}
-
-impl From<IoError> for LayoutError {
-    fn from(err: IoError) -> Self {
-        Self::Io(err)
-    }
-}
-
-impl From<OsPathError> for LayoutError {
-    fn from(err: OsPathError) -> Self {
-        Self::OsPath(err)
     }
 }
 
