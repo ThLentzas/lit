@@ -39,14 +39,14 @@ pub(super) fn validate_metadata_for_migration(
     path: OsPath,
     cwd: &OsPath,
 ) -> Result<RepositoryPaths, RepositoryError> {
-    let location = resolve_metadata_location(path, cwd)?;
-    let cfg_path = location.metadata_dir.join_unchecked("config");
+    let paths = resolve_metadata_location(path, cwd)?;
+    let cfg_path = paths.metadata_dir.join_unchecked("config");
     let cfg = ConfigFile::new_or_empty(cfg_path)?;
     // if version is absent, we don't discard the repo
     // the absent version does not make a structurally valid repo ineligible to move
     let _ = RepositoryFormat::from_config(&cfg)?;
 
-    Ok(location)
+    Ok(paths)
 }
 
 fn require_accessible_dir(path: &OsPath) -> Result<(), RepositoryError> {
@@ -485,7 +485,7 @@ impl Repository {
         let layout = Layout::from_discovery(metadata_dir, worktree_dir, pointer_file)?;
         let format = RepositoryFormat::from_config(&cfg)?.unwrap_or_default();
 
-        Ok(Self { 
+        Ok(Self {
             layout,
             format,
             objects_dir,

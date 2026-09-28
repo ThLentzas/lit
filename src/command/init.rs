@@ -17,6 +17,10 @@ use std::{fmt, fs, io};
 use tempfile::{Builder, NamedTempFile, TempDir};
 
 #[derive(Debug, Args)]
+// conditionally adds an attribute during compilation, here it means if compiling tests apply the
+// attribute. We need `Init::default()` for testing but outside that, `Init` must only be created by
+// Clap
+#[cfg_attr(test, derive(Default))]
 pub(crate) struct Init {
     #[arg(short = 'q', long)]
     quiet: bool,
@@ -59,6 +63,16 @@ impl Init {
         if let Some(link) = destination.pointer_file() {
             // TODO: we need to write a test and see what happens if someone provides --separate-lit-dir
             //  flag for an existing bare repo
+            // Note: what we don't currently do is to check if the user provided formats(if any) conflict
+            // against the repo we want to migrate before the migration happens. It happens after,
+            // which means that if it fails the repository has already been migrated. This mimics
+            // git's behavior.
+            //
+            // `init_db()` link above does the following:
+            //  First it invokes `separate_git_dir()` that performs the move and writes the pointer,
+            //  and then calls `repository_format_configure()` to check for a mismatch.
+            //  The flow is: move metadata -> write pointer -> check repo format -> reject on mismatch
+            //  This means that on a mismatch we never move back the repo
             try_migrate_metadata(link, destination.metadata_dir(), &cwd)?;
         }
 
@@ -69,38 +83,7 @@ impl Init {
         // a fresh repo, or a reinit with a missing file we have to repair
         // only an Io::NotFound error produces an empty in memory ConfigFile later
         let mut cfg = ConfigFile::new_or_empty(cfg_path)?;
-        // defer falling back to default for now, read comment below
-        let repo_format = RepositoryFormat::from_config(&cfg)?;
-        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2765
-        // if repo format is absent, init options like --object-format or --ref-format can select the
-        // format. For an existing format its options must not conflict with the user provided ones
-        // If we initialize repo_format to default, we wouldn't be able to make the distinction
-        let mut repo_format = match repo_format {
-            // for an existing repo don't allow the user to specify a different hash/ref format, it
-            // can lead to unexpected behavior/corruption of the repo.
-            Some(repo_format) => {
-                if self
-                    .object_format
-                    .is_some_and(|obj_format| obj_format != *repo_format.object_format())
-                {
-                    return Err(InitError::HashMismatch);
-                }
-                if self
-                    .ref_format
-                    .is_some_and(|format| format != *repo_format.ref_storage().format())
-                {
-                    return Err(InitError::RefStorageMisMatch);
-                }
-                repo_format
-            }
-            None => {
-                // safe to default it and let user provided option overwrite the formats
-                let mut repo_format = RepositoryFormat::default();
-                *repo_format.object_format_mut() = resolve_object_format(self.object_format, &cfg)?;
-                *repo_format.ref_storage_mut() = resolve_ref_storage(self.ref_format, &cfg)?;
-                repo_format
-            }
-        };
+        self.finalize_repo_format(&mut cfg)?;
 
         // TODO: next is apply_repository_format()
         //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2884
@@ -109,12 +92,10 @@ impl Init {
         //  next is to copy any templates
         //  https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2587
         let reinit = is_reinit(destination.metadata_dir())?;
-        finalize_format_version(&mut cfg, &mut repo_format)?;
         // When a tracked entry's mode differs from what is recorded, Git must distinguish if the
         // change was actually made by the user, or it is a false positive because the environment
         // does not support Unix permissions(Windows, a fs mounted without permissions)
-        let trust_filemode = trust_filemode(destination.metadata_dir())?;
-        if trust_filemode {
+        if probe_fs_for_filemode(destination.metadata_dir())? {
             cfg.set_all("core.filemode", "true")?;
         } else {
             cfg.set_all("core.filemode", "false")?;
@@ -170,11 +151,11 @@ impl Init {
             // absence -> implicitly true
             // https://github.com/git/git/blob/3699d22b59a6ea467ce13edb81b6bdea0398c803/setup.c#L2646-L2653
             // only writes false in the else block
-            if !support_symlinks(destination.metadata_dir())? {
+            if !probe_fs_for_symlink_support(destination.metadata_dir())? {
                 cfg.set_all("core.symlinks", "false")?;
             }
             // absence -> implicitly false
-            if !is_case_sensitive_fs(destination.metadata_dir())? {
+            if !probe_fs_for_case_sensitivity(destination.metadata_dir())? {
                 cfg.set_all("core.ignorecase", "true")?;
             }
         }
@@ -202,6 +183,101 @@ impl Init {
         lockfile.write(&cfg.serialize())?;
         lockfile.commit()?;
 
+        Ok(())
+    }
+
+    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2787-L2801
+    // precedence: flag > env var > config value
+    fn resolve_object_format(&self, cfg: &ConfigFile) -> Result<ObjectFormat, InitError> {
+        if let Some(format) = self.object_format {
+            return Ok(format);
+        }
+
+        if let Some(hash) = environment::var(environment::LIT_DEFAULT_HASH) {
+            let hash = os::os_str_as_bytes(&hash);
+            return ObjectFormat::try_from(hash).map_err(InitError::UnknownObjectFormat);
+        }
+
+        // TODO: cfg needs to look for this in the global config not local?
+        match cfg.get_str("init.defaultObjectFormat") {
+            Ok(hash) => {
+                ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat)
+            }
+            Err(err) if err.is_key_not_found() => Ok(ObjectFormat::default()),
+            Err(err) => Err(InitError::Config(err)),
+        }
+    }
+
+    fn resolve_ref_storage(&self, cfg: &ConfigFile) -> Result<RefStorage, InitError> {
+        let mut ref_storage = RefStorage::default();
+
+        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2824-L2838
+        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/environment.h#L46
+        // when I wrote this, I couldn't find any reference for that env var in the docs
+        // In the src code, linked above, the branch that checks this env var is a separate one, disconnected
+        // from the rest of the logic. It has the highest precedence, it overwrites any previously set
+        // value.
+        if let Some(ref_backend) = environment::var(environment::LIT_REFERENCE_BACKEND) {
+            let ref_backend = os::os_str_as_bytes(ref_backend.as_os_str());
+            ref_storage = RefStorage::try_from(ref_backend)?;
+
+            return Ok(ref_storage);
+        }
+
+        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2803-L2821
+        if let Some(ref_format) = self.ref_format {
+            *ref_storage.format_mut() = ref_format;
+        } else if let Some(ref_format) = environment::var(environment::LIT_DEFAULT_REF_FORMAT) {
+            let ref_format = os::os_str_as_bytes(ref_format.as_os_str());
+            *ref_storage.format_mut() = RefFormat::try_from(ref_format)?;
+        } else {
+            match cfg.get_str("init.defaultRefFormat") {
+                Ok(ref_format) => {
+                    *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_bytes())?;
+                }
+                // if the config value is not set, storage is already default, we don't have to
+                // perform any action
+                Err(err) if err.is_key_not_found() => {}
+                Err(err) => return Err(InitError::Config(err)),
+            }
+        }
+        Ok(ref_storage)
+    }
+
+    fn finalize_repo_format(&self, cfg: &mut ConfigFile) -> Result<(), InitError> {
+        // defer falling back to default for now, read comment below
+        let repo_format = RepositoryFormat::from_config(&cfg)?;
+        // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2765
+        // if repo format is absent, init options like --object-format or --ref-format can select the
+        // format. For an existing format its options must not conflict with the user provided ones
+        // If we initialize repo_format to default, we wouldn't be able to make the distinction
+        let mut repo_format = match repo_format {
+            // for an existing repo don't allow the user to specify a different hash/ref format, it
+            // can lead to unexpected behavior/corruption of the repo.
+            Some(repo_format) => {
+                if self
+                    .object_format
+                    .is_some_and(|obj_format| obj_format != *repo_format.object_format())
+                {
+                    return Err(InitError::HashMismatch);
+                }
+                if self
+                    .ref_format
+                    .is_some_and(|format| format != *repo_format.ref_storage().format())
+                {
+                    return Err(InitError::RefStorageMisMatch);
+                }
+                repo_format
+            }
+            None => {
+                // safe to default it and let user provided option overwrite the formats
+                let mut repo_format = RepositoryFormat::default();
+                *repo_format.object_format_mut() = self.resolve_object_format(cfg)?;
+                *repo_format.ref_storage_mut() = self.resolve_ref_storage(cfg)?;
+                repo_format
+            }
+        };
+        finalize_format_version(cfg, &mut repo_format)?;
         Ok(())
     }
 }
@@ -407,7 +483,7 @@ impl Destination {
         let entry = worktree_dir.join_unchecked(".lit");
 
         match fs::metadata(&entry) {
-            Ok(_) => Ok(&metadata_dir != entry.inner()),
+            Ok(_) => Ok(entry.same_canonical_path_with(&metadata_dir)?),
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
             Err(err) => Err(IoError::new("realpath", Some(&entry), err)),
         }
@@ -444,7 +520,7 @@ fn is_reinit(path: &OsPath) -> Result<bool, IoError> {
 //
 // Git's docs about filemode mention filesystem and cross-environment situations that can cause
 // this. https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefileMode
-fn trust_filemode(probe_dir: &OsPath) -> Result<bool, IoError> {
+fn probe_fs_for_filemode(probe_dir: &OsPath) -> Result<bool, IoError> {
     // we create a temporary file inside the metadata directory for the filemode probe. We don't try
     // to test it against an existing file.
     // https://docs.rs/tempfile/latest/tempfile/struct.Builder.html#method.permissions
@@ -473,7 +549,7 @@ fn trust_filemode(probe_dir: &OsPath) -> Result<bool, IoError> {
 // when checking out that entry, Git uses `core.symlinks` to choose how to represent that file.
 //  - true: follows the symlink and reads the content of target
 //  - false: reads the text `releases/v1`
-fn support_symlinks(probe_dir: &OsPath) -> Result<bool, IoError> {
+fn probe_fs_for_symlink_support(probe_dir: &OsPath) -> Result<bool, IoError> {
     let temp_dir =
         TempDir::new_in(probe_dir).with_context("create temp file in", Some(probe_dir))?;
     let parent = OsPath::new_unchecked(temp_dir.path());
@@ -497,7 +573,7 @@ fn support_symlinks(probe_dir: &OsPath) -> Result<bool, IoError> {
 // because an intentionally staged rename from Parser.rs to parser.rs is a real repo change
 //  Delete this after: core.ignorecase = true -> tracked.eq_ignore_ascii_case(observed)
 //  else tracked == observed
-fn is_case_sensitive_fs(path: &OsPath) -> Result<bool, IoError> {
+fn probe_fs_for_case_sensitivity(path: &OsPath) -> Result<bool, IoError> {
     let tempfile = Builder::new()
         .prefix(".lit-case-probe")
         .suffix(".case")
@@ -614,7 +690,7 @@ fn finalize_format_version(
         cfg.set_all("extensions.objectformat", object_format.name())?;
     }
     if let Some(payload) = ref_storage.payload() {
-        let payload = unsafe { OsStr::from_encoded_bytes_unchecked(payload) };
+        let payload = os::os_str_from_bytes(payload);
         cfg.set_all("extensions.refstorage", payload)?;
     } else if *ref_format == RefFormat::RefTable {
         cfg.set_all("extensions.refstorage", ref_format.name())?;
@@ -634,7 +710,6 @@ fn finalize_format_version(
     //  `extensions.submodulePathConfig` extension
     //  https://git-scm.com/docs/git-config#Documentation/git-config.txt-submodulePathConfig
     //  It requires v1 so when we support it we need to check set the version
-
     cfg.set("core.repositoryformatversion", format.version().as_str())?;
 
     // there are 2 cases that we still need to check:
@@ -677,7 +752,7 @@ fn try_migrate_metadata(
     // it means we know the destination, but we have not yet created or validated anything
     // what is left is to determine for migration is metadata resolution, structural validation and
     // format validation.
-    let location = repo::validate_metadata_for_migration(entry.into_owned(), cwd)?;
+    let paths = repo::validate_metadata_for_migration(entry.into_owned(), cwd)?;
     // rename does not automatically canonicalize either path, `from` is guaranteed to be an absolute
     // canonical path, but `to` is not. `metadata_destination` is absolute by construction in
     // Destination::resolve() but not canonical(still can be a symlink)
@@ -685,12 +760,12 @@ fn try_migrate_metadata(
     // fs::rename() does not replace the symlink's target but the symlink itself
     match fs::canonicalize(metadata_destination) {
         Ok(to) => {
-            if location.metadata_dir().inner() != to {
-                fs::rename(location.metadata_dir(), &to).with_context("rename", Some(to))?
+            if paths.metadata_dir().inner() != to {
+                fs::rename(paths.metadata_dir(), &to).with_context("rename", Some(to))?
             }
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            fs::rename(location.metadata_dir(), metadata_destination)
+            fs::rename(paths.metadata_dir(), metadata_destination)
                 .with_context("rename", Some(metadata_destination))?
         }
         Err(err) => {
@@ -704,65 +779,6 @@ fn try_migrate_metadata(
     litfile::write(link, metadata_destination.as_bytes())?;
 
     Ok(())
-}
-
-// https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2787-L2801
-// precedence: flag > env var > config value
-fn resolve_object_format(
-    flag: Option<ObjectFormat>,
-    cfg: &ConfigFile,
-) -> Result<ObjectFormat, InitError> {
-    if let Some(format) = flag {
-        return Ok(format);
-    }
-
-    if let Some(hash) = environment::var(environment::LIT_DEFAULT_HASH) {
-        let hash = os::os_str_as_bytes(&hash);
-        return ObjectFormat::try_from(hash).map_err(InitError::UnknownObjectFormat);
-    }
-
-    // TODO: cfg needs to look for this in the global config not local?
-    match cfg.get_str("init.defaultObjectFormat") {
-        Ok(hash) => ObjectFormat::try_from(hash.as_bytes()).map_err(InitError::UnknownObjectFormat),
-        Err(err) if err.is_key_not_found() => Ok(ObjectFormat::default()),
-        Err(err) => Err(InitError::Config(err)),
-    }
-}
-
-fn resolve_ref_storage(flag: Option<RefFormat>, cfg: &ConfigFile) -> Result<RefStorage, InitError> {
-    let mut ref_storage = RefStorage::default();
-
-    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2824-L2838
-    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/environment.h#L46
-    // when I wrote this, I couldn't find any reference for that env var in the docs
-    // In the src code, linked above, the branch that checks this env var is a separate one, disconnected
-    // from the rest of the logic. It has the highest precedence, it overwrites any previously set
-    // value.
-    if let Some(ref_backend) = environment::var(environment::LIT_REFERENCE_BACKEND) {
-        let ref_backend = os::os_str_as_bytes(ref_backend.as_os_str());
-        ref_storage = RefStorage::try_from(ref_backend)?;
-
-        return Ok(ref_storage);
-    }
-
-    // https://github.com/git/git/blob/b8242b093d9e941a34460d715e3ce616a34ac3fe/setup.c#L2803-L2821
-    if let Some(ref_format) = flag {
-        *ref_storage.format_mut() = ref_format;
-    } else if let Some(ref_format) = environment::var(environment::LIT_DEFAULT_REF_FORMAT) {
-        let ref_format = os::os_str_as_bytes(ref_format.as_os_str());
-        *ref_storage.format_mut() = RefFormat::try_from(ref_format)?;
-    } else {
-        match cfg.get_str("init.defaultRefFormat") {
-            Ok(ref_format) => {
-                *ref_storage.format_mut() = RefFormat::try_from(ref_format.as_bytes())?;
-            }
-            // if the config value is not set, storage is already default, we don't have to
-            // perform any action
-            Err(err) if err.is_key_not_found() => {}
-            Err(err) => return Err(InitError::Config(err)),
-        }
-    }
-    Ok(ref_storage)
 }
 
 fn ensure_dir(path: &OsPath) -> Result<(), InitError> {
@@ -1000,9 +1016,9 @@ impl From<RefFormatError> for InitError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repo::environment;
     use sealed_test::prelude::*;
     use std::env;
+    use std::io::Write;
 
     // `separate_lit_dir` is set, worktree is cwd, pointer_file points to `cwd/.lit`
     #[test]
@@ -1013,7 +1029,10 @@ mod tests {
 
         assert_eq!(destination.metadata_dir(), &path);
         assert_eq!(destination.worktree_dir(), Some(&cwd));
-        assert_eq!(destination.pointer_file(), Some(&cwd.join_unchecked(".lit")));
+        assert_eq!(
+            destination.pointer_file(),
+            Some(&cwd.join_unchecked(".lit"))
+        );
     }
 
     // `separate_lit_dir` is set, positional path is set, pointer_file points to `<positional_path>/.lit`
@@ -1058,7 +1077,10 @@ mod tests {
         let destination = Destination::resolve(Some(path.inner()), false, None).unwrap();
 
         assert_eq!(destination.metadata_dir(), &(path.join_unchecked(".lit")));
-        assert_eq!(destination.worktree_dir(), Some(&OsPath::new_unchecked("/foo")));
+        assert_eq!(
+            destination.worktree_dir(),
+            Some(&OsPath::new_unchecked("/foo"))
+        );
         assert_eq!(destination.pointer_file(), None);
     }
 
@@ -1203,6 +1225,90 @@ mod tests {
             env::set_var("LIT_WORK_TREE", "/projects/jolt");
         }
         let error = Destination::resolve(None, true, None).unwrap_err();
+
         assert!(matches!(error, DestinationError::LitWorkTreeWithBare));
+    }
+
+    // TODO: when we have a test Environment we should expose methods like `tempfile_with_content()`
+    #[test]
+    fn hash_algo_mismatch() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"[core]\n\trepositoryformatversion = 0")
+            .unwrap();
+        let mut cfg = ConfigFile::new(OsPath::new_unchecked(file.path())).unwrap();
+        let mut init = Init::default();
+        init.object_format = Some(ObjectFormat::Sha256);
+
+        let error = init.finalize_repo_format(&mut cfg).unwrap_err();
+
+        assert!(matches!(error, InitError::HashMismatch));
+    }
+
+    #[test]
+    fn ref_format_mismatch() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"[core]\n\trepositoryformatversion = 0")
+            .unwrap();
+        let mut cfg = ConfigFile::new(OsPath::new_unchecked(file.path())).unwrap();
+        let mut init = Init::default();
+        init.ref_format = Some(RefFormat::RefTable);
+
+        let error = init.finalize_repo_format(&mut cfg).unwrap_err();
+
+        assert!(matches!(error, InitError::RefStorageMisMatch));
+    }
+
+    #[sealed_test]
+    fn explicit_object_format_flag_wins() {
+        unsafe {
+            env::set_var("LIT_DEFAULT_HASH", "sha1");
+        }
+
+        let file = NamedTempFile::new().unwrap();
+        let mut cfg = ConfigFile::new(OsPath::new_unchecked(file.path())).unwrap();
+        let mut init = Init::default();
+        init.object_format = Some(ObjectFormat::Sha256);
+
+        let object_format = init.resolve_object_format(&mut cfg).unwrap();
+
+        assert_eq!(object_format, ObjectFormat::Sha256)
+    }
+
+    #[sealed_test]
+    fn env_var_wins_over_cfg_setting() {
+        unsafe {
+            env::set_var("LIT_DEFAULT_HASH", "sha256");
+        }
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"[init]\n\tdefaultObjectFormat = sha1").unwrap();
+        let mut cfg = ConfigFile::new(OsPath::new_unchecked(file.path())).unwrap();
+        let init = Init::default();
+
+        let object_format = init.resolve_object_format(&mut cfg).unwrap();
+
+        assert_eq!(object_format, ObjectFormat::Sha256)
+    }
+
+    #[test]
+    fn object_format_from_cfg_setting() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"[init]\n\tdefaultObjectFormat = sha256").unwrap();
+        let mut cfg = ConfigFile::new(OsPath::new_unchecked(file.path())).unwrap();
+        let init = Init::default();
+
+        let object_format = init.resolve_object_format(&mut cfg).unwrap();
+
+        assert_eq!(object_format, ObjectFormat::Sha256)
+    }
+
+    #[test]
+    fn everything_absent_fallback_to_default() {
+        let mut cfg = ConfigFile::new_or_empty(OsPath::new_unchecked("/test")).unwrap();
+        let init = Init::default();
+
+        let object_format = init.resolve_object_format(&mut cfg).unwrap();
+
+        assert_eq!(object_format, ObjectFormat::Sha1)
     }
 }

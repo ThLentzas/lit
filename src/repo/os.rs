@@ -167,9 +167,12 @@ impl OsPath {
     // to the same fs path even if they have different components.
     //
     // Read: repo/mod.rs::MetadataPlacement::from_discovery()
-    pub(crate) fn same_canonical_path_with(&self, other: &OsPath) -> Result<bool, IoError> {
+    pub(crate) fn same_canonical_path_with<P>(&self, other: P) -> Result<bool, IoError>
+    where
+        P: AsRef<Path>,
+    {
         let lhs = fs::canonicalize(self).with_context("realpath", Some(self))?;
-        let rhs = fs::canonicalize(other).with_context("realpath", Some(other))?;
+        let rhs = fs::canonicalize(other.as_ref()).with_context("realpath", Some(other))?;
 
         Ok(lhs == rhs)
     }
