@@ -6,6 +6,7 @@
       <w>litdir</w>
       <w>litfile</w>
       <w>pathspec</w>
+      <w>tempdir</w>
       <w>tempfile</w>
     </words>
   </dictionary>

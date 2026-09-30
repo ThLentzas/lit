@@ -157,8 +157,8 @@ impl RefStorage {
         &mut self.ref_format
     }
 
-    pub(crate) fn payload(&self) -> Option<&Vec<u8>> {
-        self.payload.as_ref()
+    pub(crate) fn payload(&self) -> Option<&[u8]> {
+        self.payload.as_deref()
     }
 
     pub(crate) fn has_payload(&self) -> bool {
@@ -571,6 +571,7 @@ impl fmt::Display for RepositoryFormatError {
             Self::ObjectFormat { extension, .. } => {
                 write!(f, "invalid value for 'extensions.{}'", extension.name())
             }
+            // TODO: find a message for this
             Self::RefStorage(_) => write!(f, ""),
             Self::DuplicateCompatObjectFormatExtension => {
                 write!(

@@ -418,6 +418,7 @@ dependencies = [
  "sealed_test",
  "sha1",
  "tempfile",
+ "test_env",
 ]
 
 [[package]]
@@ -650,6 +651,13 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "test_env"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

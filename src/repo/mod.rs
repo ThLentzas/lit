@@ -38,7 +38,7 @@ use std::{fmt, io};
 pub(super) fn validate_metadata_for_migration(
     path: OsPath,
     cwd: &OsPath,
-) -> Result<RepositoryPaths, RepositoryError> {
+) -> Result<MetadataPaths, RepositoryError> {
     let paths = resolve_metadata_location(path, cwd)?;
     let cfg_path = paths.metadata_dir.join_unchecked("config");
     let cfg = ConfigFile::new_or_empty(cfg_path)?;
@@ -92,7 +92,7 @@ fn validate_head(path: &OsPath) -> Result<(), RepositoryError> {
 fn resolve_metadata_location(
     path: OsPath,
     cwd: &OsPath,
-) -> Result<RepositoryPaths, RepositoryError> {
+) -> Result<MetadataPaths, RepositoryError> {
     let metadata = fs::metadata(&path).with_context("stat", Some(&path))?;
 
     let (metadata_dir, pointer_file) = if metadata.is_dir() {
@@ -153,7 +153,7 @@ fn resolve_metadata_location(
     // invalid target must produce an error rather than let the search continue.
     validate_metadata_structure(&metadata_dir, &objects_dir)?;
 
-    Ok(RepositoryPaths {
+    Ok(MetadataPaths {
         metadata_dir,
         objects_dir,
         pointer_file,
@@ -259,7 +259,7 @@ fn resolve_worktree_dir(
 fn probe_metadata_location(
     path: &OsPath,
     cwd: &OsPath,
-) -> Result<Option<RepositoryPaths>, RepositoryError> {
+) -> Result<Option<MetadataPaths>, RepositoryError> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(err)
@@ -291,7 +291,7 @@ fn probe_metadata_location(
 
         let objects_dir = resolve_objects_dir(path, cwd)?;
         return if is_metadata_dir(&metadata_dir, &objects_dir)? {
-            Ok(Some(RepositoryPaths {
+            Ok(Some(MetadataPaths {
                 metadata_dir,
                 objects_dir,
                 pointer_file: None,
@@ -324,14 +324,14 @@ fn probe_metadata_location(
     // `is_metadata_dir()`
     validate_metadata_structure(&metadata_dir, &objects_dir)?;
 
-    Ok(Some(RepositoryPaths {
+    Ok(Some(MetadataPaths {
         metadata_dir,
         objects_dir,
         pointer_file: Some(path.clone()),
     }))
 }
 
-fn search_ancestors(cwd: &OsPath) -> Result<(RepositoryPaths, Option<OsPath>), RepositoryError> {
+fn search_ancestors(cwd: &OsPath) -> Result<(MetadataPaths, Option<OsPath>), RepositoryError> {
     let mut dir = cwd.clone();
 
     loop {
@@ -347,7 +347,7 @@ fn search_ancestors(cwd: &OsPath) -> Result<(RepositoryPaths, Option<OsPath>), R
             // worktree
             if is_metadata_dir(&metadata_dir, &objects_dir)? {
                 return Ok((
-                    RepositoryPaths {
+                    MetadataPaths {
                         metadata_dir: dir,
                         objects_dir,
                         pointer_file: None,
@@ -375,14 +375,14 @@ fn canonicalize_path(path: &OsPath) -> Result<OsPath, IoError> {
 }
 
 // extract state as we do traversal to resolve later
-pub(super) struct RepositoryPaths {
+pub(super) struct MetadataPaths {
     // absolute, canonical path to the metadata dir
     metadata_dir: OsPath,
     objects_dir: OsPath,
     pointer_file: Option<OsPath>,
 }
 
-impl RepositoryPaths {
+impl MetadataPaths {
     pub(super) fn metadata_dir(&self) -> &OsPath {
         &self.metadata_dir
     }
@@ -436,7 +436,7 @@ impl Repository {
         let cwd = environment::cwd()?;
         let path = cwd.join(path)?;
         let paths = resolve_metadata_location(path, &cwd)?;
-        let RepositoryPaths {
+        let MetadataPaths {
             metadata_dir,
             objects_dir,
             pointer_file,
@@ -472,7 +472,7 @@ impl Repository {
         let cwd = environment::cwd()?;
         let (paths, worktree_dir) = search_ancestors(&cwd)?;
         // https://doc.rust-lang.org/rust-by-example/flow_control/match/destructuring/destructure_structures.html
-        let RepositoryPaths {
+        let MetadataPaths {
             metadata_dir,
             objects_dir,
             pointer_file,

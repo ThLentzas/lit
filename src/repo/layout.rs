@@ -142,7 +142,7 @@ mod tests {
 
     // No worktree
     #[test]
-    fn p01() {
+    fn plc_no_worktree_is_unlinked() {
         let metadata_dir = OsPath::new_unchecked("/demo/metadata");
 
         let placement = MetadataPlacement::from_discovery(&metadata_dir, None, None).unwrap();
@@ -154,7 +154,7 @@ mod tests {
     // still discover them via config values and env vars. Such case is `LIT_DIR` and `LIT_WORK_TREE`
     // mention unrelated paths. `Destination::needs_worktree_config()` handles such cases
     #[test]
-    fn p02() {
+    fn plc_missing_entry_is_unlinked() {
         let metadata_dir = OsPath::new_unchecked("/demo/metadata");
         let worktree_dir = OsPath::new_unchecked("/projects/lit");
 
@@ -168,7 +168,7 @@ mod tests {
     // `worktree` = /projects/lit/
     // The `entry` canonicalizes to a directory, and it is equal to the metadata directory
     #[test]
-    fn p03() {
+    fn plc_matching_dir_is_embedded() {
         let temp = tempfile::tempdir().unwrap();
         // we create the `.lit` directory inside `temp` with 0 added randomness in the name
         let metadata_dir = Builder::new()
@@ -193,7 +193,7 @@ mod tests {
     // `worktree` = /projects/app
     // `entry` = /projects/app/.lit -> /storage/app-metadata
     #[test]
-    fn p04() {
+    fn plc_symlink_to_metadata_is_embedded() {
         let temp1_dir = tempfile::tempdir().unwrap();
         let temp2_dir = tempfile::tempdir().unwrap();
         let worktree_dir = OsPath::new_unchecked(temp1_dir.path());
@@ -221,7 +221,7 @@ mod tests {
     // logic. Placement does not reread the pointer's content, Repository::discover() already resolved
     // it, we can assume it is `litdir: /storage/app-metadata`
     #[test]
-    fn p05() {
+    fn plc_matching_pointer_is_embedded() {
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree_dir = OsPath::new_unchecked(temp_dir.path());
         let metadata_dir = OsPath::new_unchecked("/storage/metadata");
@@ -253,7 +253,7 @@ mod tests {
     // `pointer_file` = /pointers/lit
     // `entry` = /projects/app/.lit -> /pointers/lit
     #[test]
-    fn p07() {
+    fn plc_symlink_to_pointer_is_separate() {
         let temp_dir = tempfile::tempdir().unwrap();
         let pointer_dir = tempfile::tempdir().unwrap();
         let worktree_dir = OsPath::new_unchecked(temp_dir.path());
@@ -292,7 +292,7 @@ mod tests {
     // the directory branch compares `/storage/app-metadata` != `/projects/app/.lit`
     // Merely having `.lit` directory does not connect it to the selected metadata
     #[test]
-    fn p08() {
+    fn plc_unrelated_dir_is_unlinked() {
         let temp1_dir = tempfile::tempdir().unwrap();
         // Note: don't try to use `let _ =` because `_` is not a binding it's a wildcard pattern and
         // drop happens immediately which deletes `temp_dir`
@@ -331,7 +331,7 @@ mod tests {
     //
     // the directory branch compares `/foo/.lit` != `/projects/app/.lit`
     #[test]
-    fn p09() {
+    fn plc_unrelated_file_is_unlinked() {
         let temp1_dir = tempfile::tempdir().unwrap();
         // Note: don't try to use `let _ =` because `_` is not a binding it's a wildcard pattern and
         // drop happens immediately which deletes `temp_dir`
@@ -368,7 +368,7 @@ mod tests {
 
     // `entry` is a dangling symlink
     #[test]
-    fn p10() {
+    fn plc_dangling_symlink_is_unlinked() {
         let temp_dir = tempfile::tempdir().unwrap();
         let worktree_dir = OsPath::new_unchecked(temp_dir.path());
         let metadata_dir = OsPath::new_unchecked("/storage/app-metadata");
