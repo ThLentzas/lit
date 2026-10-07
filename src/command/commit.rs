@@ -64,7 +64,7 @@ fn index_background_refreshing(
     let mut refreshes = Vec::new();
 
     for (i, entry) in index.entries.iter().enumerate() {
-        let node = match workspace.stat(&entry.path) {
+        let node = match workspace.stat(entry.path()) {
             Ok(node) => node,
             Err(_) => continue,
         };
@@ -78,11 +78,11 @@ fn index_background_refreshing(
             // if we blindly called fs::read_file(), for symlinks we would follow the path and return
             // the target's content which is not what we store in the blob.
             let content = if entry.mode.is_symlink() {
-                workspace.read_link(&entry.path)?
+                workspace.read_link(entry.path())?
             } else {
-                workspace.read_file(&entry.path)?
+                workspace.read_file(entry.path())?
             };
-            if db::hash(b"blob", &content) == entry.oid {
+            if db::hash(b"blob", &content) == *entry.oid() {
                 refreshes.push((i, node.stat));
             }
         }

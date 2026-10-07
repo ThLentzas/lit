@@ -6,13 +6,15 @@ pub(crate) mod cat_file;
 pub(crate) mod print;
 pub(crate) mod config;
 
-use clap::Subcommand;
-use crate::command::add::Add;
-use crate::command::cat_file::CatFile;
-use crate::command::commit::Commit;
 use crate::command::config::Config;
 use crate::command::init::Init;
-use crate::command::status::Status;
+use clap::Subcommand;
+
+enum RepositoryRequirement {
+    None,
+    Any, // valid metadata, bare no bare does not matter
+    NeedsWorktree // valid metadata and worktree
+}
 
 // TODO: should all commands consume self since they are one and done?
 #[derive(Debug, Subcommand)]
@@ -37,6 +39,13 @@ impl Command {
             // Command::Status(command) => command.execute().unwrap(),
             // Command::CatFile(command) => command.execute().unwrap(),
             Command::Config(cmd) => cmd.execute(),
+        }
+    }
+
+    fn repo_requirement(&self) -> RepositoryRequirement {
+        match self {
+            Self::Init(_) => RepositoryRequirement::None,
+            Self::Config(_) => RepositoryRequirement::Any,
         }
     }
 }

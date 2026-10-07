@@ -16,10 +16,11 @@ pub(super) mod report;
 pub(super) mod timestamp;
 pub(super) mod tree;
 pub(super) mod workspace;
+mod diff;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::Database;
-use crate::repo::format::{ObjectFormat, RepositoryFormat, RepositoryFormatError};
+use crate::repo::format::{RepositoryFormat, RepositoryFormatError};
 use crate::repo::index::Index;
 use crate::repo::layout::Layout;
 use crate::repo::litfile::LitFileError;
@@ -89,10 +90,7 @@ fn validate_head(path: &OsPath) -> Result<(), RepositoryError> {
 // return the path pointed by the litfile. This avoids a clone() call in the first case. There are
 // other ways of doing it, we could use Cow too and the caller knows that if Cow::Borrowed then the
 // path that was passed must be returned.
-fn resolve_metadata_location(
-    path: OsPath,
-    cwd: &OsPath,
-) -> Result<MetadataPaths, RepositoryError> {
+fn resolve_metadata_location(path: OsPath, cwd: &OsPath) -> Result<MetadataPaths, RepositoryError> {
     let metadata = fs::metadata(&path).with_context("stat", Some(&path))?;
 
     let (metadata_dir, pointer_file) = if metadata.is_dir() {
@@ -399,6 +397,7 @@ pub(super) struct Repository {
 }
 
 impl Repository {
+    // this is the method that starts the discovery: https://github.com/git/git/blob/a018953688f1b10bddf91bff8747068f5f4746a4/setup.c#L2022-L2130
     // Discovery never writes config
     pub(super) fn discover() -> Result<Self, RepositoryError> {
         // https://github.com/git/git/blob/d38352cd43ab9745686d697872408bc3249a153f/setup.c#L1581-L1590
@@ -429,7 +428,7 @@ impl Repository {
     }
 
     // inspects the repository pointed by `LIT_DIR` and reports failure without searching elsewhere
-    pub(super) fn discover_at<P>(path: P) -> Result<Self, RepositoryError>
+    fn discover_at<P>(path: P) -> Result<Self, RepositoryError>
     where
         P: AsRef<Path>,
     {

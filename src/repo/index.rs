@@ -29,6 +29,7 @@ impl IndexEntry {
         // https://git-scm.com/docs/index-format
         // the lowest 12 bits store the name length
         // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
+        // newly added entries have the remaining bits set to 0
         let flags = path.len().min(PATH_MAX_SIZE as usize) as u16;
 
         Self {
@@ -39,12 +40,33 @@ impl IndexEntry {
             mode,
         }
     }
+    
+    pub(crate) fn path(&self) -> &RepoPath {
+        &self.path
+    }
 
+    pub(crate) fn oid(&self) -> &Oid {
+        &self.oid
+    }
+    
     pub(crate) fn times_match(&self, other: &FileStat) -> bool {
         self.stat.ctime == other.ctime
             && self.stat.ctime_nsec == other.ctime_nsec
             && self.stat.mtime == other.mtime
             && self.stat.mtime_nsec == other.mtime_nsec
+    }
+
+    // used when we construct entries from fields validated by the index parser
+    // unlike `new()`, which computes the path-length bits and clears the upper flag bits, we preserve
+    // the flags read from disk
+    fn from_parsed_parts(stat: FileStat, mode: Mode, oid: Oid, flags: u16, path: RepoPath,) -> Self {
+        Self {
+            stat,
+            mode,
+            oid,
+            flags,
+            path,
+        }
     }
 
     fn serialize(&self) -> Vec<u8> {
@@ -143,7 +165,7 @@ impl IndexEntry {
     }
 }
 
-// TODO: caching tree
+// TODO: cache tree is part of the extensions that Index supprots
 pub(crate) struct Index {
     // TODO: on the rewrite test if a BTreeMap could work
     pub(crate) entries: Vec<IndexEntry>,
@@ -161,9 +183,22 @@ impl Index {
             modified: false,
         }
     }
-    
+
     pub(crate) fn path(&self) -> &OsPath {
         &self.path
+    }
+    
+    pub(crate) fn get(&self, path: &RepoPath) -> Option<&IndexEntry> {
+        match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
+            Ok(pos) => {
+                Some(&self.entries[pos])
+            }
+            Err(_) => None,
+        }
+    }
+
+    pub(crate) unsafe fn get_unchecked(&self, pos: usize) -> &IndexEntry {
+        unsafe { self.entries.get_unchecked(pos) }
     }
 
     // This method is used by status to see if the entry pointed by `path` is tracked by the index.
@@ -220,12 +255,12 @@ impl Index {
     // order otherwise we will compute a different hash for the same tree which breaks Git's invariance
     // same content -> same hash
     //
-    // We encofre sorted, unique index entries to achieve the same behavior. Maintaing the sorted
+    // We enforce sorted, unique index entries to achieve the same behavior. Maintaining the sorted
     // order prevents the above issue where we could produce different hash for the same tree. By
-    // sorting based on the path we maintain the order accross all componenets of the path.
+    // sorting based on the path we maintain the order across all components of the path.
     // foo/src/a, foo/src/b and foo/README . In the final order README appears before src as the entries
     // of foo and a appears before b as the entries of src. Inserting in ascending order allows us
-    // to do BS for retrieveing entries instead of appending + sorting. Read more Tree::write()
+    // to do BS for retrieving entries instead of appending + sorting. Read more Tree::write()
     pub(crate) fn add_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
         for entry in entries {
             self.resolve_conflicts(&entry.path);
@@ -248,13 +283,18 @@ impl Index {
 
     pub(crate) fn remove(&mut self, path: &RepoPath) -> Option<IndexEntry> {
         match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
-            Ok(index) => Some(self.entries.remove(index)),
+            Ok(pos) => {
+                let entry = self.entries.remove(pos);
+                self.modified = true;
+                Some(entry)
+            }
             Err(_) => None,
         }
     }
 
     pub(crate) fn refresh_entry_stat(&mut self, index: usize, stat: FileStat) {
         self.entries[index].stat = stat;
+        self.modified = true;
     }
 
     pub(crate) fn serialize(&self) -> Vec<u8> {
@@ -380,23 +420,22 @@ impl Index {
     }
 
     // we need to consider 2 edge cases:
-    //  -adding a file whose parent directory has the same name as an existing file in the index. We
-    //  have an index entry, foo.txt then we remove foo.txt from our filesystem, create
-    //  foo.txt/bar.rs, and we call add for foo.txt/bar.rs. Now in our index we have both foo.txt and
-    //  foo.txt/bar.rs which is not possible because no filesystem will allow a file and a directory
-    //  to have the same name. Consider we want to add lib/index/entry.rs while have lib/index and
-    //  lib. Both those entries must be removed before adding our new entry, we will have the same
-    //  name for a file/directory at the same level violation otherwise.
-    //  is_parent_path(b"lib", b"lib/index/entry.rb") returns true
-    //  is_parent_path(b"lib/index", b"lib/index/entry.rb") this also returns true so both will be
-    //  removed. is_parent_path() takes parent as first arg and child as 2nd, in this case the existing
-    //  entry must be the parent dir so is_parent_path(&entry.path, path) returns true
-    //  -in the previous case an existing entry was parent of the new entry, now it is the reversed,
-    //  the new entry is parent of existing entries. New entry: lib, existing entry: lib/index/entry.rs
-    //  we need to delete all the lib/ entries. This is why we make the call to is_parent_path() twice
+    // - an existing file becomes a directory. We have an entry called `foo` and we want to add
+    // `foo/bar.rs`. We must remove the existing `foo` first before adding the new one.
+    // - an existing directory becomes a file. Now we have the opposite, existing entry `foo/bar.rs`
+    // and we want to add `foo`. In this case, all the entries that start with `foo/` will be removed
+    //
+    // In both examples, `foo` is the parent. In the first case, is the existing entry so we catch
+    // it with `entry.path.is_parent_of(path)` and in the second, it is the argument,
+    // `path.is_parent_of(&entry.path)` catches it. We can't have `||` here. If we look at the 2nd
+    // case, we do `path.is_parent_of(&entry.path)` for `foo/bar.rs` and `foo` which returns true
+    // so we keep the entry which is incorrect.
+    //
+    // Such cases represent invalid states because no fs allows 2 entries to have the same name
     fn resolve_conflicts(&mut self, path: &RepoPath) {
+        // remove an existing entry if either path is a parent of the other
         self.entries
-            .retain(|entry| !entry.path.is_parent_of(path) || path.is_parent_of(&entry.path))
+            .retain(|entry| !entry.path.is_parent_of(path) && !path.is_parent_of(&entry.path))
     }
 
     // This method we have seen before on Leetcode is the next_greater() adaptation of binary search,
@@ -477,6 +516,7 @@ pub(crate) enum FormatErrorKind {
     InvalidPadding,
     LongPathLenMisMatch,
     InvalidPathSyntax(RepoPathError),
+    ExtendedFlagInV2,
     TrailingData { remaining: usize },
 }
 
@@ -501,6 +541,7 @@ impl fmt::Display for FormatErrorKind {
             Self::InvalidPathSyntax(err) => {
                 write!(f, "invalid index path: {err}")
             }
+            Self::ExtendedFlagInV2 => write!(f, ""),
             Self::TrailingData { remaining } => {
                 write!(f, "unexpected trailing data: {remaining} bytes remaining")
             }

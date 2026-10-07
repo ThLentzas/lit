@@ -1,5 +1,5 @@
 use crate::repo::db::{Database, DatabaseError};
-use crate::repo::index::Index;
+use crate::repo::index::{Index, IndexEntry};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Entry, Object};
@@ -24,7 +24,10 @@ impl Tree {
         let mut tree = Self::new();
 
         for entry in index.entries {
-            tree.insert(entry.path, entry.oid, entry.mode);
+            let IndexEntry {
+                path, oid, mode, ..
+            } = entry;
+            tree.insert(path, oid, mode);
         }
 
         tree

@@ -40,7 +40,7 @@ impl Status {
         // to report the changes.
         let lock = Lockfile::acquire(index.path()).ok();
         index.load()?;
-        let report = Report::generate(&repo, &index)?;
+        let report = Report::status(&repo, &index)?;
 
         if let Some(mut lockfile) = lock
             && !report.refreshes.is_empty()

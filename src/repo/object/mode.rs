@@ -49,6 +49,7 @@ impl Mode {
     }
 }
 
+// TODO: this need to impl Error?
 #[derive(Debug)]
 pub(crate) struct UnsupportedFileType;
 

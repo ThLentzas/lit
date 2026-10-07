@@ -90,10 +90,10 @@ impl RepoPath {
     // for a conflict to exist the parent must be a parent dir of child
     // the 3rd condition is to avoid a false match, like parent: lib, child: library/doc it is not
     // enough for it to be a prefix, it has to be a parent dir
-    pub(super) fn is_parent_of(&self, other: &RepoPath) -> bool {
-        other.len() > self.len()
-            && other.inner.starts_with(self.as_bytes())
-            && other.inner[self.len()] == b'/'
+    pub(super) fn is_parent_of(&self, child: &RepoPath) -> bool {
+        child.len() > self.len()
+            && child.inner.starts_with(self.as_bytes())
+            && child.inner[self.len()] == b'/'
     }
 
     pub(super) fn components(&self) -> impl Iterator<Item = &[u8]> {

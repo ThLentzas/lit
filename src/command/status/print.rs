@@ -1,9 +1,9 @@
+use crate::command::print::{self, Printer};
 use crate::command::status::Format;
 use crate::repo::os::FileKind;
 use crate::repo::repo_path::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::io::{self, IsTerminal, Write};
-use crate::command::print::{self, Printer};
 
 // TODO: this need to change to 17 when we add diff support
 const LABEL_WIDTH: usize = 12;
@@ -67,7 +67,7 @@ impl Style {
 }
 
 pub(super) struct StatusPrinter {
-    pub(super) format: Format
+    pub(super) format: Format,
 }
 
 // TODO: nothing to commit, working tree clean
@@ -89,27 +89,22 @@ fn print_short(_report: &Report) -> io::Result<()> {
 fn print_long(report: &Report) -> io::Result<()> {
     // if we don't acquire the lock, everytime we write stdout would have to acquire the lock.
     let mut writer = io::stdout().lock();
-    
-    let staged = report.changes.iter().filter_map(|(path, change)| {
-        change.head_index.as_ref().map(|ch| {
-            let label = match ch {
-                HeadIndexChange::Added => "new file:",
-                HeadIndexChange::Modified => "modified:",
-                HeadIndexChange::Deleted => "deleted:",
-            };
-            (path.as_bytes(), label)
-        })
-    });
-    let unstaged = report.changes.iter().filter_map(|(path, change)| {
-        change.workspace_index.as_ref().map(|ch| {
-            let label = match ch {
-                WorkspaceIndexChange::Modified => "modified:",
-                WorkspaceIndexChange::Deleted => "deleted:",
-            };
-            (path.as_bytes(), label)
-        })
-    });
 
+    let unstaged = report.unstaged.iter().map(|(path, change)| {
+        let label = match change {
+            WorkspaceIndexChange::Modified(_) => "modified:",
+            WorkspaceIndexChange::Deleted => "deleted:",
+        };
+        (path.as_bytes(), label)
+    });
+    let staged = report.staged.iter().map(|(path, change)| {
+        let label = match change {
+            HeadIndexChange::Added => "new file:",
+            HeadIndexChange::Modified => "modified:",
+            HeadIndexChange::Deleted => "deleted:",
+        };
+        (path.as_bytes(), label)
+    });
     let mut untracked: Vec<Vec<u8>> = report
         .untracked
         .iter()

@@ -51,6 +51,7 @@ impl<'repo> Workspace<'repo> {
         Ok(os::os_str_as_bytes(path.as_os_str()).to_vec())
     }
 
+    // TODO: this should probably read the file from the fd
     pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, IoError> {
         let absolute = self.to_absolute(path);
 
@@ -59,6 +60,7 @@ impl<'repo> Workspace<'repo> {
 
     pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, IoError> {
         let absolute = self.to_absolute(path);
+
         os::stat(&absolute)
     }
 

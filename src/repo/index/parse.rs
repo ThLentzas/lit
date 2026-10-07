@@ -64,6 +64,26 @@ impl<'a> Parser<'a> {
         // we can have a hash mismatch, the object stored under that OID is corrupt or misplaced.
         let oid = Oid::from_bytes(*bytes);
         let flags = u16::from_be_bytes(*self.take::<2>()?);
+        let flags_offset = self.offset();
+        // https://git-scm.com/docs/index-format
+        // 0 - 11 is path length
+        // 12 - 13 merge state
+        // 14 extended flags follow, must be zero for v2
+        // 15 assume-valid
+        //
+        // the 14th bit(0-indexed) must not be set for v2
+        if flags & 0x4000 != 0 {
+            return Err(FormatError::at(
+                flags_offset,
+                FormatErrorKind::ExtendedFlagInV2,
+            ));
+        }
+        // we isolate the 2 stage bits
+        // 12 and 13th bit are set, rest are zeros, shifting them moves those 2 bits into positions
+        // 1, 0
+        // TODO: update when we add `merge` support
+        let stage = (flags & 0x3000) >> 12;
+
         // we extract the lowest 12 bits which is where we stored the path len
         let path_len = flags & 0xfff;
         let path = if path_len == index::PATH_MAX_SIZE {
@@ -74,7 +94,7 @@ impl<'a> Parser<'a> {
         let size = self.pos - entry_offset;
         self.skip_padding(size)?;
 
-        Ok(IndexEntry::new(path, oid, mode, stat))
+        Ok(IndexEntry::from_parsed_parts(stat, mode, oid, flags, path))
     }
 
     // one of the things that we have to validate is that the path length from flags matches the
@@ -208,21 +228,22 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], FormatError> {
-        let remaining = self.remaining();
-
-        let bytes: &[u8; N] =
-            self.buf[self.pos..self.pos + N]
-                .try_into()
-                .map_err(|_| FormatError {
-                    offset: self.pos,
-                    kind: FormatErrorKind::UnexpectedEof {
-                        needed: N,
-                        remaining,
-                    },
-                })?;
+        // Note: don't try `self.buf[self.pos..self.pos + N].try_into()` because if fewer than `N`
+        // bytes remain the indexing will panic before we call `try_into()`. We have to check first
+        if self.remaining() < N {
+            return Err(FormatError {
+                offset: self.pos,
+                kind: FormatErrorKind::UnexpectedEof {
+                    needed: N,
+                    remaining: self.remaining(),
+                },
+            });
+        }
+        let bytes = &self.buf[self.pos..self.pos + N];
         self.advance(N);
-
-        Ok(bytes)
+        // safe to unwrap here, we know our slice contains exactly `N` bytes,l but we could use `expect`
+        // too
+        Ok(bytes.try_into().unwrap())
     }
 
     pub(super) fn is_empty(&self) -> bool {
