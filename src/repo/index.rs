@@ -1,13 +1,15 @@
+pub(crate) mod entry;
 mod parse;
 
+use crate::repo::index::entry::IndexEntry;
 use crate::repo::index::parse::Parser;
-use crate::repo::object::mode::Mode;
-use crate::repo::object::oid::Oid;
 use crate::repo::os::{FileStat, IoError, OsPath};
 use crate::repo::repo_path::{RepoPath, RepoPathError};
 use sha1::{Digest, Sha1};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::io;
+use std::ops::Bound;
 use std::{fmt, fs};
 
 // git has multiple versions(2, 3, 4) for the index format
@@ -15,162 +17,11 @@ const INDEX_VERSION: u32 = 2;
 const PATH_MAX_SIZE: u16 = 0xfff;
 const SIGNATURE: &str = "DIRC";
 
-#[derive(PartialEq, Eq)]
-pub(crate) struct IndexEntry {
-    pub(crate) stat: FileStat,
-    pub(crate) mode: Mode,
-    pub(crate) oid: Oid,
-    flags: u16,
-    pub(crate) path: RepoPath,
-}
-
-impl IndexEntry {
-    pub(crate) fn new(path: RepoPath, oid: Oid, mode: Mode, stat: FileStat) -> Self {
-        // https://git-scm.com/docs/index-format
-        // the lowest 12 bits store the name length
-        // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
-        // newly added entries have the remaining bits set to 0
-        let flags = path.len().min(PATH_MAX_SIZE as usize) as u16;
-
-        Self {
-            stat,
-            oid,
-            flags,
-            path,
-            mode,
-        }
-    }
-    
-    pub(crate) fn path(&self) -> &RepoPath {
-        &self.path
-    }
-
-    pub(crate) fn oid(&self) -> &Oid {
-        &self.oid
-    }
-    
-    pub(crate) fn times_match(&self, other: &FileStat) -> bool {
-        self.stat.ctime == other.ctime
-            && self.stat.ctime_nsec == other.ctime_nsec
-            && self.stat.mtime == other.mtime
-            && self.stat.mtime_nsec == other.mtime_nsec
-    }
-
-    // used when we construct entries from fields validated by the index parser
-    // unlike `new()`, which computes the path-length bits and clears the upper flag bits, we preserve
-    // the flags read from disk
-    fn from_parsed_parts(stat: FileStat, mode: Mode, oid: Oid, flags: u16, path: RepoPath,) -> Self {
-        Self {
-            stat,
-            mode,
-            oid,
-            flags,
-            path,
-        }
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        // 10 fields, 4 bytes each
-        // 20 bytes for the oid
-        // 2 bytes for flags
-        // at least 1 NUL byte, at this point at least 63
-        // path bytes
-        // padding
-        let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(&self.stat.ctime.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.ctime_nsec.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mtime.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mtime_nsec.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.dev.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.ino.to_be_bytes());
-        // the next part is confusing in the docs
-        // it says: 32-bit mode, 4-bit type, 3 unused 9-bit permissions(3 per group)
-        //
-        // 31                                                0
-        //  ┌────────────┬─────────┬─────────────────────────┐
-        //  │ 4-bit type │ 3 unused│ 9-bit Unix permissions  │
-        //  └────────────┴─────────┴─────────────────────────┘
-        //
-        // bits 31..16: zero
-        // bits 15..12: object type
-        // bits 11..9:  unused
-        // bits 8..0:   Unix permission bits
-        //
-        // 100644 octal
-        // =
-        // 1000 000 110100100 binary (16bits the rest are padded with zeros)
-        // │    │   │
-        // │    │   └── 9 permission bits: 0644
-        // │    └────── 3 unused bits: 000
-        // └─────────── 4 object-type bits: 1000
-        //
-        // let mode: u32 = 0o100644;
-        //
-        // let object_type = (mode >> 12) & 0b1111;
-        // let unused = (mode >> 9) & 0b111;
-        // let permissions = mode & 0o777;
-        //
-        // we get the exact same behavior by calling Mode::from_raw() when parsing those bytes, for
-        // storing is just we write those in BE.
-        bytes.extend_from_slice(&(self.mode as u32).to_be_bytes());
-        bytes.extend_from_slice(&self.stat.uid.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.gid.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
-        bytes.extend_from_slice(self.oid.as_bytes()); // in the docs this is called Object name
-        bytes.extend_from_slice(&self.flags.to_be_bytes());
-        bytes.extend_from_slice(self.path.as_bytes()); // in the docs, is called Entry path name
-        // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
-        // multiple of 8
-        //
-        // For any path 4095 bytes or longer, the format stores 0xFFF as a sentinel meaning "too long"
-        // For those paths, the length field gives us nothing, we still need to find where the path
-        // ends is by scanning for the NUL terminator.
-        bytes.push(0);
-
-        // The size of each record(entry) according to the format rules has to be divisible by 8
-        // Since the path has variable length, the total size of an entry is not fixed.
-        //
-        // Why did they choose padding on v2/v3?
-        //
-        // I couldn't find the exact answer to that question. Maybe it has to with mmap. At first,
-        // I thought it will be some sort of 8-alignment, but not sure. Padding is dropped in v4.
-        // Maybe it is a rule that was set that each entry size must be a multiple of 8 bytes. Maybe
-        // it is to make the parsing process following a simple boundary rule where next_entry_offset
-        // = current_entry_offset + padded_entry_size
-        //
-        // next_entry_offset = current_entry_offset + padded_entry_size
-        //
-        // header
-        // offset 12:  [ fixed entry fields ... 62 bytes ... ]
-        // offset 74:  f
-        // offset 75:  o
-        // offset 76:  o
-        // offset 77:  \0   <- path terminator
-        // offset 78:  \0   <- padding
-        // offset 79:  \0   <- padding
-        // offset 80:  \0   <- padding
-        // offset 81:  \0   <- padding
-        // offset 82:  \0   <- padding
-        // offset 83:  \0   <- padding
-        // offset 84:  next entry starts here
-        //
-        // current_entry_offset = 12
-        // padded_entry_size = 72
-        //
-        // next_entry_offset = 12 + 72 = 84
-        while bytes.len() % 8 != 0 {
-            bytes.push(0);
-        }
-        bytes
-    }
-}
-
-// TODO: cache tree is part of the extensions that Index supprots
+// TODO: cache tree is part of the extensions that Index supports
 pub(crate) struct Index {
-    // TODO: on the rewrite test if a BTreeMap could work
-    pub(crate) entries: Vec<IndexEntry>,
+    entries: BTreeSet<IndexEntry>,
     pub(crate) path: OsPath,
-    // a flag that is used to not unnecessary write if no changes detected
+    // no writes if no changes detected
     pub(crate) modified: bool,
 }
 
@@ -179,26 +30,25 @@ impl Index {
     pub(crate) fn new(path: OsPath) -> Self {
         Self {
             path,
-            entries: Vec::new(),
+            entries: BTreeSet::new(),
             modified: false,
         }
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &IndexEntry> {
+        self.entries.iter()
+    }
+
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = IndexEntry> {
+        self.entries.into_iter()
     }
 
     pub(crate) fn path(&self) -> &OsPath {
         &self.path
     }
-    
-    pub(crate) fn get(&self, path: &RepoPath) -> Option<&IndexEntry> {
-        match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
-            Ok(pos) => {
-                Some(&self.entries[pos])
-            }
-            Err(_) => None,
-        }
-    }
 
-    pub(crate) unsafe fn get_unchecked(&self, pos: usize) -> &IndexEntry {
-        unsafe { self.entries.get_unchecked(pos) }
+    pub(crate) fn get(&self, path: &RepoPath) -> Option<&IndexEntry> {
+        self.entries.get(path)
     }
 
     // This method is used by status to see if the entry pointed by `path` is tracked by the index.
@@ -244,10 +94,8 @@ impl Index {
         let mut path_bytes = Vec::with_capacity(path.as_bytes().len() + 1);
         path_bytes.extend_from_slice(path.as_bytes());
         path_bytes.push(b'/');
-        let pos = self.lower_bound(&path_bytes);
-        self.entries
-            .get(pos)
-            .is_some_and(|entry| entry.path.as_bytes().starts_with(&path_bytes))
+        let entry = self.lower_bound(&path_bytes);
+        entry.is_some_and(|entry| entry.path.as_bytes().starts_with(&path_bytes))
     }
 
     // Git requires index entries to be sorted by filename. It is a requirement for deterministic
@@ -264,16 +112,16 @@ impl Index {
     pub(crate) fn add_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
         for entry in entries {
             self.resolve_conflicts(&entry.path);
-
-            match self.entries.binary_search_by(|e| e.path.cmp(&entry.path)) {
-                Ok(pos) => {
-                    if self.entries[pos] != entry {
-                        self.entries[pos] = entry;
+            // we can't get a `&mut T` from a BTreeSet so we call `get()` and then `replace()`
+            match self.entries.get(entry.path()) {
+                Some(existing_entry) => {
+                    if !existing_entry.metadata_match(&entry) {
+                        self.entries.replace(entry);
                         self.modified = true;
                     }
                 }
-                Err(pos) => {
-                    self.entries.insert(pos, entry);
+                None => {
+                    self.entries.insert(entry);
                     self.modified = true;
                 }
             }
@@ -281,20 +129,31 @@ impl Index {
         Ok(())
     }
 
-    pub(crate) fn remove(&mut self, path: &RepoPath) -> Option<IndexEntry> {
-        match self.entries.binary_search_by(|entry| entry.path.cmp(path)) {
-            Ok(pos) => {
-                let entry = self.entries.remove(pos);
-                self.modified = true;
-                Some(entry)
-            }
-            Err(_) => None,
-        }
+    // for now none of the callers needs the removed value if any, so we return bool. If anything
+    // changes we will return Option<IndexEntry>
+    pub(crate) fn remove(&mut self, path: &RepoPath) -> bool {
+        let removed = self.entries.remove(path);
+        // keep the index marked as modified if it already was from a previous call, or mark it as
+        // modified if something was removed
+        self.modified = self.modified || removed;
+
+        removed
     }
 
-    pub(crate) fn refresh_entry_stat(&mut self, index: usize, stat: FileStat) {
-        self.entries[index].stat = stat;
-        self.modified = true;
+    pub(crate) fn update_stat(&mut self, path: &RepoPath, stat: FileStat) -> bool {
+        // we can't get a `&mut T` from a BTreeSet so we call `take()` that removes the entry, we
+        // update `stat` and then reinsert. Unlike `add_entries()` where we have access to the new
+        // entry and can call `get()` and `replace()`, here we need to update only stat
+        self.entries.take(path).map_or(false, |mut entry| {
+            if entry.stat != stat {
+                entry.stat = stat;
+                self.entries.insert(entry);
+                self.modified = true;
+                true
+            } else {
+                false
+            }
+        })
     }
 
     pub(crate) fn serialize(&self) -> Vec<u8> {
@@ -312,12 +171,15 @@ impl Index {
         bytes
     }
 
-    // loads the context of .lit/index in memory
+    // loads the contents of .lit/index in memory
     pub(crate) fn load(&mut self) -> Result<(), IndexError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
+            // happens on a new repo, `Index` will be created on the first write
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                self.entries = Vec::new();
+                self.entries.clear();
+                self.modified = false;
+
                 return Ok(());
             }
             Err(err) => {
@@ -376,12 +238,11 @@ impl Index {
         let count = u32::from_be_bytes(*parser.take::<4>()?);
         // we need to be explicit with the type because the check for last.path happens before the
         // entries.push(entry) where the type can be inferred.
-        let mut entries: Vec<IndexEntry> = Vec::with_capacity(count as usize);
+        let mut entries: BTreeSet<IndexEntry> = BTreeSet::new();
         // if we exhausted the buffer before we reach count we get UnexpectedEof
         for _ in 0..count {
             let entry_offset = parser.offset();
             let entry = parser.next()?;
-
             // don't do the C++/Java way of
             //  if !self.entries.is_empty() {
             //  let last = self.entries.last().unwrap();
@@ -394,14 +255,14 @@ impl Index {
                 // if entry.path < last.path, sort order is broken; any earlier duplicate would also
                 // surface as a non-ascending pair somewhere in the sequence
                 // TODO: address sorting order when we add stage support during merge
-                if last.path >= entry.path {
+                if last.path() >= &entry.path {
                     return Err(FormatError::at(
                         entry_offset,
                         FormatErrorKind::EntriesOutOfSorted,
                     ))?;
                 }
             }
-            entries.push(entry);
+            entries.insert(entry);
         }
 
         // there are trailing bytes between the last index entry and the checksum
@@ -442,18 +303,17 @@ impl Index {
     // or it is treated as such. To determine if `path` is parent path of any of the entries, we need
     // to find the entry that is lexicographically greater than `path`. The entries that we are actually
     // going to return true are entries that their path length is always greater than length of the
-    // provided path because child_path.len() > parent_path.len(). Sure foo/bar.txt is one potential
-    // candidate as is lexicographically greater than a/b/ but so is a/b/foo.txt.
-    fn lower_bound(&self, path_bytes: &[u8]) -> usize {
+    // provided path because child_path.len() > parent_path.len(). Sure `foo/bar.txt` is one potential
+    // candidate as is lexicographically greater than `a/b/` but so is `a/b/foo.txt`.
+    fn lower_bound(&self, path_bytes: &[u8]) -> Option<&IndexEntry> {
         self.entries
-            .binary_search_by(|entry| entry.path.as_bytes().cmp(path_bytes))
-            .unwrap_or_else(|pos| pos)
+            // TODO: it needs to impl `Borrow<[u8]>` for IndexEntry
+            .range::<[u8], _>((Bound::Excluded(path_bytes), Bound::Unbounded))
+            .next()
     }
 
     pub(crate) fn contains(&self, path: &RepoPath) -> bool {
-        self.entries
-            .binary_search_by(|entry| entry.path.cmp(path))
-            .is_ok()
+        self.entries.contains(path)
     }
 }
 

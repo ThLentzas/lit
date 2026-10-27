@@ -90,7 +90,7 @@ impl<'repo> Workspace<'repo> {
                 Err(err) => return Err(IoError::new("opendir", Some(&absolute), err)),
             };
             let name = entry.file_name();
-            // TODO: remove .git and add .litignore
+            // TODO: remove .git and add .litignore, check if we can use matches!()
             if name == ".lit" || name == ".git" || name == "target" {
                 continue;
             }

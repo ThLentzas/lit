@@ -89,6 +89,8 @@ pub(crate) struct Patch {
 // The --minimal flag will use Algorithm::RawMyers explicitly
 
 // default diff compares tracked file versions in the index against the workspace.
+// https://web.mit.edu/gnu/doc/html/diff_3.html
+// https://www.gnu.org/software/diffutils/manual/html_node/Unified-Format.html
 pub(crate) fn unstaged(
     repo: &Repository,
     // TODO: we need to address this on the caller, because if refresh_index is false we should not

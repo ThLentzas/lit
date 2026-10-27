@@ -1,11 +1,12 @@
 use crate::repo::db::{Database, DatabaseError};
-use crate::repo::index::{Index, IndexEntry};
+use crate::repo::index::{Index};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Entry, Object};
 use crate::repo::repo_path::RepoPath;
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
+use crate::repo::index::entry::IndexEntry;
 
 enum TreeNode {
     Blob { oid: Oid, mode: Mode },
@@ -21,9 +22,9 @@ pub(crate) struct Tree {
 
 impl Tree {
     pub(crate) fn from_index(index: Index) -> Self {
-        let mut tree = Self::new();
+        let mut tree = Self::default();
 
-        for entry in index.entries {
+        for entry in index.into_entries() {
             let IndexEntry {
                 path, oid, mode, ..
             } = entry;
@@ -61,7 +62,7 @@ impl Tree {
                     // directory already exists return a mutable reference to it
                     MapEntry::Occupied(entry) => match entry.into_mut() {
                         // we can't have a subdirectory and a file with the same name in the same
-                        // directory, it is guaranteed by the OS
+                        // directory, it is guaranteed by the fs
                         TreeNode::Blob { .. } => {
                             unreachable!("path conflict: expected directory, found file");
                         }
@@ -215,9 +216,5 @@ impl Tree {
             entries.push(Entry { oid, name, mode });
         }
         db.store(Object::Tree(entries))
-    }
-
-    fn new() -> Self {
-        Self::default()
     }
 }

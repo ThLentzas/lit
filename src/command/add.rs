@@ -1,26 +1,95 @@
+use crate::repo::Repository;
+use crate::repo::config::ConfigFileError;
 use crate::repo::db::{Database, DatabaseError};
-use crate::repo::index::{Index, IndexEntry, IndexError};
+use crate::repo::index::entry::IndexEntry;
+use crate::repo::index::{Index, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
-use crate::repo::os::{FileKind, IoError, StatNode};
+use crate::repo::os::{FileKind, IoError, OsPathError, StatNode};
 use crate::repo::pathspec::{Pathspec, PathspecError};
 use crate::repo::repo_path::RepoPath;
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{Repository, RepositoryError};
+use clap::Args;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-#[derive(Debug)]
+// refresh updates the index stat information without staging any changes, and it is an operation
+// rather than a different `Selection` variant
+//
+// scope is determined by pathspec. If present, the scope is the supplied paths, otherwise entire
+// worktree.
+//
+// This is similar to `Target` in `init` when based on what the user provided we determine worktree
+// and metadata dirs. The rest of the flags are independent and will check them after we made a
+// `Selection`
+enum Selection {
+    AllChanges,
+    TrackedChanges,
+    AdditionsAndModifications,
+}
+
+enum Operation {
+    Interactive,
+    Refresh,
+    Stage(Selection),
+}
+
+// Conflicts: Git accepts `-u`, `-A` with `refresh` or `interactive`. For example, `refresh -A` and
+// `refresh -u` execute just `refresh`. `refresh -u -A` is a conflict error.
+// Cases like `lit add -u -no-all -A` fail. `-A` cancels `no-all` and then it conflicts with `u`.
+// Clap handles this by first checking for overrides and then for conflicts.
+//
+// `lit add -i --refresh` and `lit add --refresh -i` both enter interactive mode because argument
+// order does not affect operation precedence
+#[derive(Debug, Args)]
 pub(crate) struct Add {
-    // user provided path
-    pub(crate) paths: Vec<PathBuf>,
+    #[arg(short = 'v', long)]
+    verbose: bool,
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+    #[arg(short = 'f', long)]
+    force: bool,
+    #[arg(short = 'i', long, conflicts_with = "dry_run")]
+    interactive: bool,
+    #[arg(
+        short = 'A',
+        long,
+        visible_alias = "no-ignore-removal",
+        // when both `no_all` and `all` are provided last one wins
+        // https://docs.rs/clap/latest/clap/struct.Arg.html#method.overrides_with
+        overrides_with = "no_all",
+        // both specify which changes to stage
+        // update stages tracked modifications and deletions but not untracked files, all includes
+        // those too
+        conflicts_with = "update"
+    )]
+    // equivalent to `git add .` when called from root
+    all: bool,
+    // TODO: review
+    //  git accepts `-u -no-all` while rejects `-u -A` I couldn't understand why so for now I reject
+    //  `update` includes stage deletions which contradicts the `--no-all/ignore-removal`
+    #[arg(long, visible_alias = "ignore-removal", conflicts_with = "update")]
+    no_all: bool,
+    #[arg(short = 'u', long)]
+    update: bool,
+    refresh: bool,
+    ignore_errors: bool,
+    // empty = not provided, could also wrap it in an Option
+    paths: Vec<PathBuf>,
 }
 
 // TODO: when we add .litignore support, if a file is already tracked by lit and then added to .litignore
 //  we still update it. .litignore rules apply for untracked files.
+//
+// `Removal` in this context means removing an entry from the index because its file was deleted
+// from the working tree.
+// `ignore-removal` leaves deleted files' index entries intact, same as `--no-all`, `no-ignore-removal`
+// does not. `git add <pathspec>` includes them. These options control whether `add` stages deletions
+// `add` removes the file's entry from the index, so the next commit will emit that file.
+//
 impl Add {
     // cwd -> where the user ran the command from
     // root -> directory that owns .lit
@@ -32,17 +101,19 @@ impl Add {
     //
     // Git still knows the repository root is jolt and the index path should be src/parser/lexer.rs
     // not just lexer.rs(what the user provided, self.path in our case)
-    pub(super) fn execute(&self) -> Result<(), AddError> {
-        let repo = Repository::discover()?;
-        let db = repo.database();
-        let workspace = repo.workspace().unwrap();
-        let mut index = repo.index();
+    pub(super) fn execute(&self, repository: &Repository) -> Result<(), AddError> {
+        let db = repository.database();
+        // always safe for commands that require a working tree
+        let workspace = repository.workspace().unwrap();
+        let mut index = repository.index();
+        let config = repository.config()?;
         let mut lockfile = Lockfile::acquire(index.path())?;
         index.load()?;
+        let op = self.resolve_operation();
 
         for path in self.paths.iter() {
             // if the user called add . from root then the prefix is "" and the pathspec.pattern is
-            // also  "". This is fine because in collect_entries() for the dir case we call dir_entries()
+            // also "". This is fine because in collect_entries() for the dir case we call dir_entries()
             // which does self.to_absolute() so absolute root + "" give us the absolute root path
             // which is what we want.
             let prefix = if path.is_absolute() {
@@ -67,8 +138,11 @@ impl Add {
                 }
                 // Case: a deleted file that index used to keep track of
                 //
-                // this is referred to as a stage deletion because index no longer contains the specific
+                // this is referred to as a staged deletion because index no longer contains the specific
                 // file next time we ran status or commit HEAD will have the file, but index will not
+                // TODO: what happens if the provided path is a deleted directory that index contained
+                //  entries, it was tracked, what is the behavior in this case? remove() will fail
+                //  because dir's path itself does not exist on the index.
                 None if index.is_tracked(pattern) => {
                     index.remove(pattern);
                 }
@@ -84,6 +158,25 @@ impl Add {
             lockfile.commit()?;
         }
         Ok(())
+    }
+
+    // in terms of precedence interactive > refresh > any stage flag
+    fn resolve_operation(&self) -> Operation {
+        if self.interactive {
+            return Operation::Interactive;
+        }
+
+        if self.refresh {
+            return Operation::Refresh;
+        }
+
+        if self.update {
+            Operation::Stage(Selection::TrackedChanges)
+        } else if self.no_all {
+            Operation::Stage(Selection::AdditionsAndModifications)
+        } else {
+            Operation::Stage(Selection::AllChanges)
+        }
     }
 }
 
@@ -188,10 +281,11 @@ impl<'a, 'repo> EntryCollector<'a, 'repo> {
 }
 
 #[derive(Debug)]
-pub(super) enum AddError {
-    Repository(RepositoryError),
+pub(crate) enum AddError {
+    Config(ConfigFileError),
     Index(IndexError),
     Database(DatabaseError),
+    OsPath(OsPathError),
     Workspace(WorkspaceError),
     Pathspec(PathspecError),
     Lockfile(LockfileError),
@@ -206,7 +300,7 @@ impl Error for AddError {}
 impl fmt::Display for AddError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AddError::Repository(err) => write!(f, "{err}"),
+            AddError::Config(err) => write!(f, "{err}"),
             // the actual index error is kept internally but no specific information is provided
             // the user can't really do much with an error like bad padding at ...
             AddError::Index(err) => {
@@ -237,9 +331,9 @@ impl fmt::Display for AddError {
     }
 }
 
-impl From<RepositoryError> for AddError {
-    fn from(err: RepositoryError) -> Self {
-        AddError::Repository(err)
+impl From<ConfigFileError> for AddError {
+    fn from(err: ConfigFileError) -> Self {
+        Self::Config(err)
     }
 }
 

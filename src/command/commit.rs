@@ -47,7 +47,7 @@ impl Commit {
                 author,
                 parents,
                 committer,
-                message: "hey".to_string(),
+                message: ":/".to_string(),
                 root_id: tree_id,
             };
             db.store(Object::Commit(commit))
@@ -63,7 +63,7 @@ fn index_background_refreshing(
 ) -> Result<(), CommitError> {
     let mut refreshes = Vec::new();
 
-    for (i, entry) in index.entries.iter().enumerate() {
+    for (i, entry) in index.iter().enumerate() {
         let node = match workspace.stat(entry.path()) {
             Ok(node) => node,
             Err(_) => continue,
@@ -92,7 +92,7 @@ fn index_background_refreshing(
         drop(lock);
     } else {
         for (i, stat) in refreshes {
-            index.refresh_entry_stat(i, stat);
+            index.update_stat(stat);
         }
         lock.write(&index.serialize())?;
         lock.commit()?;

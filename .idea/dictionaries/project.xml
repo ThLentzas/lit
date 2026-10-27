@@ -5,6 +5,7 @@
       <w>filemode</w>
       <w>litdir</w>
       <w>litfile</w>
+      <w>litignore</w>
       <w>pathspec</w>
       <w>tempdir</w>
       <w>tempfile</w>

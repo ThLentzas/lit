@@ -1,7 +1,7 @@
 use crate::repo::Repository;
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::{self, Database, DatabaseError};
-use crate::repo::index::{Index, IndexEntry};
+use crate::repo::index::{Index};
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Object, OidError};
@@ -12,6 +12,7 @@ use crate::repo::workspace::{Workspace, WorkspaceError};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
+use crate::repo::index::entry::IndexEntry;
 
 // green for new, orange for modified, red for deleted, something else for untracked
 pub(crate) enum HeadIndexChange {
@@ -56,7 +57,7 @@ pub(crate) struct Report {
     // and we sort once.
     pub(crate) untracked: Vec<(RepoPath, FileKind)>,
     // changes always report files, so we never have to consider Git's rules about the trailing slash
-    // for directories. Whatever order we get from is later used to print the results.
+    // for directories. Whatever order we get is later used to print the results.
     pub(crate) unstaged: BTreeMap<RepoPath, WorkspaceIndexChange>,
     pub(crate) staged: BTreeMap<RepoPath, HeadIndexChange>,
     pub(crate) refreshes: Vec<(usize, StatNode)>,
@@ -110,7 +111,7 @@ impl Report {
         };
 
         report.scan_workspace(&workspace, index, &RepoPath::new())?;
-        for (i, entry) in index.entries.iter().enumerate() {
+        for (i, entry) in index.iter().enumerate() {
             report.check_index_against_workspace(&workspace, i, entry, filemode, refresh_index)?;
         }
         Ok(report)
@@ -274,7 +275,7 @@ impl Report {
         filemode: bool,
         refresh_index: bool,
     ) -> Result<(), ReportError> {
-        for (i, entry) in index.entries.iter().enumerate() {
+        for (i, entry) in index.iter().enumerate() {
             self.check_index_against_workspace(workspace, i, entry, filemode, refresh_index)?;
             self.check_index_against_head(entry);
         }

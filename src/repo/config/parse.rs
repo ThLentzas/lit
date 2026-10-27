@@ -311,8 +311,8 @@ impl<'a> LineParser<'a> {
         // this is the part where we trim the trailing whitespaces
         // we can't do it as we parse the value because we don't know yet if they will be part of the
         // value until we hit a comment or a newline.(the cases where we break above)
-        let mut end = self.pos;
-        while end > start && matches!(self.buf[end - 1], b' ' | b'\t') {
+        let mut end = self.pos - 1;
+        while end > start && matches!(self.buf[end], b' ' | b'\t') {
             end -= 1;
         }
         Ok(LineSpan { start, end })

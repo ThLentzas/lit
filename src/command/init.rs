@@ -49,6 +49,8 @@ impl Init {
     // https://github.com/git/git/blob/fa7f9290efe2bd22dd736689597b474b93798e11/setup.c#L2841-L2945
     // TODO: create hooks, info, description
     pub(super) fn execute(&self) -> Result<(), InitError> {
+        // TODO: should change Target to something else since we don't actually resolve it, we never
+        //  make an fs call, and resolve should change to new
         let target = Target::resolve(
             self.path.as_deref(),
             self.bare,
@@ -835,7 +837,7 @@ fn resolve_entry_if_symlink(pointer_file: &OsPath) -> Result<Option<Cow<'_, OsPa
 }
 
 #[derive(Debug)]
-pub(super) enum TargetError {
+pub(crate) enum TargetError {
     Io(IoError),
     OsPath(OsPathError),
     LitWorkTreeWithBare,
@@ -876,7 +878,7 @@ impl From<OsPathError> for TargetError {
 }
 
 #[derive(Debug)]
-pub(super) enum InitError {
+pub(crate) enum InitError {
     Target(TargetError),
     Io(IoError),
     Lockfile(LockfileError),
@@ -1036,10 +1038,7 @@ mod tests {
 
         assert_eq!(target.metadata_dir(), &path);
         assert_eq!(target.worktree_dir(), Some(&cwd));
-        assert_eq!(
-            target.pointer_file(),
-            Some(&cwd.join_unchecked(".lit"))
-        );
+        assert_eq!(target.pointer_file(), Some(&cwd.join_unchecked(".lit")));
     }
 
     // `separate_lit_dir` is set, positional path is set, pointer_file points to `<positional_path>/.lit`

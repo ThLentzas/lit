@@ -7,24 +7,25 @@ use std::fmt;
 //
 // Experimental in std:: https://doc.rust-lang.org/std/error/struct.Report.html
 #[derive(Debug)]
-pub(crate) struct Report<'a> {
+pub(crate) struct ErrorReport<'a> {
     error: &'a dyn Error,
 }
 
-impl<'a> Report<'a> {
+// TODO: should this be in lib.rs?
+impl<'a> ErrorReport<'a> {
     pub(crate) fn new(error: &'a dyn Error) -> Self {
         Self { error }
     }
 }
 
-impl fmt::Display for Report<'_> {
+impl fmt::Display for ErrorReport<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.error)?;
 
-        let mut current = self.error.source();
-        while let Some(cause) = current {
+        let mut source = self.error.source();
+        while let Some(cause) = source {
             write!(f, "\n\tcaused by: {cause}")?;
-            current = cause.source();
+            source = cause.source();
         }
 
         Ok(())

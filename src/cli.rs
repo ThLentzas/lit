@@ -1,4 +1,4 @@
-use crate::command::Command;
+use crate::command::{Command, CommandError};
 use clap::Parser;
 
 // TODO: https://git-scm.com/docs/git, top level options
@@ -8,7 +8,7 @@ struct Cli {
     command: Command,
 }
 
-pub(super) fn run() {
+pub(super) fn run() -> Result<(), CommandError> {
     let cli = Cli::parse();
-    cli.command.execute();
+    cli.command.execute()
 }

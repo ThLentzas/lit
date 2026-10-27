@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, Metadata, Permissions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{self as unix_fs, MetadataExt, PermissionsExt};
 use std::path::{Component, Components, Display, Path, PathBuf, StripPrefixError};
 use tempfile::NamedTempFile;
@@ -175,6 +175,11 @@ impl OsPath {
         let rhs = fs::canonicalize(other.as_ref()).with_context("realpath", Some(other))?;
 
         Ok(lhs == rhs)
+    }
+    
+    // no new allocation, we move twice
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.inner.into_os_string().into_vec()
     }
 }
 

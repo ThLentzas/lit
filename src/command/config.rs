@@ -1,7 +1,6 @@
 mod print;
 
 use crate::repo::Repository;
-use crate::repo::config::ConfigFile;
 use crate::repo::lockfile::Lockfile;
 use clap::{Args, Subcommand};
 use std::ffi::OsString;

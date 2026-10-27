@@ -3,6 +3,7 @@ use crate::command::print::{self, Printer};
 use crate::repo::object::{Object, Signature};
 use crate::repo::object::mode::Mode;
 
+// TODO: maybe all the print logic for every command should be a submodule inside each command
 pub(super) struct CatFilePrinter;
 
 impl Printer for CatFilePrinter {

@@ -147,6 +147,7 @@ where
     }
 }
 
+// TODO: probably should make each span hold a Range
 // holds the trivia
 // it is created when we parse a line and holds the span of the line relative to the buffer
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

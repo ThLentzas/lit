@@ -37,6 +37,10 @@ impl RepoPath {
         Ok(RepoPath { inner })
     }
 
+    pub(super) fn from_bytes_unchecked(bytes: Vec<u8>) -> Self {
+        RepoPath { inner: bytes }
+    }
+
     pub(super) fn join<P: AsRef<Path>>(&self, path: P) -> Result<Self, RepoPathError> {
         let bytes = path.as_ref().as_os_str().as_encoded_bytes();
         check_bytes(bytes)?;

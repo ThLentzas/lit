@@ -1,6 +1,5 @@
 pub(super) mod config;
 pub(super) mod db;
-mod diagnostic;
 pub(super) mod environment;
 pub(super) mod format;
 pub(super) mod index;
@@ -17,6 +16,7 @@ pub(super) mod timestamp;
 pub(super) mod tree;
 pub(super) mod workspace;
 mod diff;
+mod litignore;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::Database;

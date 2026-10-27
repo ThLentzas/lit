@@ -1,4 +1,6 @@
-extern crate core;
+use command::error::ErrorReport;
+use std::error::Error;
+use std::process::ExitCode;
 
 mod cli;
 mod command;
@@ -12,8 +14,15 @@ mod repo;
 //  having valid bytes, they don't contain NUL?
 // TODO: top level errors return Result<(), CommandError> make it the same way io::Result works
 //  also do this of reach command error
-fn main() {
-    cli::run();
+fn main() -> ExitCode {
+    match cli::run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // TODO: we need to see if the top level error needs a message or empty is fine
+            eprintln!("fatal: {}", ErrorReport::new(&err));
+            ExitCode::FAILURE
+        }
+    }
 }
 
 // TODO: write a doc where we explain each command, how it works and why we made those choices
