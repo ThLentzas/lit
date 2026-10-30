@@ -92,9 +92,9 @@ impl RepoPath {
     //
     // the length of the child must be greater than the parent because parent is part of the child
     // for a conflict to exist the parent must be a parent dir of child
-    // the 3rd condition is to avoid a false match, like parent: lib, child: library/doc it is not
+    // the 3rd condition is to avoid a false match like: parent lib, child: library/doc it is not
     // enough for it to be a prefix, it has to be a parent dir
-    pub(super) fn is_parent_of(&self, child: &RepoPath) -> bool {
+    pub(crate) fn is_parent_of(&self, child: &RepoPath) -> bool {
         child.len() > self.len()
             && child.inner.starts_with(self.as_bytes())
             && child.inner[self.len()] == b'/'

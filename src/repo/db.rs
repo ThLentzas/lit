@@ -3,7 +3,7 @@ use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::{self, IoError, OsPath};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use sha1::{Digest, Sha1};
 use std::collections::HashMap;
 use std::error::Error;
@@ -24,8 +24,7 @@ impl<'repo> Database<'repo> {
             object_format,
         }
     }
-
-
+    
     pub(crate) fn store(&self, object: Object) -> Result<Oid> {
         let obj_type = object.obj_type().to_string();
         let content = object.serialize();

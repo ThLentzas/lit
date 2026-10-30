@@ -1,17 +1,30 @@
-use crate::repo::index::PATH_MAX_SIZE;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::FileStat;
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 
-#[derive(Debug)]
-pub(crate) struct IndexEntry {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct IndexEntryMetadata {
     pub(crate) stat: FileStat,
     pub(crate) mode: Mode,
     pub(crate) oid: Oid,
-    flags: u16,
+    pub(crate) flags: u16,
+}
+
+impl IndexEntryMetadata {
+    pub(crate) fn times_match(&self, other: &FileStat) -> bool {
+        self.stat.ctime == other.ctime
+            && self.stat.ctime_nsec == other.ctime_nsec
+            && self.stat.mtime == other.mtime
+            && self.stat.mtime_nsec == other.mtime_nsec
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexEntry {
+    metadata: IndexEntryMetadata,
     pub(crate) path: RepoPath,
 }
 
@@ -53,15 +66,15 @@ impl IndexEntry {
         // the lowest 12 bits store the name length
         // if the length is less than 0xFFF; otherwise 0xFFF is stored in this field.
         // newly added entries have the remaining bits set to 0
-        let flags = path.len().min(PATH_MAX_SIZE as usize) as u16;
-
-        Self {
+        let flags = path.len().min(super::PATH_MAX_SIZE as usize) as u16;
+        let metadata = IndexEntryMetadata {
             stat,
+            mode,
             oid,
             flags,
-            path,
-            mode,
-        }
+        };
+
+        Self { metadata, path }
     }
 
     pub(crate) fn path(&self) -> &RepoPath {
@@ -69,21 +82,31 @@ impl IndexEntry {
     }
 
     pub(crate) fn oid(&self) -> &Oid {
-        &self.oid
+        &self.metadata.oid
     }
 
-    pub(crate) fn times_match(&self, other: &FileStat) -> bool {
-        self.stat.ctime == other.ctime
-            && self.stat.ctime_nsec == other.ctime_nsec
-            && self.stat.mtime == other.mtime
-            && self.stat.mtime_nsec == other.mtime_nsec
+    pub(crate) fn stat(&self) -> &FileStat {
+        &self.metadata.stat
     }
 
-    pub(super) fn metadata_match(&self, other: &IndexEntry) -> bool {
-        self.oid == other.oid
-            && self.mode == other.mode
-            && self.stat == other.stat
-            && self.flags == other.flags
+    pub(crate) fn stat_mut(&mut self) -> &mut FileStat {
+        &mut self.metadata.stat
+    }
+
+    pub(crate) fn metadata(&self) -> &IndexEntryMetadata {
+        &self.metadata
+    }
+
+    pub(super) fn metadata_mut(&mut self) -> &mut IndexEntryMetadata {
+        &mut self.metadata
+    }
+
+    pub(crate) fn mode(&self) -> &Mode {
+        &self.metadata.mode
+    }
+
+    pub(crate) fn file_size(&self) -> u32 {
+        self.metadata.stat.file_size
     }
 
     // used when we construct entries from fields validated by the index parser
@@ -96,13 +119,13 @@ impl IndexEntry {
         flags: u16,
         path: RepoPath,
     ) -> Self {
-        Self {
+        let metadata = IndexEntryMetadata {
             stat,
             mode,
             oid,
             flags,
-            path,
-        }
+        };
+        Self { metadata, path }
     }
 
     pub(super) fn serialize(&self) -> Vec<u8> {
@@ -113,12 +136,12 @@ impl IndexEntry {
         // path bytes
         // padding
         let mut bytes = Vec::with_capacity(64);
-        bytes.extend_from_slice(&self.stat.ctime.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.ctime_nsec.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mtime.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.mtime_nsec.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.dev.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.ino.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.ctime.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.ctime_nsec.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.mtime.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.mtime_nsec.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.dev.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.ino.to_be_bytes());
         // the next part is confusing in the docs
         // it says: 32-bit mode, 4-bit type, 3 unused 9-bit permissions(3 per group)
         //
@@ -148,12 +171,12 @@ impl IndexEntry {
         //
         // we get the exact same behavior by calling Mode::from_raw() when parsing those bytes, for
         // storing is just we write those in BE.
-        bytes.extend_from_slice(&(self.mode as u32).to_be_bytes());
-        bytes.extend_from_slice(&self.stat.uid.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.gid.to_be_bytes());
-        bytes.extend_from_slice(&self.stat.file_size.to_be_bytes());
-        bytes.extend_from_slice(self.oid.as_bytes()); // in the docs this is called Object name
-        bytes.extend_from_slice(&self.flags.to_be_bytes());
+        bytes.extend_from_slice(&(self.metadata.mode as u32).to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.uid.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.gid.to_be_bytes());
+        bytes.extend_from_slice(&self.metadata.stat.file_size.to_be_bytes());
+        bytes.extend_from_slice(self.oid().as_bytes()); // in the docs this is called Object name
+        bytes.extend_from_slice(&self.metadata.flags.to_be_bytes());
         bytes.extend_from_slice(self.path.as_bytes()); // in the docs, is called Entry path name
         // the path bytes are always followed by 1 NULL byte, and then we do padding until we have a
         // multiple of 8

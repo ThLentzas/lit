@@ -1,12 +1,12 @@
 use crate::repo::db::{Database, DatabaseError};
-use crate::repo::index::{Index};
+use crate::repo::index::Index;
+use crate::repo::index::entry::IndexEntry;
 use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::object::{Entry, Object};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use indexmap::IndexMap;
 use indexmap::map::Entry as MapEntry;
-use crate::repo::index::entry::IndexEntry;
 
 enum TreeNode {
     Blob { oid: Oid, mode: Mode },
@@ -25,10 +25,8 @@ impl Tree {
         let mut tree = Self::default();
 
         for entry in index.into_entries() {
-            let IndexEntry {
-                path, oid, mode, ..
-            } = entry;
-            tree.insert(path, oid, mode);
+            let IndexEntry { path, metadata } = entry;
+            tree.insert(path, metadata.oid, metadata.mode);
         }
 
         tree

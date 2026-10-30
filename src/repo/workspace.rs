@@ -1,5 +1,5 @@
 use crate::repo::os::{self, FileKind, IoError, IoErrorContext, OsPath, StatNode};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::{env, fmt, fs};

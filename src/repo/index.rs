@@ -1,10 +1,10 @@
 pub(crate) mod entry;
 mod parse;
 
-use crate::repo::index::entry::IndexEntry;
+use crate::repo::index::entry::{IndexEntry, IndexEntryMetadata};
 use crate::repo::index::parse::Parser;
 use crate::repo::os::{FileStat, IoError, OsPath};
-use crate::repo::repo_path::{RepoPath, RepoPathError};
+use crate::repo::repopath::{RepoPath, RepoPathError};
 use sha1::{Digest, Sha1};
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -18,6 +18,8 @@ const PATH_MAX_SIZE: u16 = 0xfff;
 const SIGNATURE: &str = "DIRC";
 
 // TODO: cache tree is part of the extensions that Index supports
+//  we need to guarantee that any mutations that happen to stroed entries always go through index
+//  so we can update the `modified` flag
 pub(crate) struct Index {
     entries: BTreeSet<IndexEntry>,
     pub(crate) path: OsPath,
@@ -35,11 +37,11 @@ impl Index {
         }
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &IndexEntry> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item=&IndexEntry> {
         self.entries.iter()
     }
 
-    pub(crate) fn into_entries(self) -> impl Iterator<Item = IndexEntry> {
+    pub(crate) fn into_entries(self) -> impl Iterator<Item=IndexEntry> {
         self.entries.into_iter()
     }
 
@@ -115,7 +117,7 @@ impl Index {
             // we can't get a `&mut T` from a BTreeSet so we call `get()` and then `replace()`
             match self.entries.get(entry.path()) {
                 Some(existing_entry) => {
-                    if !existing_entry.metadata_match(&entry) {
+                    if existing_entry.metadata() != entry.metadata() {
                         self.entries.replace(entry);
                         self.modified = true;
                     }
@@ -129,6 +131,24 @@ impl Index {
         Ok(())
     }
 
+    pub(crate) fn update_entry(&mut self, path: &RepoPath, metadata: IndexEntryMetadata) -> bool {
+        let Some(mut existing_entry) = self.entries.take(path) else {
+            return false;
+        };
+
+        let updated = if *existing_entry.metadata() != metadata {
+            *existing_entry.metadata_mut() = metadata;
+            true
+        } else {
+            false
+        };
+
+        self.entries.insert(existing_entry);
+        self.modified = self.modified || updated;
+
+        updated
+    }
+
     // for now none of the callers needs the removed value if any, so we return bool. If anything
     // changes we will return Option<IndexEntry>
     pub(crate) fn remove(&mut self, path: &RepoPath) -> bool {
@@ -140,20 +160,23 @@ impl Index {
         removed
     }
 
-    pub(crate) fn update_stat(&mut self, path: &RepoPath, stat: FileStat) -> bool {
+    pub(crate) fn refresh_stat(&mut self, path: &RepoPath, stat: FileStat) -> bool {
         // we can't get a `&mut T` from a BTreeSet so we call `take()` that removes the entry, we
         // update `stat` and then reinsert. Unlike `add_entries()` where we have access to the new
-        // entry and can call `get()` and `replace()`, here we need to update only stat
-        self.entries.take(path).map_or(false, |mut entry| {
-            if entry.stat != stat {
-                entry.stat = stat;
-                self.entries.insert(entry);
-                self.modified = true;
-                true
-            } else {
-                false
-            }
-        })
+        // entry and can call `get()`/`replace()`, here we need to update only stat
+        let mut entry = match self.entries.take(path) {
+            Some(entry) => entry,
+            None => return false,
+        };
+        if *entry.stat() != stat {
+            *entry.stat_mut() = stat;
+            self.entries.insert(entry);
+            self.modified = true;
+            true
+        } else {
+            self.entries.insert(entry);
+            false
+        }
     }
 
     pub(crate) fn serialize(&self) -> Vec<u8> {

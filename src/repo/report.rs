@@ -7,7 +7,7 @@ use crate::repo::object::oid::Oid;
 use crate::repo::object::{Object, OidError};
 use crate::repo::os::{FileKind, StatNode};
 use crate::repo::refs::{RefError, Refs};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use crate::repo::workspace::{Workspace, WorkspaceError};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
@@ -207,7 +207,7 @@ impl Report {
                 // different size/mode -> modified
                 if entry.stat.file_size != stat.stat.file_size || mode_changed {
                     self.unstaged
-                        .insert(entry.path().clone(), WorkspaceIndexChange::Modified(stat));
+                        .insert(entry.path().clone(), WorkspaceIndexChange::Modified(stat)); 
                     // this is the tricky part: Coglan mentions in 9.2.4 that a timestamp mismatch
                     // does not automatically mean modified, it means maybe changed, need to
                     // verify by reading and hashing the file. Because we can touch a file and
@@ -228,6 +228,8 @@ impl Report {
                     } else {
                         workspace.read_file(entry.path())?
                     };
+                    // TODO: this is questionable, can this naive approach of simply checking the hashes
+                    //  swallow collisions?
                     if db::hash(b"blob", &content) != *entry.oid() {
                         self.unstaged
                             .insert(entry.path().clone(), WorkspaceIndexChange::Modified(stat));

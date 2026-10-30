@@ -10,7 +10,7 @@ pub(super) mod object;
 pub(super) mod os;
 pub(super) mod pathspec;
 pub(super) mod refs;
-pub(super) mod repo_path;
+pub(super) mod repopath;
 pub(super) mod report;
 pub(super) mod timestamp;
 pub(super) mod tree;

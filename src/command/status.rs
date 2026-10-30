@@ -46,7 +46,7 @@ impl Status {
             && !report.refreshes.is_empty()
         {
             for (i, node) in report.refreshes.iter() {
-                index.update_stat(*i, node.stat);
+                index.refresh_stat(*i, node.stat);
             }
             lockfile.write(&index.serialize())?;
             lockfile.commit()?;

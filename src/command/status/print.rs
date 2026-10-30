@@ -1,7 +1,7 @@
 use crate::command::print::{self, Printer};
 use crate::command::status::Format;
 use crate::repo::os::FileKind;
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use crate::repo::report::{HeadIndexChange, Report, WorkspaceIndexChange};
 use std::io::{self, IsTerminal, Write};
 

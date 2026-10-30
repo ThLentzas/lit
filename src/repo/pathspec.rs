@@ -1,5 +1,5 @@
 use crate::repo::os::{OsPath, OsPathError};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::fmt;

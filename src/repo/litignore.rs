@@ -1,5 +1,5 @@
 use crate::repo::os::{IoError, IoErrorContext, OsPath};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::ops::Range;

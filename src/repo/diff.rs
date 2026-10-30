@@ -5,7 +5,7 @@ use crate::repo::index::Index;
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
 use crate::repo::os::{FileKind, IoError};
-use crate::repo::repo_path::RepoPath;
+use crate::repo::repopath::RepoPath;
 use crate::repo::report::{Report, ReportError, WorkspaceIndexChange};
 use similar::{Algorithm, DiffOp};
 use std::ops::Range;

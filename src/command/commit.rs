@@ -16,6 +16,11 @@ pub(crate) struct Commit;
 impl Commit {
     // TODO: [master 1b9a196] Done with status, need to test it 3 files changed, 92 insertions(+),
     //  46 deletions(-)
+    //  [master 6d58f52] added support for .litignore
+    //  23 files changed, 674 insertions(+), 278 deletions(-)
+    //  rename src/{repo/diagnostic.rs => command/error.rs} (71%)
+    //  create mode 100644 src/repo/index/entry.rs
+    //  create mode 100644 src/repo/litignore.rs
     pub(super) fn execute(&self) -> Result<(), CommitError> {
         let repo = Repository::discover()?;
         let db = repo.database();
@@ -92,7 +97,7 @@ fn index_background_refreshing(
         drop(lock);
     } else {
         for (i, stat) in refreshes {
-            index.update_stat(stat);
+            index.refresh_stat(stat);
         }
         lock.write(&index.serialize())?;
         lock.commit()?;

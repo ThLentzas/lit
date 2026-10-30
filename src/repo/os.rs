@@ -308,8 +308,8 @@ fn file_kind(meta: &Metadata) -> FileKind {
         FileKind::Symlink
     } else if file_type.is_file() {
         // many Unix permissions can mean executable 100700, 100710, 100711 etc
-        // Git does not preserve them all, instead if the owner has the x right it is enough to classify
-        // it as executable.
+        // Git does not preserve them all, instead if the owner has the `x` right it is enough to 
+        // classify it as executable.
         if meta.mode() & 0o100 != 0 {
             FileKind::Regular(true)
         } else {
