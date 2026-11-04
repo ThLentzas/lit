@@ -5,37 +5,17 @@ use crate::repo::index::{Index, IndexError};
 use crate::repo::lockfile::{Lockfile, LockfileError};
 use crate::repo::object::Object;
 use crate::repo::object::mode::Mode;
-use crate::repo::os::{FileKind, IoError, OsPath, OsPathError, StatNode};
+use crate::repo::os::{FileKind, IoError, OsPathError, StatNode};
 use crate::repo::pathspec::{Pathspec, PathspecError};
 use crate::repo::repopath::RepoPath;
 use crate::repo::workspace::{Workspace, WorkspaceError};
-use crate::repo::{Repository, db};
+use crate::repo::{Repository, environment};
 use clap::Args;
+use std::collections::{BTreeSet, HashSet};
 use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
-
-// refresh updates the index stat information without staging any changes, and it is an operation
-// rather than a different `Selection` variant
-//
-// scope is determined by pathspec. If present, the scope is the supplied paths, otherwise entire
-// worktree.
-//
-// This is similar to `Target` in `init` when based on what the user provided we determine worktree
-// and metadata dirs. The rest of the flags are independent and will check them after we made a
-// `Selection`
-enum Selection {
-    AllChanges,
-    TrackedChanges,
-    AdditionsAndModifications,
-}
-
-enum Operation {
-    Interactive,
-    Refresh,
-    Stage(Selection),
-}
 
 // Conflicts: Git accepts `-u`, `-A` with `refresh` or `interactive`. For example, `refresh -A` and
 // `refresh -u` execute just `refresh`. `refresh -u -A` is a conflict error.
@@ -69,7 +49,8 @@ pub(crate) struct Add {
     // equivalent to `git add .` when called from root
     all: bool,
     // TODO: review
-    //  git accepts `-u -no-all` while rejects `-u -A` I couldn't understand why so for now I reject
+    //  git accepts `-u -no-all` while rejects `-u -A` I couldn't understand why, so for now I
+    //  reject both
     //  `update` includes stage deletions which contradicts the `--no-all/ignore-removal`
     #[arg(long, visible_alias = "ignore-removal", conflicts_with = "update")]
     no_all: bool,
@@ -82,14 +63,15 @@ pub(crate) struct Add {
 }
 
 // TODO: when we add .litignore support, if a file is already tracked by lit and then added to .litignore
-//  we still update it. .litignore rules apply for untracked files.
+// we still update it. .litignore rules apply for untracked files.
 //
 // `Removal` in this context means removing an entry from the index because its file was deleted
 // from the working tree.
 // `ignore-removal` leaves deleted files' index entries intact, same as `--no-all`, `no-ignore-removal`
 // does not. `git add <pathspec>` includes them. These options control whether `add` stages deletions
-// `add` removes the file's entry from the index, so the next commit will emit that file.
 //
+// staged deletion: `add` removes the file's entry from the index, so the next commit will emit that
+// file.
 impl Add {
     // cwd -> where the user ran the command from
     // root -> directory that owns .lit
@@ -102,59 +84,61 @@ impl Add {
     // Git still knows the repository root is jolt and the index path should be src/parser/lexer.rs
     // not just lexer.rs(what the user provided, self.path in our case)
     pub(super) fn execute(&self, repository: &Repository) -> Result<(), AddError> {
-        let db = repository.database();
         // always safe for commands that require a working tree
         let workspace = repository.workspace().unwrap();
         let mut index = repository.index();
-        let config = repository.config()?;
-        let mut lockfile = Lockfile::acquire(index.path())?;
-        index.load()?;
-        let op = self.resolve_operation();
+        let db = repository.database();
+        let cfg = repository.config()?;
+        let mut pathspecs = Vec::with_capacity(self.paths.len());
+        let cwd = environment::cwd()?;
 
         for path in self.paths.iter() {
-            // if the user called add . from root then the prefix is "" and the pathspec.pattern is
-            // also "". This is fine because in collect_entries() for the dir case we call dir_entries()
-            // which does self.to_absolute() so absolute root + "" give us the absolute root path
-            // which is what we want.
             let prefix = if path.is_absolute() {
                 None
             } else {
-                Some(workspace.prefix()?)
+                // if the user called `add .` from root, the prefix is empty and the `pathspec.pattern`
+                // is also empty. This is intended because when workspace makes any fs calls will
+                // first do `self.to_abolute(), which for an empty path results to the absolute
+                // path to root.
+                Some(workspace.path_to_root_prefix(&cwd)?)
             };
-            let pathspec = Pathspec::new(path.as_os_str(), prefix.as_deref(), workspace.root())?;
-            let pattern = pathspec.pattern();
-            let node = match workspace.stat(pattern) {
-                Ok(node) => Some(node),
-                Err(err) if err.is_not_found() => None,
-                Err(err) => return Err(AddError::Io(err)),
-            };
-
-            match node {
-                Some(node) => {
-                    let mut collector =
-                        EntryCollector::new(&workspace, &db, pattern, &index, &node);
-                    collector.collect()?;
-                    index.add_entries(collector.finish())?;
-                }
-                // Case: a deleted file that index used to keep track of
-                //
-                // this is referred to as a staged deletion because index no longer contains the specific
-                // file next time we run status or commit HEAD will have the file, but index will not
-                // TODO: what happens if the provided path is a deleted directory that index contained
-                //  entries, it was tracked, what is the behavior in this case? remove() will fail
-                //  because dir's path itself does not exist on the index.
-                None if index.is_tracked(pattern) => {
-                    index.remove(pattern);
-                }
-                None => {
-                    return Err(AddError::FoundNoMatch {
-                        path: pathspec.original().to_os_string(),
-                    });
-                }
-            }
+            let pathspec = Pathspec::new(path.as_os_str(), prefix, workspace.root())?;
+            pathspecs.push(pathspec);
         }
 
-        if index.modified {
+        // TODO: defer that until we are sure that `add` is valid
+        let mut lockfile = Lockfile::acquire(index.path())?;
+        index.load()?;
+        let op = self.resolve_operation();
+        if let Some(op) = op {
+            match op {
+                Operation::Interactive => {}
+                Operation::Refresh => {}
+                Operation::Stage(selection) => match selection {
+                    // TODO: add support for ignoring files, we already have a `.litignore` parser
+                    Selection::AllChanges => {
+                        self.stage_worktree_changes(&cfg, &workspace, &db, &mut index, &pathspecs)?;
+                    }
+                    // there is a flag check in `updated_tracked_entry()` that does not stages
+                    // deletions if `no_all` is set. The rest of the work for `all`, `no_all` is
+                    // identical
+                    Selection::AdditionsAndModifications => {
+                        // if no paths are provided, this option is a no-op
+                        if !pathspecs.is_empty() {
+                            self.stage_worktree_changes(
+                                &cfg, &workspace, &db, &mut index, &pathspecs,
+                            )?;
+                        }
+                    }
+                    Selection::TrackedChanges => {
+                        self.update(&cfg, &workspace, &db, &mut index, &pathspecs)?;
+                    }
+                },
+            }
+        } else {
+        }
+
+        if index.is_modified() {
             lockfile.write(&index.serialize())?;
             lockfile.commit()?;
         }
@@ -182,278 +166,429 @@ impl Add {
         }
     }
 
-    fn setup_update(
+    fn stage_worktree_changes(
         &self,
-        filemode: bool,
+        cfg: &ConfigFile,
+        workspace: &Workspace,
+        db: &Database,
+        index: &mut Index,
+        pathspecs: &[Pathspec],
+    ) -> Result<(), AddError> {
+        let mut untracked = Vec::new();
+        let mut seen = HashSet::new();
+
+        if pathspecs.is_empty() {
+            collect_untracked_paths(
+                workspace,
+                index,
+                &RepoPath::new(),
+                &mut untracked,
+                &mut seen,
+            )?;
+        } else {
+            for pathspec in pathspecs {
+                collect_untracked_paths(
+                    workspace,
+                    index,
+                    pathspec.pattern(),
+                    &mut untracked,
+                    &mut seen,
+                )?;
+            }
+        };
+
+        let mut positions = BTreeSet::new();
+        let mut matches = vec![false; pathspecs.len()];
+        // If no `pathspec` was provided, the entire index is updated(all tracked files in the entire
+        // working tree are updated)
+        if pathspecs.is_empty() {
+            // let iter = index.iter().enumerate().map(|(pos, _)| pos);
+            // positions.extend(iter);
+            positions.extend(0..index.len());
+        } else {
+            for (i, pathspec) in pathspecs.iter().enumerate() {
+                let pattern = pathspec.pattern();
+                let mut matched = false;
+                for (j, entry) in index.iter().enumerate() {
+                    // user provided `.`
+                    // exact match any regular file, symlinks
+                    // if the provided path is a directory check if any of its entries are tracked
+                    if pattern.as_bytes().is_empty()
+                        || pattern == entry.path()
+                        || pattern.is_parent_of(entry.path())
+                    {
+                        matched = true;
+                        positions.insert(j);
+                    }
+                }
+                // in `update` when we had no match we would return `NotFound` but now we refer to
+                // an untracked file/non-existing path
+                matches[i] = matched;
+            }
+        }
+
+        // `pathspces` and `matches` have the same length
+        // `zip` gives us the one to one mapping, pathspec[i], matches[i]
+        // instead we could call enumerate on `pathspecs.iter()` and access the pair via index
+        for (pathspec, &tracked_match) in pathspecs.iter().zip(&matches) {
+            // tracked entry, might not exist in the working tree(staged deletion)
+            if tracked_match {
+                continue;
+            }
+            match workspace.stat(pathspec.pattern()) {
+                // new existing file
+                Ok(_) => {}
+                // doesn't exist on the workspace and is not a staged deletion(index would return
+                // true)
+                Err(err) if err.is_not_found() => {
+                    return Err(AddError::FoundNoMatch(pathspec.original().to_os_string()));
+                }
+                Err(err) => return Err(AddError::Io(err)),
+            }
+        }
+
+        let filemode = filemode(cfg)?;
+        let symlinks = symlinks(cfg)?;
+        for position in positions.into_iter().rev() {
+            self.update_tracked_entry(workspace, index, db, filemode, symlinks, position)?;
+        }
+
+        for (path, node) in untracked {
+            let (content, mode) = match node.kind {
+                FileKind::Regular(exec) => {
+                    let content = workspace.read_file(&path)?;
+                    // trust the executable bit, otherwise fallback to regular
+                    let mode = if filemode && exec {
+                        Mode::Executable
+                    } else {
+                        Mode::Regular
+                    };
+                    (content, mode)
+                }
+                _ => (workspace.read_link(&path)?, Mode::Symlink),
+            };
+            let oid = db.store(Object::Blob(content))?;
+            let entry = IndexEntry::new(path, oid, mode, node.stat);
+            let pos = index.insert(entry)?;
+
+            if self.verbose {
+                // TODO: we need ReadableBytes here from print.rs
+                let entry = unsafe { index.get_unchecked(pos) };
+                println!("add '{}'", entry.path().display())
+            }
+        }
+        Ok(())
+    }
+
+    // index: [src/a.rs, src/b.rs]
+    // `lit add -u src src/a.rs`
+    //
+    //  if the caller iterated through `pathspecs` and invoked `update` for each we have the
+    //  following issue.
+    //      We process `src` first which removes from the index both entries. Next, when we try to
+    //      process `src/a.rs` it fails because we have no matching entries, and we return a `NotFound`
+    //      error. This is incorrect according to git, because when the command was invoked
+    //      `src/a.rs` was tracked.
+    //  Instead, for every `pathspec` we check against index and track the positions where they
+    //  match. If a path has no match that is a `NotFound` error. We use a `BtreeSet` to deduplicate
+    //  from cases like the above where we track `0` the position of `src/a.rs` twice.
+    fn update(
+        &self,
+        cfg: &ConfigFile,
+        workspace: &Workspace,
+        db: &Database,
+        index: &mut Index,
+        pathspecs: &[Pathspec],
+    ) -> Result<(), AddError> {
+        let mut positions = BTreeSet::new();
+        // If no `pathspec` was provided, the entire index is updated(all tracked files in the entire
+        // working tree are updated)
+        if pathspecs.is_empty() {
+            // let iter = index.iter().enumerate().map(|(pos, _)| pos);
+            // positions.extend(iter);
+            positions.extend(0..index.len());
+        } else {
+            for pathspec in pathspecs {
+                let pattern = pathspec.pattern();
+                let mut matched = false;
+                for (position, entry) in index.iter().enumerate() {
+                    // user provided `.`
+                    // exact match any regular file, symlinks
+                    // if the provided path is a directory check if any of its entries are tracked
+                    if pattern.as_bytes().is_empty()
+                        || pattern == entry.path()
+                        || pattern.is_parent_of(entry.path())
+                    {
+                        matched = true;
+                        positions.insert(position);
+                    }
+                }
+                // a provided path with no match is an error
+                if !matched {
+                    return Err(AddError::FoundNoMatch(pathspec.original().to_os_string()));
+                }
+            }
+        }
+
+        let filemode = filemode(cfg)?;
+        let symlinks = symlinks(cfg)?;
+        // `positions` is in ascending order. Removing an entry shifts everything to its
+        // right one slot left, so removing from the front would leave every remaining
+        // position stale after the first removal.
+        // Removing from the back avoid this. A removal only shifts entries to the right of
+        // it, which we have already handled, so the positions still to be processed(all to
+        // the left) remain valid.
+        for position in positions.into_iter().rev() {
+            self.update_tracked_entry(workspace, index, db, filemode, symlinks, position)?;
+        }
+        Ok(())
+    }
+
+    fn update_tracked_entry(
+        &self,
         workspace: &Workspace,
         index: &mut Index,
-        pathspec: &Pathspec,
+        db: &Database,
+        filemode: bool,
+        symlinks: bool,
+        pos: usize,
     ) -> Result<(), AddError> {
-        let pattern = pathspec.pattern();
-        let node = match workspace.stat(pattern) {
-            Ok(node) => Some(node),
+        let entry = unsafe { index.get_unchecked(pos) };
+        let node = match workspace.stat(entry.path()) {
+            Ok(node) => node,
+            // exists in the index but not in the workspace => staged deletion
+            Err(err) if err.is_not_found() => {
+                if self.no_all {
+                    return Ok(());
+                }
+                // SAFETY: every position points to an existing index entry
+                let entry = unsafe { index.remove_unchecked(pos) };
+                if self.verbose {
+                    println!("remove '{}'", entry.path().display())
+                }
+                return Ok(());
+            }
             // TODO: this should be an error? and ignored if `ignore-errors` is set?
-            Err(err) if err.is_not_found() => None,
             Err(err) => return Err(AddError::Io(err)),
         };
-        let Some(entry) = index.get(pattern) else {
-            // untracked, if `node` is `Some` and `node.kind` is other/unsupported, no error is returned
-            // we silently skip it
-            return Ok(());
-        };
 
-        let paths = index
-            .iter()
-            .filter(|&entry| {
-                // user provided `.`
-                pattern.as_bytes().is_empty()
-                    // exact match any regular file, symlinks
-                    || pattern == entry.path()
-                    // if the provided path is a directory we include its entries
-                    || pattern.is_parent_of(entry.path())
-            })
-            // TODO: review the design
-            //  with the current design and approach clone is unavoidable. Without `map` we get back
-            //  a `Vec<&IndexEntry>`, and the returned references keep the immutable borrow of
-            //  `index.iter()` alive for as long as needed. Later when we call `update_tracked()` we
-            //  have to mutate the index, and at this point we have 2 both borrows alive and we try
-            //  to use them both which is not allowed.
-            .map(|entry| entry.path().clone())
-            .collect::<Vec<_>>();
-
-        for path in paths {
-            self.update_tracked(filemode, workspace, index, &path);
-        }
-
-        // let node = match node {
-        //     Some(node) => node,
-        //     // Case: a deleted file that index used to keep track of
-        //     //
-        //     // this is referred to as a staged deletion because index no longer contains the specific
-        //     // file next time we run status or commit HEAD will have the file, but index will not
-        //     // TODO: what happens if the provided path is a deleted directory that index contained
-        //     //  entries, it was tracked, what is the behavior in this case? remove() will fail
-        //     //  because dir's path itself does not exist on the index.
-        //     None if index.is_tracked(path) => {
-        //         index.remove(path);
-        //         return Ok(());
-        //     }
-        //     None => {
-        //         return Err(AddError::FoundNoMatch {
-        //             path: pathspec.original().to_os_string(),
-        //         });
-        //     }
-        // };
-        //
-        // let (mode, content) = match node.kind {
-        //     FileKind::Regular(exe) => {
-        //         // if filemode is true, trust the current mode, otherwise keep the existing
-        //         // one
-        //         let mode = if filemode {
-        //             if exe { Mode::Executable } else { Mode::Regular }
-        //         } else {
-        //             match entry.mode() {
-        //                 Mode::Regular => Mode::Regular,
-        //                 Mode::Executable => Mode::Executable,
-        //                 // this is the case where the entry previously represented a
-        //                 // symlink, we can't keep the old mode because we would label
-        //                 // the new regular file as a symlink
-        //                 _ => Mode::Regular,
-        //             }
-        //         };
-        //         let content = workspace.read_file(path)?;
-        //         (mode, content)
-        //     }
-        //     FileKind::Symlink => (Mode::Symlink, workspace.read_link(path)?),
-        //     FileKind::Directory => (Mode::Symlink, Vec::new()),
-        //     FileKind::Other => {
-        //         if index.contains(pathspec.pattern()) {
-        //             return Err(AddError::UnsupportedFileType { path: path.clone() });
-        //         }
-        //         unreachable!("index does not contain unsupported files")
-        //     }
-        // };
-        Ok(())
-    }
-
-    fn update_tracked(
-        &self,
-        filemode: bool,
-        workspace: &Workspace,
-        index: &mut Index,
-        path: &RepoPath,
-    ) {
-    }
-
-    // fn update(
-    //     &self,
-    //     filemode: bool,
-    //     workspace: &Workspace,
-    //     db: &Database,
-    //     index: &mut Index,
-    //     path: &RepoPath,
-    // ) -> Result<(), AddError> {
-    //     let node = match workspace.stat(path) {
-    //         Ok(node) => Some(node),
-    //         // TODO: this should be an error? and ignored if `ignore-errors` is set?
-    //         Err(err) if err.is_not_found() => None,
-    //         Err(err) => return Err(AddError::Io(err)),
-    //     };
-    //
-    //     match node {
-    //         Some(node) => {
-    //             if let Some(existing_entry) = index.get(path) {
-    //                 match node.kind {
-    //                     FileKind::Regular(exe) => {
-    //                         // if filemode is true, trust the current mode, otherwise keep the existing
-    //                         // one
-    //                         let mode = if filemode {
-    //                             if exe { Mode::Executable } else { Mode::Regular }
-    //                         } else {
-    //                             match existing_entry.mode() {
-    //                                 Mode::Regular => Mode::Regular,
-    //                                 Mode::Executable => Mode::Executable,
-    //                                 // this is the case where the entry previously represented a
-    //                                 // symlink, we can't keep the old mode because we would label
-    //                                 // the new regular file as a symlink
-    //                                 _ => Mode::Regular,
-    //                             }
-    //                         };
-    //
-    //                         if existing_entry.metadata().times_match(&node.stat)
-    //                             && *existing_entry.mode() == mode
-    //                         {
-    //                             return Ok(());
-    //                         }
-    //                         let content = workspace.read_file(path)?;
-    //                         // A simple check `if *existing_entry.oid() != db::hash(b"blob", &content)`
-    //                         // is not enough, it could bypass a collision? We let store handle it
-    //                         let oid = db.store(Object::Blob(content))?;
-    //                         let metadata = IndexEntryMetadata {
-    //                             stat: node.stat,
-    //                             mode,
-    //                             oid,
-    //                             flags: 0,
-    //                         };
-    //                         index.update_entry(path, metadata);
-    //                     }
-    //                     FileKind::Symlink => {}
-    //                     FileKind::Directory => {}
-    //                     FileKind::Other => {}
-    //                 }
-    //             }
-    //         }
-    //         // Case: a deleted file that index used to keep track of
-    //         //
-    //         // this is referred to as a staged deletion because index no longer contains the specific
-    //         // file next time we run status or commit HEAD will have the file, but index will not
-    //         // TODO: what happens if the provided path is a deleted directory that index contained
-    //         //  entries, it was tracked, what is the behavior in this case? remove() will fail
-    //         //  because dir's path itself does not exist on the index.
-    //         None if index.is_tracked(path) => {
-    //             index.remove(path);
-    //         }
-    //         None => {}
-    //     }
-    //
-    //     Ok(())
-    // }
-}
-
-// 'a: for how long Collector can borrow workspace database
-// 'repo: for how long workspace/database borrows their paths from repository
-// we could drop `path` and `node` since they are only used once to start the recursion and we could
-// pass them to `collect()` instead of keeping them internally.
-struct EntryCollector<'a, 'repo> {
-    workspace: &'a Workspace<'repo>,
-    database: &'a Database<'repo>,
-    path: &'a RepoPath,
-    index: &'a Index,
-    node: &'a StatNode,
-    entries: Vec<IndexEntry>,
-}
-
-impl<'a, 'repo> EntryCollector<'a, 'repo> {
-    fn new(
-        workspace: &'a Workspace<'repo>,
-        db: &'a Database<'repo>,
-        path: &'a RepoPath,
-        index: &'a Index,
-        node: &'a StatNode,
-    ) -> Self {
-        Self {
-            workspace,
-            database: db,
-            path,
-            index,
-            node,
-            entries: Vec::new(),
-        }
-    }
-
-    // standard recursive approach, collect is the function that triggers the recursion with some
-    // initial state
-    fn collect(&mut self) -> Result<(), AddError> {
-        self.collect_entries(self.path, self.node)
-    }
-
-    fn collect_entries(&mut self, path: &RepoPath, node: &StatNode) -> Result<(), AddError> {
-        match node.kind {
-            FileKind::Regular(exe) => {
-                let content = self.workspace.read_file(path)?;
-                let oid = self.database.store(Object::Blob(content))?;
-                let mode = if exe { Mode::Executable } else { Mode::Regular };
-                self.entries
-                    .push(IndexEntry::new(path.clone(), oid, mode, node.stat));
+        let update = match node.kind {
+            FileKind::Regular(exec) => {
+                // On fs without symlink support, a tracked symlink appears as a regular file containing
+                // its target text. If `core.symlinks = false` and the existing entry's mode is `Symlink`
+                // we treat the regular file as a symlink, and later we call `read_link()` instead of
+                // `read_file()`
+                // https://github.com/git/git/blob/50fe5cc63f9cd6e89b87a2c9ccf96a444f4cfdb7/read-cache.h#L9-L29
+                let mode = if !symlinks && *entry.mode() == Mode::Symlink {
+                    Mode::Symlink
+                // if filemode is true, trust the current mode, otherwise keep the existing one
+                } else if filemode {
+                    if exec {
+                        Mode::Executable
+                    } else {
+                        Mode::Regular
+                    }
+                } else {
+                    match entry.mode() {
+                        Mode::Executable => Mode::Executable,
+                        _ => Mode::Regular,
+                    }
+                };
+                finalize_blob_update(workspace, db, index, pos, mode, &node)?
             }
             FileKind::Symlink => {
-                // https://stackoverflow.com/questions/954560/how-does-git-handle-symbolic-links
-                // the content of the blob is the target path as bytes
-                // the file size is the length of the above sequence
-                //
-                // if the user deletes target, then we have a dangling reference which is allowed.
-                // It's up to the user to remove the symlink
-                //
-                // TODO: Test the following cases
-                //
-                // lstat's st_size for a symlink is the target's length in bytes, so node.stat.file_size
-                // already equals the blob length, we store those bytes verbatim without normalizing
-                // anything.
-                //
-                // For Windows, symlink metadata reports size 0, not target length. If we try to set
-                // size = content.len() when we call status, the stat call there will return 0,
-                // different size, we have to rehash and see that the oid are unchanged which is not
-                // correct, can't have different size but identical hashes.
-                let content = self.workspace.read_link(path)?;
-                let oid = self.database.store(Object::Blob(content))?;
-                self.entries
-                    .push(IndexEntry::new(path.clone(), oid, Mode::Symlink, node.stat));
+                finalize_blob_update(workspace, db, index, pos, Mode::Symlink, &node)?
             }
+            // this is the case where a tracked entry, a blob or a symlink, is now a directory, we
+            // stage the deletion
             FileKind::Directory => {
-                // TODO: check if the mode returned by stat() contains permission bits
-                // TODO: look at --ignore-errors flag
-                for (path, node) in self.workspace.dir_entries(path)? {
-                    self.collect_entries(&path, &node)?;
+                if self.no_all {
+                    return Ok(());
                 }
+                let entry = unsafe { index.remove_unchecked(pos) };
+                EntryUpdate::Removed(entry)
             }
             FileKind::Other => {
-                // this is the case where a tracked file gets deleted and a new file with the same
-                // name but unsupported type is created. Because the old tracked file and the new
-                // unsupported one have the same name(path) Git refuses to update the Index entry.
-                //
-                // src/foo was a regular tracked file that was deleted and now src/foo is socket, and
-                // we try lit add src/foo it must fail
-                if self.index.contains(path) {
-                    return Err(AddError::UnsupportedFileType { path: path.clone() });
+                // TODO: adjust based on `ignore-errors`
+                return Err(AddError::UnsupportedFileType(entry.path().clone()));
+            }
+        };
+
+        // let entry = index.get_unchecked(pos); // we borrow from index immutably
+        // finalize_blob_update();
+        // println(...entry.path().diplay()); // keeps the immutable borrow alive since we use it
+        // after mutating the index
+        //
+        // Also the above example won't work for another reason, which is that the removed `entry`
+        // from the vector gets deallocated, and we can no longer access the path via `entry.path()`
+        if self.verbose {
+            match update {
+                // in those 2 cases, git prints nothing
+                EntryUpdate::Unchanged | EntryUpdate::Refreshed => {}
+                EntryUpdate::Updated => {
+                    // https://github.com/git/git/blob/50fe5cc63f9cd6e89b87a2c9ccf96a444f4cfdb7/read-cache.c#L815-L816
+                    // it is safe to index because `update` never modifies the position or the path'
+                    // of the entry. This is a new borrow and we avoid the issue mentioned above.
+                    // TODO: use ReadableBytes from print.rs
+                    let entry = unsafe { index.get_unchecked(pos) };
+                    println!("add '{}'", entry.path().display())
                 }
-                // Untracked unsupported files are silently ignored
+                // https://github.com/git/git/blob/50fe5cc63f9cd6e89b87a2c9ccf96a444f4cfdb7/read-cache.c#L636-L648
+                EntryUpdate::Removed(entry) => println!("remove '{}'", entry.path().display()),
             }
         }
         Ok(())
     }
 
-    fn finish(self) -> Vec<IndexEntry> {
-        self.entries
+    // https://github.com/git/git/blob/750f5de7dfe9a4062f95088212b063f189d50e91/read-cache.c#L1350-L1459
+    fn refresh(
+        &self,
+        workspace: &Workspace,
+        index: &mut Index,
+        db: &Database,
+    ) -> Result<(), AddError> {
+        Ok(())
+    }
+}
+
+// refresh updates the index stat information without staging any changes, and it is an operation
+// rather than a different `Selection` variant
+//
+// scope is determined by pathspec. If present, the scope is the supplied paths, otherwise entire
+// worktree.
+//
+// This is similar to `Target` in `init` when based on what the user provided we determine worktree
+// and metadata dirs. The rest of the flags are independent and will check them after we made a
+// `Selection`
+enum Selection {
+    AllChanges,
+    TrackedChanges,
+    AdditionsAndModifications,
+}
+
+enum Operation {
+    Interactive,
+    Refresh,
+    Stage(Selection),
+}
+
+enum EntryUpdate {
+    Unchanged,
+    Refreshed,
+    Updated,
+    Removed(IndexEntry),
+}
+
+fn collect_untracked_paths(
+    workspace: &Workspace,
+    index: &Index,
+    path: &RepoPath,
+    untracked: &mut Vec<(RepoPath, StatNode)>,
+    seen: &mut HashSet<RepoPath>,
+) -> Result<(), IoError> {
+    // prune
+    // for directories if the user provided the parent and 1 or many of its subdirectories, we don't
+    // have to visit any of them because the parent walk already does.
+    // `lit add -A src src/command`
+    // we don't walk `command` when we process `src/command`. It has already been visited when we
+    // processed `src`.
+    if !seen.insert(path.clone()) {
+        return Ok(());
+    }
+
+    let node = match workspace.stat(path) {
+        Ok(node) => node,
+        // for a missing path will later determine what to do when we do our tracked processing
+        //  - it might still exist as an index entry(staged deletion)
+        //  - if it does not exist in the index too then a `NotFound` error
+        Err(err) if err.is_not_found() => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    match node.kind {
+        // we can't just call `index.is_tracked()` for dir because it might still have entries that
+        // are untracked, we have to recurse
+        FileKind::Directory => {
+            for (path, _) in workspace.dir_entries(path)? {
+                collect_untracked_paths(workspace, index, &path, untracked, seen)?;
+            }
+        }
+        FileKind::Regular(_) | FileKind::Symlink => {
+            if !index.contains(path) {
+                untracked.push((path.clone(), node));
+            }
+        }
+        // an unsupported file explicitly supplied is silently skipped, git returns exit code 0
+        FileKind::Other => {}
+    }
+
+    Ok(())
+}
+
+// TODO: the current impl does not address racy-git
+//  https://git-scm.com/docs/racy-git
+//  https://www.youtube.com/watch?v=m44cAozuLNI
+fn finalize_blob_update(
+    workspace: &Workspace,
+    db: &Database,
+    index: &mut Index,
+    pos: usize,
+    mode: Mode,
+    node: &StatNode,
+) -> Result<EntryUpdate, AddError> {
+    let entry = unsafe { index.get_unchecked(pos) };
+    // no changes detected, nothing to update
+    // https://github.com/git/git/blob/50fe5cc63f9cd6e89b87a2c9ccf96a444f4cfdb7/statinfo.c#L64-L105
+    if *entry.stat() == node.stat && *entry.mode() == mode {
+        return Ok(EntryUpdate::Unchanged);
+    }
+
+    // if the file is a symlink in a fs that does not support symlinks, and it is reported as regular
+    // we use `read_file()`, `read_link()` would expect a symlink. We perform the read based on the
+    // `FileKind` which is what the os reported and not our recorded `Mode`
+    let content = if matches!(node.kind, FileKind::Regular(_)) {
+        workspace.read_file(entry.path())?
+    } else {
+        workspace.read_link(entry.path())?
+    };
+    let oid = db.store(Object::Blob(content))?;
+    if oid == *entry.oid() && *entry.mode() == mode {
+        unsafe {
+            index.refresh_stat_unchecked(pos, node.stat);
+        }
+        Ok(EntryUpdate::Refreshed)
+    } else {
+        let metadata = IndexEntryMetadata {
+            stat: node.stat,
+            mode,
+            oid,
+            /*
+             * TODO: this is temporary, same logic as `Index::new()` for now, when we add support
+             * for multiple index version it will change
+             */
+            flags: entry.path().as_bytes().len().min(0xfff) as u16,
+        };
+        unsafe {
+            index.update_entry_unchecked(pos, metadata);
+        }
+        Ok(EntryUpdate::Updated)
+    }
+}
+
+fn filemode(cfg: &ConfigFile) -> Result<bool, ConfigFileError> {
+    match cfg.get_bool("core.filemode") {
+        Ok(filemode) => Ok(filemode),
+        // https://git-scm.com/docs/git-config#Documentation/git-config.txt-corefileMode
+        Err(err) if err.is_key_not_found() => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
+fn symlinks(cfg: &ConfigFile) -> Result<bool, ConfigFileError> {
+    match cfg.get_bool("core.symlinks") {
+        Ok(symlinks) => Ok(symlinks),
+        // https://git-scm.com/docs/git-config#Documentation/git-config.txt-coresymlinks
+        Err(err) if err.is_key_not_found() => Ok(true),
+        Err(err) => Err(err),
     }
 }
 
@@ -467,12 +602,27 @@ pub(crate) enum AddError {
     Pathspec(PathspecError),
     Lockfile(LockfileError),
     Io(IoError),
-    UnsupportedFileType { path: RepoPath },
+    UnsupportedFileType(RepoPath),
     // user provided path verbatim
-    FoundNoMatch { path: OsString },
+    FoundNoMatch(OsString),
 }
 
-impl Error for AddError {}
+impl Error for AddError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(err) => Some(err),
+            Self::Index(err) => Some(err),
+            Self::Database(err) => Some(err),
+            Self::OsPath(err) => Some(err),
+            Self::Workspace(err) => Some(err),
+            Self::Pathspec(err) => Some(err),
+            Self::Lockfile(err) => Some(err),
+            Self::Io(err) => Some(err),
+            Self::UnsupportedFileType(_) => None,
+            Self::FoundNoMatch(_) => None,
+        }
+    }
+}
 
 impl fmt::Display for AddError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -517,7 +667,7 @@ impl From<ConfigFileError> for AddError {
 
 impl From<PathspecError> for AddError {
     fn from(err: PathspecError) -> Self {
-        AddError::Pathspec(err)
+        Self::Pathspec(err)
     }
 }
 
@@ -529,24 +679,24 @@ impl From<IoError> for AddError {
 
 impl From<IndexError> for AddError {
     fn from(err: IndexError) -> Self {
-        AddError::Index(err)
+        Self::Index(err)
     }
 }
 
 impl From<DatabaseError> for AddError {
     fn from(err: DatabaseError) -> Self {
-        AddError::Database(err)
+        Self::Database(err)
     }
 }
 
 impl From<WorkspaceError> for AddError {
     fn from(err: WorkspaceError) -> Self {
-        AddError::Workspace(err)
+        Self::Workspace(err)
     }
 }
 
 impl From<LockfileError> for AddError {
     fn from(err: LockfileError) -> Self {
-        AddError::Lockfile(err)
+        Self::Lockfile(err)
     }
 }

@@ -549,8 +549,10 @@ fn probe_fs_for_filemode(probe_dir: &OsPath) -> Result<bool, IoError> {
 //
 // if we have a tracked symlink file like `current` that contains `releases/v1`
 // when checking out that entry, Git uses `core.symlinks` to choose how to represent that file.
-//  - true: follows the symlink and reads the content of target
-//  - false: reads the text `releases/v1`
+//  - true: prints the target's content
+//  - false: prints the text `releases/v1`
+// if `core.symlinks = false` checkout represents a tracked symlink as a regular file containing its
+// target text else it follows the symlink and prints the target's content.
 fn probe_fs_for_symlink_support(probe_dir: &OsPath) -> Result<bool, IoError> {
     let temp_dir =
         TempDir::new_in(probe_dir).with_context("create temp file in", Some(probe_dir))?;

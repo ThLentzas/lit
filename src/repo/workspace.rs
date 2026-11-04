@@ -1,14 +1,17 @@
 use crate::repo::os::{self, FileKind, IoError, IoErrorContext, OsPath, StatNode};
 use crate::repo::repopath::RepoPath;
 use std::error::Error;
-use std::path::{Path, PathBuf};
-use std::{env, fmt, fs};
+use std::path::Path;
+use std::{fmt, fs};
 
 // root relative path -> fs calls
 //
 // our internal language is root relative paths, that's what the index stores, what pathspec match
 // etc. The syscalls though need absolute paths, Workspace is responsible for doing this translation
 // It is the working tree viewed from the repo root.
+//
+// Note: Workspace does not need to do any conversion for the `core.ignorecase` flag. The os itself
+// will resolve the spelling.
 pub(crate) struct Workspace<'repo> {
     // root of the working tree
     root: &'repo OsPath,
@@ -32,16 +35,12 @@ impl<'repo> Workspace<'repo> {
     //
     // we need the prefix to later compute repo relative paths
     // if cwd is root then prefix is an empty path
-    // it returns a PathBuf because prefix can be empty and OsPath cannot
-    // read OsPath::strip_prefix()
-    pub(crate) fn prefix(&self) -> Result<PathBuf, WorkspaceError> {
-        let cwd = env::current_dir().with_context::<&Path>("getcwd", None)?;
-
-        let cwd = OsPath::new_unchecked(cwd);
-        // can't return &Path because cwd is local
-        cwd.strip_prefix(&self.root)
-            .map(Path::to_path_buf)
-            .map_err(|_| WorkspaceError::OutsideRepository { path: cwd })
+    pub(crate) fn path_to_root_prefix<'a>(
+        &self,
+        path: &'a OsPath,
+    ) -> Result<&'a Path, WorkspaceError> {
+        path.strip_prefix(&self.root)
+            .map_err(|_| WorkspaceError::OutsideRepository { path: path.clone() })
     }
 
     // returns the target's path
@@ -51,7 +50,7 @@ impl<'repo> Workspace<'repo> {
         Ok(os::os_str_as_bytes(path.as_os_str()).to_vec())
     }
 
-    // TODO: this should probably read the file from the fd
+    //
     pub(crate) fn read_file(&self, path: &RepoPath) -> Result<Vec<u8>, IoError> {
         let absolute = self.to_absolute(path);
 
@@ -127,7 +126,8 @@ impl<'repo> Workspace<'repo> {
     }
 
     fn to_absolute(&self, path: &RepoPath) -> OsPath {
-        self.root.join_unchecked(os::os_str_from_bytes(path.as_bytes()))
+        self.root
+            .join_unchecked(os::os_str_from_bytes(path.as_bytes()))
     }
 }
 

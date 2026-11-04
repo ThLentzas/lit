@@ -34,7 +34,7 @@ impl Oid {
         let mut inner = [0u8; 20];
 
         for (i, pair) in hex.chunks_exact(2).enumerate() {
-            inner[i] = unsafe { pair_to_u8_unchecked(pair.try_into().unwrap()) };
+            inner[i] = pair_to_u8_unchecked(pair.try_into().unwrap());
         }
 
         Self { inner }

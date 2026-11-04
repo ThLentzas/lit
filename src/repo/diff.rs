@@ -156,7 +156,7 @@ pub(crate) fn unstaged(
         // `Replace` means replace this range of `a` with this range of `b`
         let ops = similar::capture_diff_slices(Algorithm::Myers, &old_lines, &new_lines);
         let old_version = Some(FileVersion {
-            mode: index_entry.mode,
+            mode: *index_entry.mode(),
             content: old_content,
         });
         let new_version = new_mode.map(|mode| FileVersion {

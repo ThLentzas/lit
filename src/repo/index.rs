@@ -6,11 +6,7 @@ use crate::repo::index::parse::Parser;
 use crate::repo::os::{FileStat, IoError, OsPath};
 use crate::repo::repopath::{RepoPath, RepoPathError};
 use sha1::{Digest, Sha1};
-use std::collections::BTreeSet;
-use std::error::Error;
-use std::io;
-use std::ops::Bound;
-use std::{fmt, fs};
+use std::{error::Error, fmt, fs, io, ptr};
 
 // git has multiple versions(2, 3, 4) for the index format
 const INDEX_VERSION: u32 = 2;
@@ -18,13 +14,32 @@ const PATH_MAX_SIZE: u16 = 0xfff;
 const SIGNATURE: &str = "DIRC";
 
 // TODO: cache tree is part of the extensions that Index supports
-//  we need to guarantee that any mutations that happen to stroed entries always go through index
-//  so we can update the `modified` flag
+// TODO: we need to add support for `core.ignorecase`, it is probed and recorded during init, but not
+//  considered during working-tree/index name matching.
+// Things that I tried:
+//  BTreeMap<RepoPath, IndexEntry>: we have to clone every time to store the path.
+//  BTreeMap<RepoPath, IndexEntryMetadata>: works but then we lose `IndexEntry`. It gives us the
+//  ability to mutate metadata while keys remain immutable. Required a lot of changes on the existing
+//  index methods.
+//  BTreeSet<IndexEntry>: this worked but with issues since it treats the entire entry as key.
+//  Implemented `Ord` to only consider `entry.path`, and `Borrow<[u8]>` so we can search entries based
+//  on the underlying path buffer. We can't get `&mut IndexEntry` because it would break the order,
+//  so any modifications were remove, modify?, insert. Another issue was when we were doing the setup
+//  for the `update` option, we would have to iterate over the existing entries and find which of
+//  those we have to modify. The result was a `Vec<&RepoPath>. The operation then dies because we
+//  would have 2 active references for index, 1 from the calling `index.iter()` to collect the paths
+//  and the mutable one to perform the mutations. The solution to that was to clone each path. If the
+//  user called `update .` from root and no new files were added just modifications of existing ones
+//  we would have to clone everything.
+//
+// Index is represented by a sorted array. Entries are unique by raw repository-relative path bytes.
+// No mutable entry iterator is exposed. Every mutation must go through Index so `modified` is
+// maintained, and paths cannot be modified by accident. This invariant must hold no matter what is
+// the underlying structure. DO NOT expose any methods that return `&mut IndexEntry`
 pub(crate) struct Index {
-    entries: BTreeSet<IndexEntry>,
-    pub(crate) path: OsPath,
-    // no writes if no changes detected
-    pub(crate) modified: bool,
+    entries: Vec<IndexEntry>,
+    path: OsPath,
+    modified: bool,
 }
 
 // .lit/index is created lazily on the first write
@@ -32,16 +47,16 @@ impl Index {
     pub(crate) fn new(path: OsPath) -> Self {
         Self {
             path,
-            entries: BTreeSet::new(),
+            entries: Vec::new(),
             modified: false,
         }
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item=&IndexEntry> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &IndexEntry> {
         self.entries.iter()
     }
 
-    pub(crate) fn into_entries(self) -> impl Iterator<Item=IndexEntry> {
+    pub(crate) fn into_entries(self) -> impl Iterator<Item = IndexEntry> {
         self.entries.into_iter()
     }
 
@@ -49,17 +64,32 @@ impl Index {
         &self.path
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn is_modified(&self) -> bool {
+        self.modified
+    }
+
     pub(crate) fn get(&self, path: &RepoPath) -> Option<&IndexEntry> {
-        self.entries.get(path)
+        self.search(path).ok().map(|pos| &self.entries[pos])
+    }
+
+    pub(crate) unsafe fn get_unchecked(&self, pos: usize) -> &IndexEntry {
+        unsafe { self.entries.get_unchecked(pos) }
+    }
+
+    pub(crate) fn contains(&self, path: &RepoPath) -> bool {
+        self.search(path).is_ok()
     }
 
     // This method is used by status to see if the entry pointed by `path` is tracked by the index.
-    // If path points to a file, a single binary search call is enough, but directories have specific
-    // behavior. As we already mentioned Index does not keep track of directories. If the path passed
-    // to add is a directory Index and tracks its entries.
-    // An optimization that Git does is that when a directory  contains no tracked files anywhere
-    // inside it, status reports the directory itself, not every file below it. So if foo contains
-    // bar.txt, and baz.txt, instead of listing both as untracked it lists foo/.
+    // If `path` points to a file, a single binary search call is enough. Directories though, since
+    // are not tracked by Index are treated differently. Read below.
+    // An optimization that Git does is that when a directory contains no tracked files anywhere
+    // inside it, status reports the directory itself, not every file below it. So if `foo` contains
+    // `bar.txt`, and `baz.txt`, instead of listing both as untracked it lists `foo/`.
     //      workspace:
     //          a/b/inner.txt      tracked
     //          a/outer.txt        untracked
@@ -68,36 +98,41 @@ impl Index {
     //      index:
     //          a/b/inner.txt
     //
-    // The result of status for untracked files is: a/b/c, a/outer.txt. even though a/ is not literally
-    // in the index, it is a tracked directory for status purposes because it contains a/b/inner.txt,
-    // which is tracked. a/b is also tracked since it contains inner.txt.
+    // The result of status for untracked files is: `a/b/c`, `a/outer.txt`. even though `a/ is not
+    // literally in the index, it is a 'tracked' directory for status purposes because it contains
+    // `a/b/inner.txt` which is tracked. `a/b` is also tracked since it contains `inner.txt`.
     //
     // The rule is:
     //      A path is tracked for status if:
     //          1. the exact file path exists in the index, OR
     //          2. the path is a directory prefix of at least one index entry.
     //
-    // The exact file is easy as mentioned. For the dir case, we already have the is_parent_path()
-    // from resolve_conflicts() we need to find the child entry path. Read lower_bound()
+    // The exact file is easy as mentioned. For the dir case, read lower_bound()
     // This logic handles untracked(non-empty) directories.
     pub(crate) fn is_tracked(&self, path: &RepoPath) -> bool {
+        // path points to file
         if self.contains(path) {
             return true;
         }
         // TODO: test it
-        // Hard to see edge case spotted by AI. If the path is not found it means either that it is
-        // a file and does not exist or that is a dir. In either case we append a trailing slash
-        // a/b.txt      <- '.' (0x2E) sorts before '/' (0x2F)
-        // a/b/c.txt
-        // is_tracked("a/b"): exact search misses, lower_bound("a/b") lands on a/b.txt (the first
-        // entry > "a/b"), is_parent_path("a/b", "a/b.txt") is false -> we return false, even though
-        // a/b/c.txt makes a/b tracked. The real descendants live past the sibling file. Searching
-        // for a/b/ instead skips over a/b.txt and lands exactly on the first descendant if one exists
+        // If the entry is not found it means either that it is an untracked file or that is a dir.
+        // We need to see if it is a 'tracked' directory, a directory whose entries are tracked.
+        // path: a/b
+        //  [a/b.txt, a/b/c.txt], '.' (0x2E) sorts before '/c' (0x2F)
+        //
+        //  for path to be parent dir of any entry three properties must hold true.
+        //      - child.len() > parent.len()
+        //      - parent is a prefix of child
+        //      - child[parent.len()] must be '/'
+        //  It is the same logic as `RepoPath::is_parent_of()`. Appending `\` handles the 3rd condition
+        //  and the `starts_with()` call checks the prefix. The 1st condition is guarantee by Index
+        //  where an entry's path never has a trailing slash, so any entry that starts with
+        // `path` + '/' is necessarily longer than `path`.
         let mut path_bytes = Vec::with_capacity(path.as_bytes().len() + 1);
         path_bytes.extend_from_slice(path.as_bytes());
         path_bytes.push(b'/');
         let entry = self.lower_bound(&path_bytes);
-        entry.is_some_and(|entry| entry.path.as_bytes().starts_with(&path_bytes))
+        entry.is_some_and(|entry| entry.path().as_bytes().starts_with(&path_bytes))
     }
 
     // Git requires index entries to be sorted by filename. It is a requirement for deterministic
@@ -108,73 +143,118 @@ impl Index {
     // We enforce sorted, unique index entries to achieve the same behavior. Maintaining the sorted
     // order prevents the above issue where we could produce different hash for the same tree. By
     // sorting based on the path we maintain the order across all components of the path.
-    // foo/src/a, foo/src/b and foo/README . In the final order README appears before src as the entries
-    // of foo and a appears before b as the entries of src. Inserting in ascending order allows us
-    // to do BS for retrieving entries instead of appending + sorting. Read more Tree::write()
-    pub(crate) fn add_entries(&mut self, entries: Vec<IndexEntry>) -> Result<(), IndexError> {
-        for entry in entries {
-            self.resolve_conflicts(&entry.path);
-            // we can't get a `&mut T` from a BTreeSet so we call `get()` and then `replace()`
-            match self.entries.get(entry.path()) {
-                Some(existing_entry) => {
-                    if existing_entry.metadata() != entry.metadata() {
-                        self.entries.replace(entry);
-                        self.modified = true;
-                    }
-                }
-                None => {
-                    self.entries.insert(entry);
+    // `foo/src/a`, `foo/src/b` and `foo/README`. In the final order, `README` appears before `src`
+    // as the entries of `foo` and `a` appears before `b` as the entries of `src`. Inserting in
+    // ascending order allows us to do BS for retrieving entries instead of appending + sorting.
+    // Read more Tree::write()
+    pub(crate) fn insert(&mut self, entry: IndexEntry) -> Result<usize, IndexError> {
+        self.resolve_conflicts(entry.path());
+
+        let pos = match self.search(entry.path()) {
+            Ok(pos) => {
+                if self.entries[pos].metadata() != entry.metadata() {
+                    self.entries[pos] = entry;
                     self.modified = true;
                 }
+                pos
             }
-        }
-        Ok(())
+            Err(pos) => {
+                self.entries.insert(pos, entry);
+                self.modified = true;
+                pos
+            }
+        };
+        Ok(pos)
     }
 
+    // `entry.path` remains unchanged so the order never breaks
     pub(crate) fn update_entry(&mut self, path: &RepoPath, metadata: IndexEntryMetadata) -> bool {
-        let Some(mut existing_entry) = self.entries.take(path) else {
+        let Ok(pos) = self.search(path) else {
             return false;
         };
 
-        let updated = if *existing_entry.metadata() != metadata {
-            *existing_entry.metadata_mut() = metadata;
-            true
-        } else {
-            false
-        };
-
-        self.entries.insert(existing_entry);
-        self.modified = self.modified || updated;
-
-        updated
-    }
-
-    // for now none of the callers needs the removed value if any, so we return bool. If anything
-    // changes we will return Option<IndexEntry>
-    pub(crate) fn remove(&mut self, path: &RepoPath) -> bool {
-        let removed = self.entries.remove(path);
-        // keep the index marked as modified if it already was from a previous call, or mark it as
-        // modified if something was removed
-        self.modified = self.modified || removed;
-
-        removed
-    }
-
-    pub(crate) fn refresh_stat(&mut self, path: &RepoPath, stat: FileStat) -> bool {
-        // we can't get a `&mut T` from a BTreeSet so we call `take()` that removes the entry, we
-        // update `stat` and then reinsert. Unlike `add_entries()` where we have access to the new
-        // entry and can call `get()`/`replace()`, here we need to update only stat
-        let mut entry = match self.entries.take(path) {
-            Some(entry) => entry,
-            None => return false,
-        };
-        if *entry.stat() != stat {
-            *entry.stat_mut() = stat;
-            self.entries.insert(entry);
+        let entry = &mut self.entries[pos];
+        if *entry.metadata() != metadata {
+            *entry.metadata_mut() = metadata;
             self.modified = true;
             true
         } else {
-            self.entries.insert(entry);
+            false
+        }
+    }
+
+    pub(crate) unsafe fn update_entry_unchecked(
+        &mut self,
+        pos: usize,
+        metadata: IndexEntryMetadata,
+    ) -> bool {
+        let entry = &mut self.entries[pos];
+        if *entry.metadata() != metadata {
+            *entry.metadata_mut() = metadata;
+            self.modified = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn remove(&mut self, path: &RepoPath) -> Option<IndexEntry> {
+        let Ok(pos) = self.search(path) else {
+            return None;
+        };
+        let entry = self.entries.remove(pos);
+        self.modified = true;
+
+        Some(entry)
+    }
+
+    // the code below is taken Rust's `try_remove()` impl
+    // https://doc.rust-lang.org/beta/src/alloc/vec/mod.rs.html#2437-2452
+    //
+    // an alternative would be to call `try_remove().unwrap_unchecked()`
+    pub(crate) unsafe fn remove_unchecked(&mut self, pos: usize) -> IndexEntry {
+        let len = self.entries.len();
+
+        unsafe {
+            let entry;
+            {
+                // the place we are taking from.
+                let ptr = self.entries.as_mut_ptr().add(pos);
+                // copy it out, unsafely having a copy of the value on
+                // the stack and in the vector at the same time.
+                entry = ptr::read(ptr);
+                // Shift everything down to fill in that spot.
+                ptr::copy(ptr.add(1), ptr, len - pos - 1);
+            }
+            self.entries.set_len(len - 1);
+            self.modified = true;
+
+            entry
+        }
+    }
+
+    pub(crate) fn refresh_stat(&mut self, path: &RepoPath, stat: FileStat) -> bool {
+        let Ok(pos) = self.search(path) else {
+            return false;
+        };
+
+        let entry = &mut self.entries[pos];
+        if *entry.stat() != stat {
+            *entry.stat_mut() = stat;
+            self.modified = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) unsafe fn refresh_stat_unchecked(&mut self, pos: usize, stat: FileStat) -> bool {
+        let entry = &mut self.entries[pos];
+        if *entry.stat() != stat {
+            *entry.stat_mut() = stat;
+            self.modified = true;
+            true
+        } else {
             false
         }
     }
@@ -184,7 +264,7 @@ impl Index {
         bytes.extend_from_slice(SIGNATURE.as_bytes());
         bytes.extend_from_slice(&INDEX_VERSION.to_be_bytes());
         bytes.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
-        // TODO: at this point according to the format we are supposed to add Extensions
+        // TODO: at this point according to the format we add Extensions
         for entry in self.entries.iter() {
             bytes.extend(entry.serialize());
         }
@@ -194,11 +274,11 @@ impl Index {
         bytes
     }
 
-    // loads the contents of .lit/index in memory
+    // loads the contents of .lit/index
     pub(crate) fn load(&mut self) -> Result<(), IndexError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
-            // happens on a new repo, `Index` will be created on the first write
+            // happens on a new repo, `Index` will be created lazily on the first write
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 self.entries.clear();
                 self.modified = false;
@@ -261,7 +341,7 @@ impl Index {
         let count = u32::from_be_bytes(*parser.take::<4>()?);
         // we need to be explicit with the type because the check for last.path happens before the
         // entries.push(entry) where the type can be inferred.
-        let mut entries: BTreeSet<IndexEntry> = BTreeSet::new();
+        let mut entries: Vec<IndexEntry> = Vec::new();
         // if we exhausted the buffer before we reach count we get UnexpectedEof
         for _ in 0..count {
             let entry_offset = parser.offset();
@@ -278,14 +358,14 @@ impl Index {
                 // if entry.path < last.path, sort order is broken; any earlier duplicate would also
                 // surface as a non-ascending pair somewhere in the sequence
                 // TODO: address sorting order when we add stage support during merge
-                if last.path() >= &entry.path {
+                if last.path() >= entry.path() {
                     return Err(FormatError::at(
                         entry_offset,
                         FormatErrorKind::EntriesOutOfSorted,
                     ))?;
                 }
             }
-            entries.insert(entry);
+            entries.push(entry);
         }
 
         // there are trailing bytes between the last index entry and the checksum
@@ -317,26 +397,30 @@ impl Index {
     //
     // Such cases represent invalid states because no fs allows 2 entries to have the same name
     fn resolve_conflicts(&mut self, path: &RepoPath) {
+        let old_len = self.entries.len();
         // remove an existing entry if either path is a parent of the other
         self.entries
-            .retain(|entry| !entry.path.is_parent_of(path) && !path.is_parent_of(&entry.path))
+            .retain(|entry| !entry.path().is_parent_of(path) && !path.is_parent_of(entry.path()));
+        // if the index is already modified keep it as is else is the result of attempting removal
+        self.modified |= self.entries.len() != old_len
     }
 
-    // This method we have seen before on Leetcode is the next_greater() adaptation of binary search,
-    // or it is treated as such. To determine if `path` is parent path of any of the entries, we need
-    // to find the entry that is lexicographically greater than `path`. The entries that we are actually
-    // going to return true are entries that their path length is always greater than length of the
-    // provided path because child_path.len() > parent_path.len(). Sure `foo/bar.txt` is one potential
-    // candidate as is lexicographically greater than `a/b/` but so is `a/b/foo.txt`.
+    // This is the `next_greater()` adaptation of bs, or it is treated as such.
+    // To determine if `path` is parent path of the entries, we need to find the entry that is
+    // lexicographically greater than `path`. The entries that are actually going to return true are
+    // entries that their path length is always greater than length of the provided path because
+    // child_path.len() > parent_path.len(). Sure `foo/bar.txt` is one potential candidate as is
+    // lexicographically greater than `a/b/` but so is `a/b/foo.txt`.
     fn lower_bound(&self, path_bytes: &[u8]) -> Option<&IndexEntry> {
-        self.entries
-            // TODO: it needs to impl `Borrow<[u8]>` for IndexEntry
-            .range::<[u8], _>((Bound::Excluded(path_bytes), Bound::Unbounded))
-            .next()
+        let position = self
+            .entries
+            .partition_point(|entry| entry.path().as_bytes() < path_bytes);
+        self.entries.get(position)
     }
 
-    pub(crate) fn contains(&self, path: &RepoPath) -> bool {
-        self.entries.contains(path)
+    fn search(&self, path: &RepoPath) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by(|entry| entry.path().cmp(path))
     }
 }
 
@@ -382,6 +466,8 @@ impl fmt::Display for IndexError {
             Self::UnsupportedVersion(version) => {
                 write!(f, "unsupported index version {version}")
             }
+            // TODO: this needs to change, index format errors should not be exposed to the user
+            //  even if they know the issue how are they going to fix it?
             Self::InvalidFormat(err) => write!(f, "{err}"),
             Self::Io(_) => write!(f, "index I/O failed"),
         }

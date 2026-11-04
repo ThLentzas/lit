@@ -1,6 +1,6 @@
-use crate::repo::os::{IoError, IoErrorContext, OsPath, OsPathError};
-use std::ffi::{OsStr, OsString};
+use crate::repo::os::{IoError, OsPath};
 use std::env;
+use std::ffi::{OsStr, OsString};
 
 pub(crate) const LIT_DIR: &str = "LIT_DIR";
 pub(crate) const LIT_WORK_TREE: &str = "LIT_WORK_TREE";
@@ -19,8 +19,9 @@ pub(crate) fn var<K: AsRef<OsStr>>(key: K) -> Option<OsString> {
 }
 
 pub(crate) fn cwd() -> Result<OsPath, IoError> {
-    let path = env::current_dir().with_context::<&OsPath>("getcwd", None)?;
-    Ok(OsPath::new_unchecked(path))
+    env::current_dir()
+        .map(OsPath::new_unchecked)
+        .map_err(|err| IoError::new::<&OsPath>("getcwd", None, err))
 }
 
 // fn read_path(path: &str) -> Result<Option<OsPath>> {

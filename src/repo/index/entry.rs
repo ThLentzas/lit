@@ -2,8 +2,6 @@ use crate::repo::object::mode::Mode;
 use crate::repo::object::oid::Oid;
 use crate::repo::os::FileStat;
 use crate::repo::repopath::RepoPath;
-use std::borrow::Borrow;
-use std::cmp::Ordering;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct IndexEntryMetadata {
@@ -25,7 +23,7 @@ impl IndexEntryMetadata {
 #[derive(Debug)]
 pub(crate) struct IndexEntry {
     metadata: IndexEntryMetadata,
-    pub(crate) path: RepoPath,
+    path: RepoPath,
 }
 
 impl PartialEq for IndexEntry {
@@ -35,30 +33,6 @@ impl PartialEq for IndexEntry {
 }
 
 impl Eq for IndexEntry {}
-
-impl PartialOrd for IndexEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for IndexEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.path.cmp(other.path())
-    }
-}
-
-impl Borrow<RepoPath> for IndexEntry {
-    fn borrow(&self) -> &RepoPath {
-        self.path()
-    }
-}
-
-impl Borrow<[u8]> for IndexEntry {
-    fn borrow(&self) -> &[u8] {
-        self.path.as_bytes()
-    }
-}
 
 impl IndexEntry {
     pub(crate) fn new(path: RepoPath, oid: Oid, mode: Mode, stat: FileStat) -> Self {
