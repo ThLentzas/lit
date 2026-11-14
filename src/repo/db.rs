@@ -24,7 +24,7 @@ impl<'repo> Database<'repo> {
             object_format,
         }
     }
-    
+
     pub(crate) fn store(&self, object: Object) -> Result<Oid> {
         let obj_type = object.obj_type().to_string();
         let content = object.serialize();
@@ -84,7 +84,10 @@ impl<'repo> Database<'repo> {
         let hex = oid.to_hex();
         // always safe to index since hex is a valid 40 character long hex string
         let (parent, child) = hex.split_at(2);
-        let path = self.objects_dir.join_unchecked(parent).join_unchecked(child);
+        let path = self
+            .objects_dir
+            .join_unchecked(parent)
+            .join_unchecked(child);
         let content = match fs::read(&path) {
             Ok(content) => content,
             Err(err)
@@ -185,7 +188,9 @@ impl<'repo> Database<'repo> {
         let entries = match fs::read_dir(&path) {
             Ok(read_dir) => read_dir,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Err(DatabaseError::Prefix(PrefixError::NotFound(prefix.to_string())));
+                return Err(DatabaseError::Prefix(PrefixError::NotFound(
+                    prefix.to_string(),
+                )));
             }
             Err(err) => return Err(DatabaseError::Io(IoError::new("opendir", Some(path), err))),
         };
@@ -194,7 +199,9 @@ impl<'repo> Database<'repo> {
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
-                Err(err) => return Err(DatabaseError::Io(IoError::new("opendir", Some(path), err))),
+                Err(err) => {
+                    return Err(DatabaseError::Io(IoError::new("opendir", Some(path), err)));
+                }
             };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -224,6 +231,7 @@ impl<'repo> Database<'repo> {
     }
 }
 
+// TODO: we need to consider the hasher
 pub(crate) fn hash(obj_type: &[u8], content: &[u8]) -> Oid {
     Oid::from_bytes(Sha1::digest(encode(obj_type, content)).into())
 }

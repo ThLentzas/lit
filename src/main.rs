@@ -48,3 +48,4 @@ fn main() -> ExitCode {
 //  but with an actual fs call
 // TODO: CHECK the notes on why should never do lexical normalization to symlinks, review if we have
 //  done any so far
+// TODO: should error paths be absolute ?

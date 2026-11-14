@@ -1,8 +1,8 @@
 use crate::repo::os::{self, FileKind, IoError, IoErrorContext, OsPath, StatNode};
 use crate::repo::repopath::RepoPath;
-use std::error::Error;
+use std::fs;
+use std::fs::File;
 use std::path::Path;
-use std::{fmt, fs};
 
 // root relative path -> fs calls
 //
@@ -35,12 +35,12 @@ impl<'repo> Workspace<'repo> {
     //
     // we need the prefix to later compute repo relative paths
     // if cwd is root then prefix is an empty path
-    pub(crate) fn path_to_root_prefix<'a>(
-        &self,
-        path: &'a OsPath,
-    ) -> Result<&'a Path, WorkspaceError> {
-        path.strip_prefix(&self.root)
-            .map_err(|_| WorkspaceError::OutsideRepository { path: path.clone() })
+    // 
+    // for now the only call is with `cwd` as path which comes from `env::current_dir()` and it is
+    // already a canonical path, root is also in canonical form from repository discovery, so we don't
+    // need any lexical normalization
+    pub(crate) fn path_to_root_prefix<'a>(&self, path: &'a OsPath) -> Option<&'a Path> {
+        path.strip_prefix(&self.root).ok()
     }
 
     // returns the target's path
@@ -55,6 +55,13 @@ impl<'repo> Workspace<'repo> {
         let absolute = self.to_absolute(path);
 
         fs::read(&absolute).with_context("open", Some(&absolute))
+    }
+
+    // for a line based file like `.litignore` determine its path and return the handler to the
+    // parser so we can use a `BufReader`
+    pub(crate) fn open_file(&self, path: &RepoPath) -> Result<File, IoError> {
+        let absolute = self.to_absolute(path);
+        File::open(&absolute).with_context("open", Some(&absolute))
     }
 
     pub(crate) fn stat(&self, path: &RepoPath) -> Result<StatNode, IoError> {
@@ -110,7 +117,7 @@ impl<'repo> Workspace<'repo> {
         &self,
         path: &RepoPath,
         kind: &FileKind,
-    ) -> Result<bool, WorkspaceError> {
+    ) -> Result<bool, IoError> {
         match kind {
             FileKind::Regular { .. } | FileKind::Symlink => Ok(true),
             FileKind::Other => Ok(false),
@@ -128,37 +135,5 @@ impl<'repo> Workspace<'repo> {
     fn to_absolute(&self, path: &RepoPath) -> OsPath {
         self.root
             .join_unchecked(os::os_str_from_bytes(path.as_bytes()))
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum WorkspaceError {
-    Io(IoError),
-    OutsideRepository { path: OsPath },
-}
-
-impl Error for WorkspaceError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Io(source) => Some(source),
-            Self::OutsideRepository { .. } => None,
-        }
-    }
-}
-
-impl fmt::Display for WorkspaceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(_) => write!(f, "workspace I/O failed"),
-            Self::OutsideRepository { path } => {
-                write!(f, "path '{}' is outside the repository", path.display())
-            }
-        }
-    }
-}
-
-impl From<IoError> for WorkspaceError {
-    fn from(err: IoError) -> Self {
-        Self::Io(err)
     }
 }

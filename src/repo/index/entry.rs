@@ -79,6 +79,10 @@ impl IndexEntry {
         &self.metadata.mode
     }
 
+    pub(crate) fn mode_mut(&self) -> &mut Mode {
+        &mut self.metadata().mode
+    }
+
     pub(crate) fn file_size(&self) -> u32 {
         self.metadata.stat.file_size
     }

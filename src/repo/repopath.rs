@@ -1,4 +1,5 @@
 use crate::command::print::ReadableBytes;
+use crate::repo::os;
 use std::error::Error;
 use std::fmt;
 use std::path::Path;
@@ -67,7 +68,7 @@ impl RepoPath {
         Ok(self.join_bytes_unchecked(bytes))
     }
 
-    pub(super) fn join_bytes_unchecked(&self, bytes: &[u8]) -> Self {
+    pub(crate) fn join_bytes_unchecked(&self, bytes: &[u8]) -> Self {
         let mut inner = Vec::with_capacity(self.inner.len() + 1 + bytes.len());
         inner.extend_from_slice(&self.inner);
         if !self.inner.is_empty() {
@@ -78,7 +79,7 @@ impl RepoPath {
         RepoPath { inner }
     }
 
-    pub(super) fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.inner.len()
     }
 
@@ -100,7 +101,7 @@ impl RepoPath {
             && child.inner[self.len()] == b'/'
     }
 
-    pub(super) fn components(&self) -> impl Iterator<Item = &[u8]> {
+    pub(crate) fn components(&self) -> impl Iterator<Item = &[u8]> {
         // split actually returns a SplitIterator and next() returns slices up to the index that the
         // predicate returned true, this is why we can call componenets().peekable() and components.next()
         self.inner.split(|&byte| byte == b'/')
@@ -108,6 +109,12 @@ impl RepoPath {
 
     pub(crate) fn display(&self) -> String {
         String::from_utf8_lossy(&self.inner).to_string()
+    }
+}
+
+impl AsRef<Path> for RepoPath {
+    fn as_ref(&self) -> &Path {
+        Path::new(os::os_str_from_bytes(self.as_bytes()))
     }
 }
 

@@ -1,8 +1,9 @@
+use crate::command::print::ReadableBytes;
 use crate::repo::os::{IoError, IoErrorContext, OsPath};
 use std::error::Error;
-use std::{fmt, result};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::{fmt, result};
 
 // https://git-scm.com/docs/api-lockfile
 // Lockfile guarantees mutual exclusion, atomic updates and cleanup of the tmp files in case of an
@@ -165,7 +166,11 @@ impl fmt::Display for LockfileError {
         match self {
             Self::Io(_) => write!(f, "lockfile I/O failed"),
             Self::LockDenied(path) => {
-                write!(f, "could not acquire lock on {}", path.display())
+                write!(
+                    f,
+                    "unable to create '{}'. Another lit process seems to be running in this repository, or the lock may be stale",
+                    ReadableBytes(path.as_bytes())
+                )
             }
         }
     }

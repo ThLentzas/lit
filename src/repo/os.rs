@@ -8,6 +8,8 @@ use std::os::unix::fs::{self as unix_fs, MetadataExt, PermissionsExt};
 use std::path::{Component, Components, Display, Path, PathBuf, StripPrefixError};
 use tempfile::NamedTempFile;
 
+use crate::command::print::ReadableBytes;
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub(crate) struct OsPath {
     inner: PathBuf,
@@ -176,7 +178,7 @@ impl OsPath {
 
         Ok(lhs == rhs)
     }
-    
+
     // no new allocation, we move twice
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.inner.into_os_string().into_vec()
@@ -308,7 +310,7 @@ fn file_kind(meta: &Metadata) -> FileKind {
         FileKind::Symlink
     } else if file_type.is_file() {
         // many Unix permissions can mean executable 100700, 100710, 100711 etc
-        // Git does not preserve them all, instead if the owner has the `x` right it is enough to 
+        // Git does not preserve them all, instead if the owner has the `x` right it is enough to
         // classify it as executable.
         if meta.mode() & 0o100 != 0 {
             FileKind::Regular(true)
@@ -460,11 +462,18 @@ impl IoError {
     }
 }
 
-impl Error for IoError {}
+impl Error for IoError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 impl fmt::Display for IoError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: ", self.op)
+        match self.path.as_ref() {
+            Some(path) => write!(f, "{}(\"{}\")", self.op, ReadableBytes(path.as_bytes())),
+            None => write!(f, "{}", self.op),
+        }
     }
 }
 

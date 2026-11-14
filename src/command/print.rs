@@ -63,8 +63,9 @@ pub(super) trait Printer {
     //
     // type T: 'a means that T does not contain any reference that expires before a
     type T<'a>;
-    
-    fn print<'a>(&self, value: &Self::T<'a>,) -> io::Result<()>;
+    // TODO: some Printer impls need `mut self`, they must acquire the lock to stdout as a field 
+    // because they print inside a loop and we can't acquire the lock at every print call.
+    fn print<'a>(&mut self, value: &Self::T<'a>,) -> io::Result<()>;
 }
 
 // TODO: this is also C-quoted representation, should we rename?

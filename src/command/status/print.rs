@@ -1,4 +1,5 @@
 use crate::command::print::{self, Printer};
+
 use crate::command::status::Format;
 use crate::repo::os::FileKind;
 use crate::repo::repopath::RepoPath;
@@ -74,7 +75,7 @@ pub(super) struct StatusPrinter {
 impl Printer for StatusPrinter {
     type T<'a> = Report;
 
-    fn print(&self, value: &Report) -> io::Result<()> {
+    fn print(&mut self, value: &Report) -> io::Result<()> {
         match self.format {
             Format::Short => print_short(value),
             Format::Long => print_long(value),
@@ -87,7 +88,10 @@ fn print_short(_report: &Report) -> io::Result<()> {
 }
 
 fn print_long(report: &Report) -> io::Result<()> {
-    // if we don't acquire the lock, everytime we write stdout would have to acquire the lock.
+    // acquiring the lock allows us to write to stdout without being interrupted in a multithreaded
+    // environment, it does not prevent another process from writing to stdout
+    // if we print out frequently calling `print!()` it can have a cost in performance since every
+    // call needs to acquire and release the lock.
     let mut writer = io::stdout().lock();
 
     let unstaged = report.unstaged.iter().map(|(path, change)| {

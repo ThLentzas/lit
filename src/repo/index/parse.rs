@@ -228,8 +228,6 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn take<const N: usize>(&mut self) -> Result<&'a [u8; N], FormatError> {
-        // Note: don't try `self.buf[self.pos..self.pos + N].try_into()` because if fewer than `N`
-        // bytes remain the indexing will panic before we call `try_into()`. We have to check first
         if self.remaining() < N {
             return Err(FormatError {
                 offset: self.pos,
@@ -241,9 +239,8 @@ impl<'a> Parser<'a> {
         }
         let bytes = &self.buf[self.pos..self.pos + N];
         self.advance(N);
-        // safe to unwrap here, we know our slice contains exactly `N` bytes,l but we could use `expect`
-        // too
-        Ok(bytes.try_into().unwrap())
+        // SAFETY: we know our slice contains exactly `N` bytes
+        Ok(unsafe { bytes.as_array::<N>().unwrap_unchecked() })
     }
 
     pub(super) fn is_empty(&self) -> bool {

@@ -13,10 +13,9 @@ pub(super) mod refs;
 pub(super) mod repopath;
 pub(super) mod report;
 pub(super) mod timestamp;
-pub(super) mod tree;
 pub(super) mod workspace;
 mod diff;
-mod litignore;
+pub(super) mod ignore;
 
 use crate::repo::config::{ConfigFile, ConfigFileError};
 use crate::repo::db::Database;
@@ -504,8 +503,10 @@ impl Repository {
         Index::new(self.metadata_dir().join_unchecked("index"))
     }
 
-    // TODO: need testing if this should be just `new()`, for now the approach is to treat a missing
-    //  config as "no local settings" instead of repository error
+    /*
+     * TODO: need testing if this should be just `new()`, for now the approach is to treat a missing
+     *  config as "no local settings" instead of repository error
+    */
     pub(super) fn config(&self) -> Result<ConfigFile, ConfigFileError> {
         ConfigFile::new_or_empty(self.config_path())
     }

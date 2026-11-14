@@ -46,8 +46,10 @@ impl CatFile {
             if expected != actual {
                 return Err(CatFileError::TypeMismatch { expected, actual });
             }
-            let printer = CatFilePrinter;
-            printer.print(&object).with_context::<&Path>("write", None)?;
+            let mut printer = CatFilePrinter::lock();
+            printer
+                .print(&object)
+                .with_context::<&Path>("write", None)?;
         }
 
         Ok(())
@@ -101,7 +103,7 @@ impl fmt::Display for CatFileError {
             Self::TypeMismatch { expected, actual } => {
                 write!(f, "object type mismatch: expected {expected}, got {actual}")
             }
-            Self::Io(_) => write!(f, "could not write to stdout")
+            Self::Io(_) => write!(f, "could not write to stdout"),
         }
     }
 }

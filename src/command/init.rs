@@ -167,7 +167,7 @@ impl Init {
             &cfg,
             reinit,
         )?;
-        // TODO: Git adjust the message based on share repo settings
+        // TODO: Git adjust the message based on share repo settings, we need a printer for this?
         //  https://github.com/git/git/blob/d38352cd43ab9745686d697872408bc3249a153f/setup.c#L2929-L2938
         if !reinit {
             println!(
@@ -517,7 +517,7 @@ fn is_reinit(path: &OsPath) -> Result<bool, IoError> {
 //  We commit a script with mode 100755. We check out that repo in an environment that does not
 //  preserve the Unix executable bit and its metadata now reports the script as non-executable,
 //  even though we changed nothing. If Git trusted that result, it would record the change into
-//  a commit. With core.fileMode = false, Git ignores the working-tree executable-bit difference
+//  a commit. With `core.fileMode = false`, Git ignores the working-tree executable-bit difference
 //  while continuing to keep track of the file.
 //
 // Git's docs about filemode mention filesystem and cross-environment situations that can cause

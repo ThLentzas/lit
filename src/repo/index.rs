@@ -3,6 +3,7 @@ mod parse;
 
 use crate::repo::index::entry::{IndexEntry, IndexEntryMetadata};
 use crate::repo::index::parse::Parser;
+use crate::repo::object::mode::Mode;
 use crate::repo::os::{FileStat, IoError, OsPath};
 use crate::repo::repopath::{RepoPath, RepoPathError};
 use sha1::{Digest, Sha1};
@@ -147,9 +148,13 @@ impl Index {
     // as the entries of `foo` and `a` appears before `b` as the entries of `src`. Inserting in
     // ascending order allows us to do BS for retrieving entries instead of appending + sorting.
     // Read more Tree::write()
+    // TODO: this api needs work on the return type, currently we don't know if the returned index
+    //  is because insertion was successful or not
     pub(crate) fn insert(&mut self, entry: IndexEntry) -> Result<usize, IndexError> {
-        self.resolve_conflicts(entry.path());
+        self.check_file_directory_conflict(entry.path());
 
+        // TODO: we need to make sure we are comparing and sorting according to this rule:
+        //  https://github.com/git/git/blob/9354c5f04055932909b660a237905b360cba195a/tree.c#L99-L165
         let pos = match self.search(entry.path()) {
             Ok(pos) => {
                 if self.entries[pos].metadata() != entry.metadata() {
@@ -252,6 +257,17 @@ impl Index {
         let entry = &mut self.entries[pos];
         if *entry.stat() != stat {
             *entry.stat_mut() = stat;
+            self.modified = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) unsafe fn set_mode_unchecked(&mut self, pos: usize, mode: Mode) -> bool {
+        let entry = &mut self.entries[pos];
+        if *entry.mode() != mode {
+            *entry.mode_mut() = mode;
             self.modified = true;
             true
         } else {
@@ -396,7 +412,7 @@ impl Index {
     // so we keep the entry which is incorrect.
     //
     // Such cases represent invalid states because no fs allows 2 entries to have the same name
-    fn resolve_conflicts(&mut self, path: &RepoPath) {
+    fn check_file_directory_conflict(&mut self, path: &RepoPath) {
         let old_len = self.entries.len();
         // remove an existing entry if either path is a parent of the other
         self.entries
