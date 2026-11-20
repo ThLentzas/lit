@@ -134,7 +134,7 @@ impl<'repo> Database<'repo> {
 
     pub(super) fn load_tree_files(&self, oid: &Oid) -> Result<HashMap<RepoPath, (Oid, Mode)>> {
         let mut files = HashMap::new();
-        self.collect_tree_files(&mut files, &RepoPath::new(), oid)?;
+        self.collect_tree_files(&mut files, &RepoPath::empty(), oid)?;
 
         Ok(files)
     }

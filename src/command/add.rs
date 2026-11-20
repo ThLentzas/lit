@@ -69,7 +69,7 @@ pub(crate) struct Add {
     chmod: Option<Chmod>,
     // empty = not provided, could also wrap it in an Option
     paths: Vec<PathBuf>,
-    // TODO: --intend-to-add
+    // TODO: --intend-to-add(requires index v3)
 }
 
 // `Removal` in this context means removing an entry from the index because its file was deleted
@@ -80,46 +80,19 @@ pub(crate) struct Add {
 // staged deletion: `add` removes the file's entry from the index, so the next commit will emit that
 // file.
 impl Add {
-    // cwd -> where the user ran the command from
-    // root -> directory that owns .lit
-    //
-    // Git commands can be run from inside the repo, not only the root
-    // cd jolt/src/parser
-    // git add lexer.rs
-    // git commit
-    //
-    // Git still knows the repository root is jolt and the index path should be src/parser/lexer.rs
-    // not just lexer.rs(what the user provided, self.path in our case)
+    /*
+     * NOTE: In none of the methods that we collect index positions we can return an iterator.
+     * A function that returns `impl Iterator<Item = usize> + use<'i , 'p>(i for index, p for matching
+     * pathspecs) will be fine but then we use the iterator to mutate the Index, which is not
+     * possible because the immutable borrow is still active.
+     */
     pub(super) fn execute(&self, repository: &Repository) -> Result<(), AddError> {
         // always safe for commands that require a working tree
         let workspace = repository.workspace().unwrap();
         let mut index = repository.index();
         let db = repository.database();
         let cfg = repository.config()?;
-        let mut pathspecs = Vec::with_capacity(self.paths.len());
-        let cwd = environment::cwd()?;
-
-        for path in self.paths.iter() {
-            let prefix = if path.is_absolute() {
-                None
-            } else {
-                // if the user called `add .` from root, the prefix is empty and the `pathspec.pattern`
-                // is also empty. This is intended because when workspace makes any fs calls will
-                // first do `self.to_abolute(), which for an empty path results to the absolute
-                // path to root.
-                match workspace.path_to_root_prefix(&cwd) {
-                    Some(prefix) => Some(prefix),
-                    None => {
-                        return Err(AddError::OutsideRepository {
-                            candidate: cwd,
-                            root: workspace.root().clone(),
-                        });
-                    }
-                }
-            };
-            let pathspec = Pathspec::new(path.as_os_str(), prefix, workspace.root())?;
-            pathspecs.push(pathspec);
-        }
+        let pathspecs = self.pathspecs_from_cli_args(&workspace)?;
 
         // TODO: defer that until we are sure that `add` is valid
         let mut lockfile = Lockfile::acquire(index.path())?;
@@ -173,7 +146,7 @@ impl Add {
         Ok(())
     }
 
-    // in terms of precedence interactive > refresh > any stage flag
+    // precedence: interactive > refresh > any stage flag
     fn resolve_operation(&self) -> Result<Operation, AddError> {
         if self.interactive {
             return Ok(Operation::Interactive);
@@ -226,7 +199,7 @@ impl Add {
             let _ = self.collect_untracked_paths(
                 workspace,
                 index,
-                &RepoPath::new(),
+                &RepoPath::empty(),
                 &mut untracked,
                 &mut seen,
                 &mut ignore_files,
@@ -374,19 +347,19 @@ impl Add {
 
         for (path, node) in untracked {
             // check first if readable then report it if `dry-run` is set
-            let (content, mode) = match node.kind {
+            let mode = match node.kind {
                 FileKind::Regular(exec) => {
-                    let content = workspace.read_file(&path)?;
                     // trust the executable bit, otherwise fallback to regular
                     let mode = if filemode && exec {
                         Mode::Executable
                     } else {
                         Mode::Regular
                     };
-                    (content, mode)
+                    mode
                 }
-                _ => (workspace.read_link(&path)?, Mode::Symlink),
+                _ => Mode::Symlink,
             };
+            let content = read_content(node.kind, workspace, &path)?;
             // no changes
             if self.dry_run {
                 printer
@@ -512,7 +485,7 @@ impl Add {
     //  `D`: tracked path is missing
     //  `T`: type changed
     // Each letter describes how a tracked path in the working tree differs from its index entry
-    // `dry-run`, `chmod` are ignored if set alongise,
+    // NOTE: `dry-run` and `chmod` are ignored if set alongise `refresh`
     fn refresh(
         &self,
         cfg: &ConfigFile,
@@ -526,10 +499,11 @@ impl Add {
         let mut changes = Vec::with_capacity(positions.len());
 
         for position in positions {
+            // position is always inbound
             let entry = unsafe { index.get_unchecked(position) };
             let node = match workspace.stat(entry.path()) {
                 Ok(node) => node,
-                // skip
+                // refresh does not stage deletions
                 Err(err) if err.is_not_found() => {
                     if self.verbose {
                         changes.push((position, RefreshChange::Deleted));
@@ -553,15 +527,15 @@ impl Add {
             // Mode::Regular <-> Executable'M'
             // file <-> symlink 'T'
             if mode != *entry.mode() {
-                let change = match (mode, *entry.mode()) {
-                    (Mode::Regular, Mode::Executable) | (Mode::Executable, Mode::Regular) => {
-                        (position, RefreshChange::Modified)
-                    }
-                    // (Mode::Regular | Mode::Executable, Mode::Symlink) | (Mode::Symlink, Mode::Regular | Mode::Executable)
-                    // can't be anything else at this point
-                    _ => (position, RefreshChange::TypeChanged),
-                };
                 if self.verbose {
+                    let change = match (mode, *entry.mode()) {
+                        (Mode::Regular, Mode::Executable) | (Mode::Executable, Mode::Regular) => {
+                            (position, RefreshChange::Modified)
+                        }
+                        // (Mode::Regular | Mode::Executable, Mode::Symlink) | (Mode::Symlink, Mode::Regular | Mode::Executable)
+                        // can't be anything else at this point
+                        _ => (position, RefreshChange::TypeChanged),
+                    };
                     changes.push(change);
                 }
                 continue;
@@ -576,11 +550,7 @@ impl Add {
                 continue;
             }
 
-            let content = if matches!(node.kind, FileKind::Regular(_)) {
-                workspace.read_file(entry.path())?
-            } else {
-                workspace.read_link(entry.path())?
-            };
+            let content = read_content(node.kind, workspace, entry.path())?;
             // TODO: should we consider collision here?
             if *entry.oid() == db::hash(b"blob", &content) {
                 // at this point only `stat` is different so we refresh
@@ -609,6 +579,44 @@ impl Add {
             }
         }
         Ok(())
+    }
+
+    // cwd -> where the user ran the command from
+    // root -> metadata dir path
+    //
+    // Git commands can be run from anywhere inside the repo, not only the root
+    //  cd jolt/src/parser
+    //  git add lexer.rs
+    // 
+    // The prefix is `src/parser` and the root relative path `src/parser/lexer.rs`
+    // A guarantee is that cwd_prefix.join(user_provided_path) => root relative path
+    fn pathspecs_from_cli_args(&self, workspace: &Workspace) -> Result<Vec<Pathspec>, AddError> {
+        let cwd = environment::cwd()?;
+        let mut pathspecs = Vec::with_capacity(self.paths.len());
+
+        for path in self.paths.iter() {
+            // for each user provided path, find the root relative prefix for cwd so that we can 
+            // compute the root relative path
+            let prefix = if path.is_absolute() {
+                None
+            } else {
+                // `add .` from root -> empty prefix and empty root relative path.
+                // This is expected because when workspace makes any fs calls will first do
+                // `self.to_abolute(), which for an empty path results to the absolute path to root
+                match workspace.root_relative_prefix(&cwd) {
+                    Some(prefix) => Some(prefix),
+                    None => {
+                        return Err(AddError::OutsideRepository {
+                            candidate: cwd,
+                            root: workspace.root().clone(),
+                        });
+                    }
+                }
+            };
+            let pathspec = Pathspec::new(path.as_os_str(), prefix, workspace.root())?;
+            pathspecs.push(pathspec);
+        }
+        Ok(pathspecs)
     }
 
     // ignore rules are only applied for untracked files
@@ -714,14 +722,7 @@ impl Add {
         if *entry.stat() == node.stat && *entry.mode() == mode {
             return Ok(EntryUpdate::Unchanged);
         }
-        // if the file is a symlink in a fs that does not support symlinks, and it is reported as regular
-        // we use `read_file()`, `read_link()` would expect a symlink. We perform the read based on the
-        // `FileKind` which is what the os reported and not our recorded `Mode`
-        let content = if matches!(node.kind, FileKind::Regular(_)) {
-            workspace.read_file(entry.path())?
-        } else {
-            workspace.read_link(entry.path())?
-        };
+        let content = read_content(node.kind, workspace, entry.path())?;
 
         if self.dry_run {
             let oid = db::hash(b"blob", &content);
@@ -782,7 +783,7 @@ impl Add {
         for position in positions {
             let entry = unsafe { index.get_unchecked(position) };
             if !matches!(entry.mode(), Mode::Regular | Mode::Executable) {
-                return Err(AddError::NothingSpecified);
+                return Err(AddError::CannotChmod(entry.path().clone(), chmod));
             }
             if !self.dry_run {
                 unsafe {
@@ -813,7 +814,7 @@ enum Operation {
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
-enum Chmod {
+pub(crate) enum Chmod {
     #[value(name = "+x")]
     Executable,
     #[value(name = "-x")]
@@ -863,18 +864,18 @@ fn collect_index_pos_for_update_or_refresh(
     pathspecs: &[Pathspec],
 ) -> Result<BTreeSet<usize>, AddError> {
     let mut positions = BTreeSet::new();
+
     if pathspecs.is_empty() {
-        // let iter = index.iter().enumerate().map(|(pos, _)| pos);
-        // positions.extend(iter);
         positions.extend(0..index.len());
     } else {
         for pathspec in pathspecs {
             let pattern = pathspec.pattern();
             let mut matched = false;
             for (position, entry) in index.iter().enumerate() {
-                // user provided `.`
-                // exact match any regular file, symlinks
-                // if the provided path is a directory check if any of its entries are tracked
+                // 3 cases:
+                //  - `.`
+                //  - exact match any regular file, symlinks
+                //  - directory check for tracked entries
                 if pattern.as_bytes().is_empty()
                     || pattern == entry.path()
                     || pattern.is_parent_of(entry.path())
@@ -890,6 +891,21 @@ fn collect_index_pos_for_update_or_refresh(
         }
     }
     Ok(positions)
+}
+
+// if the file is a symlink in a fs that does not support symlinks, and it is reported as regular
+// we use `read_file()`, `read_link()` would expect a symlink. We perform the read based on the
+// `FileKind` which is what the os reported and not our recorded `Mode`
+fn read_content(
+    kind: FileKind,
+    workspace: &Workspace,
+    path: &RepoPath,
+) -> Result<Vec<u8>, IoError> {
+    if matches!(kind, FileKind::Regular(_)) {
+        workspace.read_file(path)
+    } else {
+        workspace.read_link(path)
+    }
 }
 
 fn filemode(cfg: &ConfigFile) -> Result<bool, ConfigFileError> {
@@ -939,14 +955,13 @@ fn collect_chmod_positions(index: &Index, pathspecs: &[Pathspec]) -> Vec<usize> 
         .enumerate()
         .filter(|(_, entry)| {
             // `any()` because we don't want to call chmod more than once per entry
-            // for `foo.rs` and pathspecs = ['.', 'foo.rs'] we change the mod once on the first match
-            let matched = pathspecs.iter().any(|pathspec| {
+            // for `foo.rs` and pathspecs = ['.', 'foo.rs'] we change the mode once on the first match
+            pathspecs.iter().any(|pathspec| {
                 let pattern = pathspec.pattern();
                 pattern.as_bytes().is_empty()
                     || entry.path() == pattern
                     || pattern.is_parent_of(entry.path())
-            });
-            matched
+            })
         })
         .map(|(position, _)| position)
         .collect()

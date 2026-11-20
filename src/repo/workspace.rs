@@ -39,7 +39,7 @@ impl<'repo> Workspace<'repo> {
     // for now the only call is with `cwd` as path which comes from `env::current_dir()` and it is
     // already a canonical path, root is also in canonical form from repository discovery, so we don't
     // need any lexical normalization
-    pub(crate) fn path_to_root_prefix<'a>(&self, path: &'a OsPath) -> Option<&'a Path> {
+    pub(crate) fn root_relative_prefix<'a>(&self, path: &'a OsPath) -> Option<&'a Path> {
         path.strip_prefix(&self.root).ok()
     }
 

@@ -26,7 +26,7 @@ pub(crate) struct RepoPath {
 
 impl RepoPath {
     // could also call it empty()
-    pub(crate) fn new() -> Self {
+    pub(crate) fn empty() -> Self {
         Self::default()
     }
 
@@ -170,7 +170,7 @@ fn check_bytes(bytes: &[u8]) -> Result<(), RepoPathError> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) enum RepoPathErrorKind {
     Empty,
     LeadingSlash,
@@ -181,7 +181,7 @@ pub(super) enum RepoPathErrorKind {
     ContainsNul,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RepoPathError {
     pub(super) path: Vec<u8>,
     pub(super) kind: RepoPathErrorKind,

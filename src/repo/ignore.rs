@@ -164,7 +164,7 @@ pub(crate) fn find_ignore_files_from_ancestors(
         return Ok(Some(stack));
     }
 
-    let mut directory = RepoPath::new();
+    let mut directory = RepoPath::empty();
     // the empty dir represents the repo root, this is the point where we look for root ignore file
     // if any to start the chain
     if let Some(ignore_file) = IgnoreFile::load(workspace, &directory)? {

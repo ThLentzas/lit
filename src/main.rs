@@ -1,5 +1,4 @@
 use command::error::ErrorReport;
-use std::error::Error;
 use std::process::ExitCode;
 
 mod cli;

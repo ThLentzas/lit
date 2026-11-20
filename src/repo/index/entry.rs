@@ -79,8 +79,8 @@ impl IndexEntry {
         &self.metadata.mode
     }
 
-    pub(crate) fn mode_mut(&self) -> &mut Mode {
-        &mut self.metadata().mode
+    pub(crate) fn mode_mut(&mut self) -> &mut Mode {
+        &mut self.metadata_mut().mode
     }
 
     pub(crate) fn file_size(&self) -> u32 {
@@ -113,6 +113,7 @@ impl IndexEntry {
         // at least 1 NUL byte, at this point at least 63
         // path bytes
         // padding
+        // TODO: this should be in the serialization of `IndexEntryMetadata`
         let mut bytes = Vec::with_capacity(64);
         bytes.extend_from_slice(&self.metadata.stat.ctime.to_be_bytes());
         bytes.extend_from_slice(&self.metadata.stat.ctime_nsec.to_be_bytes());

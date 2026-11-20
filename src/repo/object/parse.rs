@@ -218,7 +218,9 @@ pub(super) fn parse(buf: &[u8]) -> Result<Object, ParseError> {
         b"commit" => Ok(Object::Commit(parse_commit(&mut cursor)?)),
         _ => Err(ParseError::new(
             0,
-            ParseErrorKind::UnknownType { got: obj_type.to_vec() },
+            ParseErrorKind::UnknownType {
+                got: obj_type.to_vec(),
+            },
         )),
     }
 }
@@ -248,7 +250,7 @@ fn parse_tree_entry(cursor: &mut Cursor) -> Result<Entry, TreeEntryError> {
                 TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
             ))?;
     }
-    let Some(mode) = Mode::from_raw(value) else {
+    let Some(mode) = Mode::try_from_raw(value) else {
         return Err(TreeEntryError::new(
             start,
             TreeEntryErrorKind::UnknownMode { mode: buf.to_vec() },
@@ -351,7 +353,7 @@ fn parse_commit(cursor: &mut Cursor) -> Result<Commit, ParseError> {
             break line;
         }
 
-        let parent_oid= Oid::from_hex_bytes(line.value).map_err(|err| {
+        let parent_oid = Oid::from_hex_bytes(line.value).map_err(|err| {
             let offset = match err {
                 OidError::BadDigit { pos, .. } => line.vbase + pos,
                 OidError::BadLength => line.vbase,

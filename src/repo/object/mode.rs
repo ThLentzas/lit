@@ -26,7 +26,7 @@ impl Mode {
         matches!(self, Self::Directory)
     }
 
-    pub(crate) fn from_raw(value: u32) -> Option<Self> {
+    pub(crate) fn try_from_raw(value: u32) -> Option<Self> {
         match value {
             0o100644 => Some(Mode::Regular),
             0o100755 => Some(Mode::Executable),

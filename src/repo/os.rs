@@ -88,14 +88,15 @@ impl OsPath {
     }
 
     // returns a &Path because what is left can be an empty path and that would break the invariant
-    // of OsPath
-    pub(crate) fn strip_prefix<P>(&self, base: P) -> Result<&Path, OsPathError>
+    pub(crate) fn strip_prefix<P>(&self, base: P) -> Result<&Path, StripPrefixError>
     where
         P: AsRef<Path>,
     {
         self.inner
+            // For the sake of your own sanity always use `Path/PathBuf::strip_prefix()` and not `str`
+            //  path: `/test/haha/foo.txt`.strip_prefix(/test) -> `haha/foo.txt` and not `/haha/foo.txt`
+            //  it guarantess that `/test.join(haha/foo.txt)` is path
             .strip_prefix(base)
-            .map_err(OsPathError::StripPrefix)
     }
 
     pub(crate) fn with_suffix_unchecked<P>(&self, suffix: P) -> Self
@@ -118,9 +119,9 @@ impl OsPath {
     // neighbor, pop it
     // 2. if we reached root, ignore '..', otherwise we preserve it
     //
-    // Note: when I first wrote this in pathspec.rs::normalize() I thought that the goal was to eliminate
-    // all the '.', '..' components, but I was wrong because we rewrite the path in a simplified form
-    // it is a different representation of the same path
+    // Note: when I first wrote this in pathspec.rs::normalize() I thought that the goal was to
+    // eliminate all the '.', '..' components, but I was wrong because we rewrite the path in a
+    // simplified form, it is a different representation of the same path
     //
     // Read notes it is explained fully there with examples.
     pub(crate) fn normalize_lexically(&self) -> OsPath {
@@ -166,7 +167,9 @@ impl OsPath {
 
     // we can't just use `==` for path comparisons because `PartialEq` for `PathBuf` calls
     // `self.components() == other.components()`. It compares path values but paths can still refer
-    // to the same fs path even if they have different components.
+    // to the same fs path even if they have different components. Also symlinks are not resolved
+    // We can have a case where we compare path A and B where B is a symlink to A. The component by
+    // component comparison will result in a false negative.
     //
     // Read: repo/mod.rs::MetadataPlacement::from_discovery()
     pub(crate) fn same_canonical_path_with<P>(&self, other: P) -> Result<bool, IoError>
@@ -390,7 +393,6 @@ where
 pub(crate) enum OsPathError {
     Empty,
     ContainsNul(PathBuf),
-    StripPrefix(StripPrefixError),
 }
 
 impl Error for OsPathError {}
@@ -402,7 +404,6 @@ impl fmt::Display for OsPathError {
             Self::ContainsNul(path) => {
                 write!(f, "path {} contains NUL byte", path.display())
             }
-            Self::StripPrefix(err) => write!(f, "{err}"),
         }
     }
 }
@@ -496,5 +497,95 @@ mod tests {
         let error = OsPath::new(&path).unwrap_err();
 
         assert_eq!(error, OsPathError::ContainsNul(path));
+    }
+
+    /*
+     * NOTE: the cases where `.` is not at the start of the path are normalized when we call
+     * `components()`, Rust does this for us. The same holds true for collapsing repeated and
+     * trailing separators. `src///` is `src`
+     */
+    #[test]
+    fn remove_current_dir_components() {
+        let cases = [
+            (".", "."),
+            ("././", "."),
+            ("./README.md", "README.md"),
+            ("src/./main.rs", "src/main.rs"),
+            ("./../README.md", "../README.md"),
+            ("/./", "/"),
+        ];
+
+        for (input, expected) in cases {
+            let input = OsPath::new_unchecked(input);
+            let expected = OsPath::new_unchecked(expected);
+            assert_eq!(input.normalize_lexically(), expected);
+        }
+    }
+
+    #[test]
+    fn resolve_parent_components() {
+        let cases = [
+            ("src/../README.md", "README.md"),
+            ("a/b/../../c", "c"),
+            ("/repo/../repo/README.md", "/repo/README.md"),
+        ];
+
+        for (input, expected) in cases {
+            let input = OsPath::new_unchecked(input);
+            let expected = OsPath::new_unchecked(expected);
+            assert_eq!(input.normalize_lexically(), expected);
+        }
+    }
+
+    #[test]
+    fn preserve_unresolved_relative_paths() {
+        let cases = [
+            ("..", ".."),
+            ("../..", "../.."),
+            ("src/../../README.md", "../README.md"),
+        ];
+
+        for (input, expected) in cases {
+            let input = OsPath::new_unchecked(input);
+            let expected = OsPath::new_unchecked(expected);
+            assert_eq!(input.normalize_lexically(), expected);
+        }
+    }
+
+    #[test]
+    fn prevent_absolute_paths_from_ascedning_above_root() {
+        let cases = [("/..", "/"), ("/../..", "/")];
+
+        for (input, expected) in cases {
+            let input = OsPath::new_unchecked(input);
+            let expected = OsPath::new_unchecked(expected);
+            assert_eq!(input.normalize_lexically(), expected);
+        }
+    }
+
+    #[test]
+    fn return_current_dir_when_relative_path_cancels_out() {
+        let input = OsPath::new_unchecked("src/..");
+
+        assert_eq!(input.normalize_lexically(), OsPath::new_unchecked("."));
+    }
+
+    #[test]
+    fn normalization_is_idempotent() {
+        // 1 entry from each test case above
+        let cases = [
+            "./../README.md",
+            "/repo/../repo/README.md",
+            "src/../../README.md",
+            "/../..",
+            "src/..",
+        ];
+
+        for input in cases {
+            let path = OsPath::new_unchecked(input);
+            let normalized_once = path.normalize_lexically();
+            let normalized_twice = normalized_once.normalize_lexically();
+            assert_eq!(normalized_once.as_bytes(), normalized_twice.as_bytes());
+        }
     }
 }

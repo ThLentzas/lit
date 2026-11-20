@@ -12,6 +12,15 @@ use crate::repo::os::{IoError, OsPath};
 
 const DEFAULT_BRANCH_NAME: &[u8] = b"master";
 
+struct SymRef {
+    
+}
+
+enum Head {
+    Symbolic(SymRef),
+    Detached(Oid),
+}
+
 pub(crate) struct Refs {
     refs: OsPath,
     head: OsPath,
@@ -157,7 +166,7 @@ impl Refs {
     // when we create a new commit, the current content of the branch ref becomes the commit's parent
     // OID and the new ID replaces it. HEAD is never moved.
     //
-    // symrefs solve the following problem. If both HEAD and the branch ref hold the OID how does
+    // symrefs solve the following problem: If both HEAD and the branch ref hold the OID how does
     // Git know which branch should move when a new commit is created. If we make a new commit Git
     // knows that HEAD should be updated but which branch? Multiple branches are allowed to point to
     // the same commit. By making HEAD a symref, only the target branch changes. This also solves
@@ -216,7 +225,6 @@ impl Refs {
     // Now we are in the same situation as before in order to have a way to reference to the new
     // line of development we need to create a branch, otherwise we have no way of referencing Y.
 }
-
 fn check_branch_name(name: &[u8]) -> Result<(), BranchNameError> {
     if name.is_empty() {
         return Err(BranchNameError {

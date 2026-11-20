@@ -1,3 +1,4 @@
+use crate::command::print::ReadableBytes;
 use crate::repo::os::{OsPath, OsPathError};
 use crate::repo::repopath::RepoPath;
 use std::error::Error;
@@ -5,69 +6,93 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Component, Path};
 
-// TODO: add magic support, what is known as glob
+// TODO: glob
 // the set of paths certain commands should operate on
 #[derive(Debug)]
 pub(crate) struct Pathspec {
-    original: OsString,
     pattern: RepoPath,
+    original: OsString,
 }
 
 impl Pathspec {
-    // Case 1: the user provided a relative to their cwd path. ws.prefix() will return the prefix,
-    // the relative path from root to cwd, and after we are done normalizing the path we have
-    // the relative to root path.
+    // `prefix`: the root relative prefix for cwd, empty if root = cwd
     //
-    // Case 2: the user provided an absolute path. In this case, the prefix is ignored because the
-    // cwd is irrelevant. To get a relative to root we strip of the root from the absolute path after
+    // Case 1: the user provided a relative to their cwd path. `prefix` is always `Some()`
+    // Case 2: the user provided an absolute path. `prefix` is always `None`. The notion of `root
+    // relative prefix` does not make sense for absolute paths.
+    //
+    // To get a relative to root we strip of the root from the absolute path after
     // normalization. We can strip of before normalization because strip_prefix() does a lexical
     // check and cases containing `.` or `..` will fail to match.
     //
     // root = "/home/thanos/repo", absolute = "/home/thanos/./../thanos/repo/docs/intro.md" strip_prefix()
     // fails to match in this case, after normalization though the result is docs/intro.md
     //
-    // In either case, `pattern` is a normalized repo relative path. Note that even when new() returns
-    // we don't know if the path actually exists or not we never touched the fs, we just express it
-    // relative to root
-    //
-    // prefix: there is no prefix when path is absolute, prefix is an empty path when root = cwd
-    // root: working tree root
+    // In either case, `pattern` is a normalized root relative path. Note that resolution is purely
+    // lexical, we don't access the fs or follow symlinks.
     pub(crate) fn new(
         arg_path: &OsStr,
         prefix: Option<&Path>,
         root: &OsPath,
     ) -> Result<Self, PathspecError> {
-        let cli_path = OsPath::new(arg_path)?;
+        let input_path = OsPath::new(arg_path)?;
         let resolved = match prefix {
-            // the join() creates the root relative path
-            // prefix is the relative path from root to cwd and cli_path is the relative path from cwd
-            // to the resource the user wants to add
-            Some(prefix) => OsPath::new_unchecked(prefix.join(&cli_path)),
-            None => cli_path.clone(),
+            Some(prefix) => OsPath::new_unchecked(prefix.join(&input_path)),
+            None => input_path.clone(),
         };
+
         let normalized = resolved.normalize_lexically();
+        // after normalization we need to produce the root relative path first and then walk its
+        // components to make sure it's not outside of the repository or contains reserved names
+        //  root = /repo
+        //  cwd = /repo/src
+        //  arg = ../../README.md
+        //  root relative = src/../../README.md
+        //  normalized = ../README.md -> falls out of root
+        //
+        // we can't reject paths with reserved components before normalization because the final path
+        // might not contain any.
+        //  cwd = /repo
+        //  arg = .lit/../README.md
+        //  normalized = README.md
+        // if the path is relative it stay as is, else we attempt to strip the root which can result
+        // in outside repo errors.
         let path = match prefix {
             Some(_) => normalized.as_ref(),
-            None => normalized.strip_prefix(root)?
+            None => match normalized.strip_prefix(root) {
+                Ok(path) => path,
+                Err(_) => {
+                    return Err(PathspecError::OutsideRepository {
+                        candidate: input_path,
+                        root: root.clone(),
+                    });
+                }
+            },
         };
-        let mut pattern = RepoPath::new();
+        let mut pattern = RepoPath::empty();
 
         for component in path.components() {
             match component {
-                // path must be relative
+                // path can't be absolute at this point
+                // the previous match guarantees that if it is relative, it stays as is otherwise
+                // we attemp to strip root from it will always leaves either an empty or relative
+                // path. In either case, the path can't be absolute. `Prefix` can't occur on Unix
                 Component::Prefix(_) | Component::RootDir => {
-                    return Err(PathspecError::OutsideRepository { path: cli_path });
+                    unreachable!("resolved path still contains a root or platform prefix: {path:?}")
                 }
                 Component::CurDir => continue,
                 Component::ParentDir => {
-                    // after normalization if path still contains '..' it means we never encountered
-                    // left neighbors to pop them so the path actually lies outside the repo
-                    // ../ means parent of root -> path lies outside repo
-                    return Err(PathspecError::OutsideRepository { path: cli_path });
+                    // after normalization if the path's first component is '..' it always escapes
+                    // the repository
+                    return Err(PathspecError::OutsideRepository {
+                        candidate: input_path,
+                        root: root.clone(),
+                    });
                 }
                 Component::Normal(name) => {
+                    // TODO: case insensitive check?
                     if name == ".lit" {
-                        return Err(PathspecError::ReservedComponent { path: cli_path });
+                        return Err(PathspecError::ReservedComponent(input_path));
                     }
                     pattern = pattern.join_unchecked(name);
                 }
@@ -79,21 +104,21 @@ impl Pathspec {
             pattern,
         })
     }
-    
+
     pub(crate) fn pattern(&self) -> &RepoPath {
         &self.pattern
     }
-    
+
     pub(crate) fn original(&self) -> &OsStr {
         &self.original
     }
 }
 
-// we could do a struct with path, kind but too few variants
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum PathspecError {
-    OutsideRepository { path: OsPath },
-    ReservedComponent { path: OsPath },
+    // `candidate` is the user provided verbatim
+    OutsideRepository { candidate: OsPath, root: OsPath },
+    ReservedComponent(OsPath),
     OsPath(OsPathError),
 }
 
@@ -102,7 +127,7 @@ impl Error for PathspecError {
         match self {
             Self::OsPath(source) => Some(source),
             Self::OutsideRepository { .. } => None,
-            Self::ReservedComponent { .. } => None,
+            Self::ReservedComponent(_) => None,
         }
     }
 }
@@ -110,16 +135,17 @@ impl Error for PathspecError {
 impl fmt::Display for PathspecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PathspecError::OsPath(_) => write!(f, "bad path"),
-            PathspecError::OutsideRepository { path } => {
-                write!(f, "path '{}' is outside the repository", path.display())
-            }
-            PathspecError::ReservedComponent { path } => {
+            Self::OsPath(_) => write!(f, "bad path"),
+            Self::OutsideRepository { candidate, root } => {
                 write!(
                     f,
-                    "path '{}' contains reserved component '.lit'",
-                    path.display(),
+                    "'{}' is outside repository at '{}'",
+                    ReadableBytes(candidate.as_bytes()),
+                    ReadableBytes(root.as_bytes())
                 )
+            }
+            Self::ReservedComponent(path) => {
+                write!(f, "'{}' contains reserved component '.lit'", path.display(),)
             }
         }
     }
@@ -133,157 +159,89 @@ impl From<OsPathError> for PathspecError {
 
 #[cfg(test)]
 mod tests {
-    // TODO: uncomment this
-    // use std::ffi::OsString;
-    // use super::*;
-    //
-    // // instead of carrying (OsString, PathBuf, Pathspec)
-    // #[derive(Debug)]
-    // struct GoodPath {
-    //     arg: OsString,
-    //     prefix: PathBuf,
-    //     pattern: PathBuf,
-    // }
-    //
-    // impl GoodPath {
-    //     fn new(arg: &OsStr, prefix: &OsStr, pattern: &OsStr) -> Self {
-    //         GoodPath {
-    //             arg: arg.to_os_string(),
-    //             prefix: PathBuf::from(prefix),
-    //             pattern: PathBuf::from(pattern),
-    //         }
-    //     }
-    // }
-    //
-    // #[derive(Debug)]
-    // struct BadPath {
-    //     arg: OsString,
-    //     prefix: PathBuf,
-    //     err: PathspecError,
-    // }
-    //
-    // impl BadPath {
-    //     fn new(arg: &OsStr, prefix: &OsStr, err: PathspecError) -> Self {
-    //         BadPath {
-    //             arg: arg.to_os_string(),
-    //             prefix: PathBuf::from(prefix),
-    //             err,
-    //         }
-    //     }
-    // }
-    //
-    // #[cfg(unix)]
-    // fn root() -> PathBuf {
-    //     PathBuf::from("/repo")
-    // }
-    //
-    // #[cfg(windows)]
-    // fn root() -> PathBuf {
-    //     PathBuf::from(r"C:\repo")
-    // }
-    //
-    // fn good_paths() -> Vec<GoodPath> {
-    //     vec![
-    //         GoodPath::new("main.rs".as_ref(), "src".as_ref(), "src/main.rs".as_ref()),
-    //         GoodPath::new("./main.rs".as_ref(), "src".as_ref(), "src/main.rs".as_ref()),
-    //         GoodPath::new(
-    //             "src/./main.rs".as_ref(),
-    //             "".as_ref(),
-    //             "src/main.rs".as_ref(),
-    //         ),
-    //         GoodPath::new(".".as_ref(), "src".as_ref(), "src".as_ref()),
-    //         GoodPath::new(".".as_ref(), "".as_ref(), "".as_ref()),
-    //         GoodPath::new(
-    //             "../README.md".as_ref(),
-    //             "src".as_ref(),
-    //             "README.md".as_ref(),
-    //         ),
-    //         GoodPath::new("..".as_ref(), "src".as_ref(), "".as_ref()),
-    //         GoodPath::new("src/../lib.rs".as_ref(), "".as_ref(), "lib.rs".as_ref()),
-    //         GoodPath::new("../d".as_ref(), "a/b/c".as_ref(), "a/b/d".as_ref()),
-    //         // trailing slash dropped by Path::components
-    //         GoodPath::new("src/".as_ref(), "".as_ref(), "src".as_ref()),
-    //         // absolute paths: prefix is ignored, path is stripped against repo root
-    //         GoodPath::new(
-    //             root().join("README.md").as_ref(),
-    //             "src".as_ref(),
-    //             "README.md".as_ref(),
-    //         ),
-    //         GoodPath::new(
-    //             root().join("src").join("main.rs").as_ref(),
-    //             "".as_ref(),
-    //             "src/main.rs".as_ref(),
-    //         ),
-    //         GoodPath::new(
-    //             root().join("src").join("..").join("README.md").as_ref(),
-    //             "ignore".as_ref(),
-    //             "README.md".as_ref(),
-    //         ),
-    //         GoodPath::new(root().as_ref(), "src".as_ref(), "".as_ref()),
-    //     ]
-    // }
-    //
-    // fn bad_paths() -> Vec<BadPath> {
-    //     // relative path tries to escape above repo root
-    //     vec![
-    //         BadPath::new(
-    //             "..".as_ref(),
-    //             "".as_ref(),
-    //             PathspecError::OutsideRepository {
-    //                 path: PathBuf::from(".."),
-    //             },
-    //         ),
-    //         // .lit access after normalization
-    //         BadPath::new(
-    //             ".lit".as_ref(),
-    //             "".as_ref(),
-    //             PathspecError::ReservedComponent {
-    //                 path: PathBuf::from(".lit"),
-    //                 component: OsString::from(".lit"),
-    //             },
-    //         ),
-    //         // absolute path outside repo
-    //         BadPath::new(
-    //             "/outside/file.txt".as_ref(),
-    //             "".as_ref(),
-    //             PathspecError::OutsideRepository {
-    //                 path: PathBuf::from("/outside/file.txt"),
-    //             },
-    //         ),
-    //         // absolute path that normalizes to filesystem root, then fails strip_prefix
-    //         BadPath::new(
-    //             "/../..".as_ref(),
-    //             "src".as_ref(),
-    //             PathspecError::OutsideRepository {
-    //                 path: PathBuf::from("/../.."),
-    //             },
-    //         ),
-    //         BadPath::new(
-    //             root().join(".lit").join("HEAD").as_ref(),
-    //             "src".as_ref(),
-    //             PathspecError::ReservedComponent {
-    //                 path: root().join(".lit").join("HEAD"),
-    //                 component: OsString::from(".lit"),
-    //             },
-    //         ),
-    //     ]
-    // }
-    //
-    // #[test]
-    // fn valid_paths() {
-    //     for gc in good_paths() {
-    //         let pathspec = Pathspec::new(gc.arg.as_os_str(), &gc.prefix, &root())
-    //             .unwrap_or_else(|err| panic!("case failed: {gc:?}, error: {err:?}"));
-    //         // same syntax as  "{:?},gc" use Debug formatting for gc
-    //         assert_eq!(pathspec.pattern, gc.pattern, "{gc:?}");
-    //     }
-    // }
-    //
-    // #[test]
-    // fn invalid_paths() {
-    //     for gc in bad_paths() {
-    //         let err = Pathspec::new(gc.arg.as_os_str(), &gc.prefix, &root()).unwrap_err();
-    //         assert_eq!(err, gc.err);
-    //     }
-    // }
+    use super::*;
+
+    fn root() -> OsPath {
+        OsPath::new_unchecked("/repo")
+    }
+
+    #[test]
+    fn valid_relative_paths() {
+        let root = root();
+        let cases = [
+            ("main.rs", "src", "src/main.rs"),
+            ("./main.rs", "src", "src/main.rs"),
+            ("..", "src", ""),
+            // contains `.lit` but is skipped
+            ("src/.lit/../main.rs", "", "src/main.rs"),
+        ];
+
+        for (arg, prefix, pattern) in cases {
+            let pathspec = Pathspec::new(OsStr::new(arg), Some(Path::new(prefix)), &root)
+                .unwrap_or_else(|error| {
+                    panic!("arg = {arg:?}, prefix = {prefix:?}: error = {error:?}")
+                });
+            assert_eq!(pattern.as_bytes(), pathspec.pattern().as_bytes());
+        }
+    }
+
+    #[test]
+    fn valid_absolute_path() {
+        let root = root();
+        let pattern = "README.md";
+        let arg = "/repo/README.md";
+        let pathspec = Pathspec::new(OsStr::new(arg), None, &root)
+            .unwrap_or_else(|error| panic!("arg = {arg:?}: error = {error:?}"));
+        assert_eq!(pattern.as_bytes(), pathspec.pattern().as_bytes());
+    }
+
+    #[test]
+    fn reject_relative_paths_that_escape_repo() {
+        let root = root();
+        let cases = [
+            ("..", ""),
+            ("../../outside.txt", "src"),
+            ("src/../../outside.txt", ""),
+        ];
+
+        for (arg, prefix) in cases {
+            let error = Pathspec::new(OsStr::new(arg), Some(Path::new(prefix)), &root).unwrap_err();
+            assert_eq!(
+                error,
+                PathspecError::OutsideRepository {
+                    candidate: OsPath::new_unchecked(arg),
+                    root: root.clone()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn reject_absolute_paths_that_escape_repo() {
+        let root = root();
+        let cases = ["/home", "/", "/root/../outside.txt"];
+
+        for arg in cases {
+            let error = Pathspec::new(OsStr::new(arg), None, &root).unwrap_err();
+            assert_eq!(
+                error,
+                PathspecError::OutsideRepository {
+                    candidate: OsPath::new_unchecked(arg),
+                    root: root.clone()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn reject_reserved_components_in_paths() {
+        let root = root();
+        let arg = "/repo/.lit/src";
+
+        let error = Pathspec::new(OsStr::new(arg), None, &root).unwrap_err();
+        assert_eq!(
+            error,
+            PathspecError::ReservedComponent(OsPath::new_unchecked(arg))
+        );
+    }
 }

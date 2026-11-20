@@ -42,10 +42,6 @@ impl Lockfile {
     // file handle atomically. If someone tries to get a handle for the same file it will fail. Now
     // we can write to that tmp file without getting interupted. It creates the file exclusively meaning
     // once a process holds the lock for the specific file any other process would fail to acquire it
-    //
-    // returns Ok(Some(()) when it successfully acquires the lock
-    // returns Ok(None) if it fails to acquire the lock
-    // returns Err for any Io
     pub(crate) fn acquire(path: &OsPath) -> Result<Lockfile> {
         let lock_path = path.with_suffix_unchecked(".lock");
         // a naive implementation would be if !path.exists() then create but this causes Time of
@@ -131,6 +127,7 @@ type Result<T> = result::Result<T, LockfileError>;
 // Some is None but because it failed dropped will not clear it, this is the reason why we need this
 // flag. If committed is true, the tmp file was successfully deleted, in any other case we do the
 // manual cleanup
+// TODO: we need to write tests for cleanup
 impl Drop for Lockfile {
     fn drop(&mut self) {
         // tempfile implements the same logic in the drop for TempDir

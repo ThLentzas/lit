@@ -2,10 +2,10 @@ pub(crate) mod entry;
 mod parse;
 
 use crate::repo::index::entry::{IndexEntry, IndexEntryMetadata};
-use crate::repo::index::parse::Parser;
+use crate::repo::index::parse::{FormatError, Parser};
 use crate::repo::object::mode::Mode;
 use crate::repo::os::{FileStat, IoError, OsPath};
-use crate::repo::repopath::{RepoPath, RepoPathError};
+use crate::repo::repopath::RepoPath;
 use sha1::{Digest, Sha1};
 use std::{error::Error, fmt, fs, io, ptr};
 
@@ -26,7 +26,7 @@ const SIGNATURE: &str = "DIRC";
 //  Implemented `Ord` to only consider `entry.path`, and `Borrow<[u8]>` so we can search entries based
 //  on the underlying path buffer. We can't get `&mut IndexEntry` because it would break the order,
 //  so any modifications were remove, modify?, insert. Another issue was when we were doing the setup
-//  for the `update` option, we would have to iterate over the existing entries and find which of
+//  for the `add -u` option, we would have to iterate over the existing entries and find which of
 //  those we have to modify. The result was a `Vec<&RepoPath>. The operation then dies because we
 //  would have 2 active references for index, 1 from the calling `index.iter()` to collect the paths
 //  and the mutable one to perform the mutations. The solution to that was to clone each path. If the
@@ -36,7 +36,8 @@ const SIGNATURE: &str = "DIRC";
 // Index is represented by a sorted array. Entries are unique by raw repository-relative path bytes.
 // No mutable entry iterator is exposed. Every mutation must go through Index so `modified` is
 // maintained, and paths cannot be modified by accident. This invariant must hold no matter what is
-// the underlying structure. DO NOT expose any methods that return `&mut IndexEntry`
+// the underlying structure. 
+// WARN: DO NOT expose any methods that expose `&mut IndexEntry`
 pub(crate) struct Index {
     entries: Vec<IndexEntry>,
     path: OsPath,
@@ -213,7 +214,7 @@ impl Index {
         Some(entry)
     }
 
-    // the code below is taken Rust's `try_remove()` impl
+    // the code below is taken from Rust's `try_remove()` impl
     // https://doc.rust-lang.org/beta/src/alloc/vec/mod.rs.html#2437-2452
     //
     // an alternative would be to call `try_remove().unwrap_unchecked()`
@@ -290,7 +291,6 @@ impl Index {
         bytes
     }
 
-    // loads the contents of .lit/index
     pub(crate) fn load(&mut self) -> Result<(), IndexError> {
         let bytes = match fs::read(&self.path) {
             Ok(bytes) => bytes,
@@ -309,92 +309,8 @@ impl Index {
                 )));
             }
         };
-
-        let (content, checksum): (&[u8], &[u8; 20]) =
-            bytes.split_last_chunk::<20>().ok_or_else(|| {
-                FormatError::at(
-                    0,
-                    FormatErrorKind::UnexpectedEof {
-                        needed: 20,
-                        remaining: bytes.len(),
-                    },
-                )
-            })?;
-        let hash: [u8; 20] = Sha1::digest(content).into();
-        // The checksum tells us the bytes we read are the same bytes that were written. It does
-        // not prove those bytes form a valid index file. We still need to do validation.
-        //
-        // checksum matches
-        // signature is DIRC
-        // content has enough bytes for the header
-        // each entry has enough bytes for the fixed 62-byte part
-        // each path has a NUL terminator
-        // entry padding does not run past the content
-        // entries are sorted correctly
-        // path length in flags matches actual path length
-        // paths do not contain weird/disallowed components
-        // duplicate paths are rejected
-        // mode is one of the allowed Git modes
-        // after reading entry_count entries, the parser ends exactly where expected
-        //
-        // checking the SHA-1 before parsing anything is a boundary we set,
-        // we don't yet have reason to trust the bytes enough to report on their internal structure.
-        if hash != *checksum {
-            // it is not InvalidFormat, we don't know that yet, the contents have been tempered with
-            return Err(IndexError::InvalidChecksum);
-        }
-
-        let mut parser = Parser::new(content);
-        if parser.take::<4>()? != SIGNATURE.as_bytes() {
-            return Err(FormatError::at(0, FormatErrorKind::InvalidSignature))?;
-        }
-
-        let version = u32::from_be_bytes(*parser.take::<4>()?);
-        if version != INDEX_VERSION {
-            return Err(IndexError::UnsupportedVersion(version));
-        }
-
-        let count = u32::from_be_bytes(*parser.take::<4>()?);
-        // we need to be explicit with the type because the check for last.path happens before the
-        // entries.push(entry) where the type can be inferred.
-        let mut entries: Vec<IndexEntry> = Vec::new();
-        // if we exhausted the buffer before we reach count we get UnexpectedEof
-        for _ in 0..count {
-            let entry_offset = parser.offset();
-            let entry = parser.next()?;
-            // don't do the C++/Java way of
-            //  if !self.entries.is_empty() {
-            //  let last = self.entries.last().unwrap();
-            if let Some(last) = entries.last() {
-                // if the entries are not in ascending order the format is invalid
-                // in a sorted list duplicates must appear next to each other, and we check each entry
-                // with the previous one
-                //
-                // if entry.path == last.path, the duplicate is adjacent and caught here
-                // if entry.path < last.path, sort order is broken; any earlier duplicate would also
-                // surface as a non-ascending pair somewhere in the sequence
-                // TODO: address sorting order when we add stage support during merge
-                if last.path() >= entry.path() {
-                    return Err(FormatError::at(
-                        entry_offset,
-                        FormatErrorKind::EntriesOutOfSorted,
-                    ))?;
-                }
-            }
-            entries.push(entry);
-        }
-
-        // there are trailing bytes between the last index entry and the checksum
-        // this also handles the case where the actual number of entries was greater than count
-        if !parser.is_empty() {
-            return Err(FormatError::at(
-                parser.offset(),
-                FormatErrorKind::TrailingData {
-                    remaining: parser.remaining(),
-                },
-            ))?;
-        }
-        self.entries = entries;
+        let mut parser = Parser::new(&bytes);
+        self.entries = parser.parse()?;
 
         Ok(())
     }
@@ -440,25 +356,17 @@ impl Index {
     }
 }
 
-// an error that can occur when creating IndexEntry or parsing .lit/index
-// Git when format is corrupted reports: Unknown Index Format
-// No more information is provided to the user because they can't do much if the format is invalid
 #[derive(Debug)]
 pub(crate) enum IndexError {
-    InvalidChecksum,
-    UnsupportedVersion(u32),
+    // git when format is corrupted reports: Unknown Index Format
+    // no more information is provided to the user because they can't do much if the format is invalid
     InvalidFormat(FormatError),
     Io(IoError),
 }
 
 impl IndexError {
     pub(crate) fn is_format_error(&self) -> bool {
-        matches!(
-            self,
-            IndexError::InvalidChecksum
-                | IndexError::UnsupportedVersion(_)
-                | IndexError::InvalidFormat(_)
-        )
+        matches!(self, IndexError::InvalidFormat(_))
     }
 }
 
@@ -467,90 +375,17 @@ impl Error for IndexError {
         match self {
             Self::InvalidFormat(source) => Some(source),
             Self::Io(source) => Some(source),
-            Self::InvalidChecksum => None,
-            Self::UnsupportedVersion(_) => None,
         }
     }
 }
 
-// errors that have IndexError as a variant will include a generic error message and not carry the
-// actual format error since the user can't do anything if the format is broken
 impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidChecksum => write!(f, "invalid index checksum"),
-            Self::UnsupportedVersion(version) => {
-                write!(f, "unsupported index version {version}")
-            }
-            // TODO: this needs to change, index format errors should not be exposed to the user
-            //  even if they know the issue how are they going to fix it?
-            Self::InvalidFormat(err) => write!(f, "{err}"),
-            Self::Io(_) => write!(f, "index I/O failed"),
+            // don't expose it, keep it internally for debugging
+            Self::InvalidFormat(_) => write!(f, "invalid index format"),
+            Self::Io(_) => write!(f, "could not read index"),
         }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum FormatErrorKind {
-    UnexpectedEof { needed: usize, remaining: usize },
-    InvalidSignature,
-    EntriesOutOfSorted,
-    InvalidMode(u32),
-    InvalidNanoseconds,
-    MissingNulTerminator,
-    InvalidPadding,
-    LongPathLenMisMatch,
-    InvalidPathSyntax(RepoPathError),
-    ExtendedFlagInV2,
-    TrailingData { remaining: usize },
-}
-
-impl fmt::Display for FormatErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnexpectedEof { needed, remaining } => {
-                write!(
-                    f,
-                    "unexpected end of file: needed {needed} bytes, only {remaining} remaining"
-                )
-            }
-            Self::InvalidSignature => write!(f, "invalid index signature"),
-            Self::EntriesOutOfSorted => write!(f, "index entries are out of order"),
-            Self::InvalidMode(mode) => write!(f, "invalid index entry mode {mode:#o}"),
-            Self::InvalidNanoseconds => write!(f, "invalid nanosecond value"),
-            Self::MissingNulTerminator => write!(f, "missing NUL terminator"),
-            Self::InvalidPadding => write!(f, "invalid index entry padding"),
-            Self::LongPathLenMisMatch => {
-                write!(f, "path length does not match the index flags")
-            }
-            Self::InvalidPathSyntax(err) => {
-                write!(f, "invalid index path: {err}")
-            }
-            Self::ExtendedFlagInV2 => write!(f, ""),
-            Self::TrailingData { remaining } => {
-                write!(f, "unexpected trailing data: {remaining} bytes remaining")
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct FormatError {
-    pub(super) offset: usize,
-    pub(super) kind: FormatErrorKind,
-}
-
-impl FormatError {
-    pub(super) fn at(offset: usize, kind: FormatErrorKind) -> Self {
-        Self { offset, kind }
-    }
-}
-
-impl Error for FormatError {}
-
-impl fmt::Display for FormatError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "invalid index at byte {}: {}", self.offset, self.kind)
     }
 }
 

@@ -9,7 +9,7 @@ pub(super) struct ConfigPrinter {
 impl Printer for ConfigPrinter {
     type T<'a> = ConfigEntry<'a>;
 
-    fn print<'a>(&self, value: &ConfigEntry<'a>) -> io::Result<()> {
+    fn print<'a>(&mut self, value: &ConfigEntry<'a>) -> io::Result<()> {
 
         Ok(())
     }

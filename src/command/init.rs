@@ -1027,9 +1027,8 @@ impl From<RefFormatError> for InitError {
 mod tests {
     use super::*;
     use sealed_test::prelude::*;
+use test_env::config::{Builder, TempConfigFile};
     use std::env;
-    use test_env::Builder;
-    use test_env::TempConfigFile;
 
     // `separate_lit_dir` is set, worktree is cwd, pointer_file points to `cwd/.lit`
     #[test]
